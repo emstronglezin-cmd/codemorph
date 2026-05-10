@@ -1,0 +1,34 @@
+FROM node:20-alpine AS base
+WORKDIR /app
+RUN apk add --no-cache libc6-compat
+
+# ── Dependencies ──────────────────────────────────────────────────────────────
+FROM base AS deps
+COPY package.json package-lock.json* ./
+COPY ai-engine/package.json ./ai-engine/
+COPY shared/package.json ./shared/
+RUN npm ci --workspace=ai-engine --workspace=shared --ignore-scripts
+
+# ── Builder ───────────────────────────────────────────────────────────────────
+FROM base AS builder
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+RUN npm run build --workspace=shared
+RUN npm run build --workspace=ai-engine
+
+# ── Runner ────────────────────────────────────────────────────────────────────
+FROM base AS runner
+ENV NODE_ENV=production
+RUN addgroup --system --gid 1001 nodejs && adduser --system --uid 1001 aiengine
+
+COPY --from=builder --chown=aiengine:nodejs /app/ai-engine/dist ./dist
+COPY --from=builder --chown=aiengine:nodejs /app/shared/dist ./shared/dist
+COPY --from=deps    --chown=aiengine:nodejs /app/node_modules ./node_modules
+COPY --from=builder --chown=aiengine:nodejs /app/ai-engine/package.json ./
+
+USER aiengine
+EXPOSE 5000
+HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
+  CMD wget -qO- http://localhost:5000/health/liveness || exit 1
+
+CMD ["node", "dist/index.js"]

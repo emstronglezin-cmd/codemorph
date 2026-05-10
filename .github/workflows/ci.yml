@@ -1,0 +1,181 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop, 'feat/**', 'fix/**']
+  pull_request:
+    branches: [main, develop]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '20'
+
+jobs:
+  # ── Lint & Type Check ────────────────────────────────────────────────────────
+  lint:
+    name: Lint & Type Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build shared package
+        run: npm run build --workspace=shared
+
+      - name: Lint all packages
+        run: npm run lint --workspaces --if-present
+
+      - name: Type check — shared
+        run: npx tsc --noEmit --project shared/tsconfig.json
+
+      - name: Type check — backend
+        run: npx tsc --noEmit --project backend/tsconfig.json
+
+      - name: Type check — ai-engine
+        run: npx tsc --noEmit --project ai-engine/tsconfig.json
+
+  # ── Build shared ─────────────────────────────────────────────────────────────
+  build-shared:
+    name: Build Shared
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build shared
+        run: npm run build --workspace=shared
+
+      - name: Upload shared dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: shared-dist
+          path: shared/dist/
+          retention-days: 1
+
+  # ── Build Backend ─────────────────────────────────────────────────────────────
+  build-backend:
+    name: Build Backend
+    runs-on: ubuntu-latest
+    needs: build-shared
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Download shared dist
+        uses: actions/download-artifact@v4
+        with:
+          name: shared-dist
+          path: shared/dist/
+
+      - name: Build backend
+        run: npm run build --workspace=backend
+
+  # ── Build AI Engine ───────────────────────────────────────────────────────────
+  build-ai-engine:
+    name: Build AI Engine
+    runs-on: ubuntu-latest
+    needs: build-shared
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Download shared dist
+        uses: actions/download-artifact@v4
+        with:
+          name: shared-dist
+          path: shared/dist/
+
+      - name: Build AI Engine
+        run: npm run build --workspace=ai-engine
+
+  # ── Build Frontend ────────────────────────────────────────────────────────────
+  build-frontend:
+    name: Build Frontend
+    runs-on: ubuntu-latest
+    needs: build-shared
+    env:
+      NEXT_PUBLIC_API_URL: http://localhost:4000/api/v1
+      NEXT_TELEMETRY_DISABLED: '1'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Download shared dist
+        uses: actions/download-artifact@v4
+        with:
+          name: shared-dist
+          path: shared/dist/
+
+      - name: Build frontend
+        run: npm run build --workspace=frontend
+
+  # ── Docker Build Check (dry run) ──────────────────────────────────────────────
+  docker-check:
+    name: Docker Build Check
+    runs-on: ubuntu-latest
+    needs: [build-backend, build-ai-engine, build-frontend]
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build backend image (no push)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: infra/docker/Dockerfile.backend
+          push: false
+          tags: codemorph/backend:ci
+
+      - name: Build ai-engine image (no push)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: infra/docker/Dockerfile.ai-engine
+          push: false
+          tags: codemorph/ai-engine:ci

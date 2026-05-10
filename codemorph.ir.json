@@ -1,0 +1,262 @@
+{
+  "$schema": "https://codemorph.dev/schemas/ir/v1.json",
+  "version": "1.0.0",
+  "generatedAt": "2024-01-15T10:30:00Z",
+  "projectMeta": {
+    "id": "proj_flutter_shop_001",
+    "name": "FlutterShop",
+    "description": "E-commerce Flutter app converted to React + TypeScript",
+    "sourceLanguage": "Flutter",
+    "targetLanguage": "React",
+    "sourceVersion": "3.16.0",
+    "targetVersion": "18.2.0",
+    "entryPoint": "lib/main.dart",
+    "totalFiles": 42,
+    "totalLines": 8750,
+    "conversionId": "conv_abc123xyz",
+    "goalPrompt": "Convert to React with Zustand state management, keep the same folder structure, use TailwindCSS instead of Flutter styles"
+  },
+  "architecture": {
+    "pattern": "BLoC",
+    "confidence": 0.94,
+    "layers": [
+      { "name": "presentation", "path": "lib/screens", "files": 12, "role": "UI layer — screens and widgets" },
+      { "name": "business_logic", "path": "lib/bloc", "files": 8, "role": "BLoC state management" },
+      { "name": "data", "path": "lib/repositories", "files": 6, "role": "Data access layer" },
+      { "name": "models", "path": "lib/models", "files": 10, "role": "Domain entities" },
+      { "name": "services", "path": "lib/services", "files": 6, "role": "External API/service integrations" }
+    ],
+    "stateManagement": "BLoC",
+    "navigation": "GoRouter",
+    "networking": "Dio",
+    "di": "GetIt",
+    "detectedFeatures": ["authentication", "product-listing", "cart", "checkout", "order-history", "user-profile"]
+  },
+  "uiGraph": {
+    "screens": [
+      {
+        "id": "screen_splash",
+        "name": "SplashScreen",
+        "sourceFile": "lib/screens/splash_screen.dart",
+        "route": "/",
+        "type": "screen",
+        "widgets": [
+          { "id": "w_logo", "type": "Image", "props": { "asset": "assets/logo.png", "width": 120 }, "targetComponent": "LogoImage" },
+          { "id": "w_loading", "type": "CircularProgressIndicator", "props": { "color": "primary" }, "targetComponent": "Spinner" }
+        ],
+        "stateBloc": "AuthBloc",
+        "navigation": [
+          { "trigger": "onAuthSuccess", "target": "screen_home" },
+          { "trigger": "onAuthFail", "target": "screen_login" }
+        ],
+        "targetComponent": "SplashPage",
+        "targetFile": "src/pages/SplashPage.tsx"
+      },
+      {
+        "id": "screen_login",
+        "name": "LoginScreen",
+        "sourceFile": "lib/screens/auth/login_screen.dart",
+        "route": "/login",
+        "type": "screen",
+        "widgets": [
+          { "id": "w_email_field", "type": "TextFormField", "props": { "keyboardType": "emailAddress", "label": "Email" }, "targetComponent": "Input" },
+          { "id": "w_password_field", "type": "TextFormField", "props": { "obscureText": true, "label": "Password" }, "targetComponent": "Input" },
+          { "id": "w_login_btn", "type": "ElevatedButton", "props": { "text": "Sign In" }, "targetComponent": "Button" },
+          { "id": "w_google_btn", "type": "OutlinedButton", "props": { "icon": "google", "text": "Continue with Google" }, "targetComponent": "OAuthButton" }
+        ],
+        "stateBloc": "AuthBloc",
+        "targetComponent": "LoginPage",
+        "targetFile": "src/pages/auth/LoginPage.tsx"
+      },
+      {
+        "id": "screen_home",
+        "name": "HomeScreen",
+        "sourceFile": "lib/screens/home/home_screen.dart",
+        "route": "/home",
+        "type": "screen",
+        "widgets": [
+          { "id": "w_app_bar", "type": "AppBar", "props": { "title": "FlutterShop" }, "targetComponent": "Header" },
+          { "id": "w_product_grid", "type": "GridView", "props": { "crossAxisCount": 2, "childAspectRatio": 0.75 }, "targetComponent": "ProductGrid" },
+          { "id": "w_bottom_nav", "type": "BottomNavigationBar", "props": { "items": ["home", "cart", "profile"] }, "targetComponent": "BottomNav" }
+        ],
+        "stateBloc": "ProductBloc",
+        "targetComponent": "HomePage",
+        "targetFile": "src/pages/home/HomePage.tsx"
+      },
+      {
+        "id": "screen_cart",
+        "name": "CartScreen",
+        "sourceFile": "lib/screens/cart/cart_screen.dart",
+        "route": "/cart",
+        "type": "screen",
+        "widgets": [
+          { "id": "w_cart_list", "type": "ListView", "props": { "shrinkWrap": true }, "targetComponent": "CartItemList" },
+          { "id": "w_total_row", "type": "Row", "props": {}, "targetComponent": "CartTotal" },
+          { "id": "w_checkout_btn", "type": "ElevatedButton", "props": { "text": "Checkout" }, "targetComponent": "Button" }
+        ],
+        "stateBloc": "CartBloc",
+        "targetComponent": "CartPage",
+        "targetFile": "src/pages/cart/CartPage.tsx"
+      }
+    ],
+    "sharedComponents": [
+      { "id": "comp_product_card", "sourceWidget": "ProductCard", "sourceFile": "lib/widgets/product_card.dart", "targetComponent": "ProductCard", "targetFile": "src/components/products/ProductCard.tsx" },
+      { "id": "comp_cart_item", "sourceWidget": "CartItemWidget", "sourceFile": "lib/widgets/cart_item.dart", "targetComponent": "CartItem", "targetFile": "src/components/cart/CartItem.tsx" }
+    ],
+    "theme": {
+      "primaryColor": "#6366F1",
+      "backgroundColor": "#FAFAFA",
+      "fontFamily": "Inter",
+      "borderRadius": 12,
+      "targetSystem": "tailwindcss"
+    }
+  },
+  "backendGraph": {
+    "services": [
+      {
+        "id": "svc_auth",
+        "name": "AuthService",
+        "sourceFile": "lib/services/auth_service.dart",
+        "methods": [
+          { "name": "signIn", "params": ["email: String", "password: String"], "returnType": "Future<User>", "targetMethod": "signIn", "httpMethod": "POST", "endpoint": "/auth/sign-in" },
+          { "name": "signOut", "params": [], "returnType": "Future<void>", "targetMethod": "signOut", "httpMethod": "POST", "endpoint": "/auth/sign-out" },
+          { "name": "getCurrentUser", "params": [], "returnType": "Future<User?>", "targetMethod": "getCurrentUser", "httpMethod": "GET", "endpoint": "/auth/me" }
+        ],
+        "targetService": "useAuthStore + useAuth hook",
+        "targetFile": "src/stores/authStore.ts"
+      },
+      {
+        "id": "svc_products",
+        "name": "ProductRepository",
+        "sourceFile": "lib/repositories/product_repository.dart",
+        "methods": [
+          { "name": "getProducts", "params": ["page: int", "limit: int"], "returnType": "Future<List<Product>>", "targetMethod": "getProducts", "httpMethod": "GET", "endpoint": "/products" },
+          { "name": "getProduct", "params": ["id: String"], "returnType": "Future<Product>", "targetMethod": "getProduct", "httpMethod": "GET", "endpoint": "/products/:id" }
+        ],
+        "targetService": "useProducts hook",
+        "targetFile": "src/hooks/useProducts.ts"
+      }
+    ],
+    "stateManagement": {
+      "source": "BLoC",
+      "blocs": [
+        { "name": "AuthBloc", "events": ["AuthLoginRequested", "AuthLogoutRequested", "AuthCheckRequested"], "states": ["AuthInitial", "AuthLoading", "AuthAuthenticated", "AuthError"], "targetStore": "authStore.ts" },
+        { "name": "ProductBloc", "events": ["ProductsFetchRequested", "ProductDetailFetched"], "states": ["ProductInitial", "ProductLoading", "ProductLoaded", "ProductError"], "targetStore": "productStore.ts" },
+        { "name": "CartBloc", "events": ["CartItemAdded", "CartItemRemoved", "CartCleared"], "states": ["CartInitial", "CartUpdated"], "targetStore": "cartStore.ts" }
+      ],
+      "target": "Zustand"
+    }
+  },
+  "dataLayer": {
+    "models": [
+      {
+        "id": "model_user",
+        "name": "User",
+        "sourceFile": "lib/models/user.dart",
+        "fields": [
+          { "name": "id", "type": "String", "nullable": false, "targetType": "string" },
+          { "name": "email", "type": "String", "nullable": false, "targetType": "string" },
+          { "name": "name", "type": "String", "nullable": false, "targetType": "string" },
+          { "name": "avatarUrl", "type": "String?", "nullable": true, "targetType": "string | null" },
+          { "name": "createdAt", "type": "DateTime", "nullable": false, "targetType": "Date" }
+        ],
+        "targetInterface": "User",
+        "targetFile": "src/types/index.ts"
+      },
+      {
+        "id": "model_product",
+        "name": "Product",
+        "sourceFile": "lib/models/product.dart",
+        "fields": [
+          { "name": "id", "type": "String", "nullable": false, "targetType": "string" },
+          { "name": "name", "type": "String", "nullable": false, "targetType": "string" },
+          { "name": "description", "type": "String", "nullable": false, "targetType": "string" },
+          { "name": "price", "type": "double", "nullable": false, "targetType": "number" },
+          { "name": "imageUrl", "type": "String", "nullable": false, "targetType": "string" },
+          { "name": "category", "type": "String", "nullable": false, "targetType": "string" },
+          { "name": "stock", "type": "int", "nullable": false, "targetType": "number" }
+        ],
+        "targetInterface": "Product",
+        "targetFile": "src/types/index.ts"
+      },
+      {
+        "id": "model_cart_item",
+        "name": "CartItem",
+        "sourceFile": "lib/models/cart_item.dart",
+        "fields": [
+          { "name": "product", "type": "Product", "nullable": false, "targetType": "Product" },
+          { "name": "quantity", "type": "int", "nullable": false, "targetType": "number" }
+        ],
+        "targetInterface": "CartItem",
+        "targetFile": "src/types/index.ts"
+      }
+    ],
+    "localStorage": {
+      "source": "SharedPreferences + Hive",
+      "target": "localStorage + Zustand persist",
+      "keys": [
+        { "source": "auth_token", "target": "codemorph-auth", "type": "string" },
+        { "source": "cart_items", "target": "cart-store", "type": "json" }
+      ]
+    }
+  },
+  "dependencyMap": {
+    "source": [
+      { "name": "flutter_bloc", "version": "^8.1.3", "purpose": "BLoC state management", "targetPackage": "zustand", "targetVersion": "^4.4.0" },
+      { "name": "dio", "version": "^5.3.2", "purpose": "HTTP client", "targetPackage": "axios", "targetVersion": "^1.6.0" },
+      { "name": "go_router", "version": "^12.0.1", "purpose": "Navigation", "targetPackage": "react-router-dom", "targetVersion": "^6.20.0" },
+      { "name": "get_it", "version": "^7.6.4", "purpose": "Dependency injection", "targetPackage": null, "note": "Use React context / module system instead" },
+      { "name": "freezed", "version": "^2.4.5", "purpose": "Immutable classes", "targetPackage": null, "note": "TypeScript interfaces are already immutable" },
+      { "name": "hive", "version": "^2.2.3", "purpose": "Local storage", "targetPackage": "zustand/middleware", "targetVersion": "built-in persist middleware" },
+      { "name": "cached_network_image", "version": "^3.3.0", "purpose": "Image caching", "targetPackage": "next/image", "targetVersion": "built-in" }
+    ],
+    "target": [
+      { "name": "react", "version": "^18.2.0", "purpose": "UI framework" },
+      { "name": "react-dom", "version": "^18.2.0", "purpose": "DOM rendering" },
+      { "name": "typescript", "version": "^5.3.0", "purpose": "Type safety" },
+      { "name": "zustand", "version": "^4.4.0", "purpose": "State management" },
+      { "name": "react-router-dom", "version": "^6.20.0", "purpose": "Client-side routing" },
+      { "name": "axios", "version": "^1.6.0", "purpose": "HTTP client" },
+      { "name": "@tanstack/react-query", "version": "^5.0.0", "purpose": "Server state" },
+      { "name": "tailwindcss", "version": "^3.4.0", "purpose": "Styling (replaces Flutter styles)" }
+    ]
+  },
+  "conversionPlan": {
+    "totalOutputFiles": 47,
+    "estimatedLines": 9200,
+    "phases": [
+      { "phase": 1, "name": "Setup & Configuration", "files": ["package.json", "tsconfig.json", "tailwind.config.ts", "vite.config.ts", "src/main.tsx", "src/App.tsx"] },
+      { "phase": 2, "name": "Types & Interfaces", "files": ["src/types/index.ts", "src/types/api.ts"] },
+      { "phase": 3, "name": "API Client & Stores", "files": ["src/lib/api.ts", "src/stores/authStore.ts", "src/stores/productStore.ts", "src/stores/cartStore.ts"] },
+      { "phase": 4, "name": "Pages & Routing", "files": ["src/pages/SplashPage.tsx", "src/pages/auth/LoginPage.tsx", "src/pages/auth/RegisterPage.tsx", "src/pages/home/HomePage.tsx", "src/pages/product/ProductDetailPage.tsx", "src/pages/cart/CartPage.tsx", "src/pages/checkout/CheckoutPage.tsx", "src/pages/profile/ProfilePage.tsx"] },
+      { "phase": 5, "name": "Shared Components", "files": ["src/components/ui/Button.tsx", "src/components/ui/Input.tsx", "src/components/ui/Spinner.tsx", "src/components/products/ProductCard.tsx", "src/components/products/ProductGrid.tsx", "src/components/cart/CartItem.tsx", "src/components/cart/CartTotal.tsx", "src/components/layout/Header.tsx", "src/components/layout/BottomNav.tsx"] }
+    ],
+    "conversionNotes": [
+      "BLoC → Zustand: Events map to actions, States map to store slices",
+      "GoRouter → React Router v6: Named routes preserved",
+      "Flutter Widgets → React Components: 1-to-1 mapping where possible",
+      "Dio → Axios: Interceptors pattern preserved for auth token injection",
+      "SharedPreferences → localStorage + Zustand persist middleware",
+      "Flutter theme → TailwindCSS config with same color tokens"
+    ]
+  },
+  "validation": {
+    "isValid": true,
+    "score": 96,
+    "warnings": [
+      { "code": "W001", "message": "Platform-specific code in ProductCard (Flutter-only shadow API) — adapted to CSS box-shadow", "severity": "info" },
+      { "code": "W002", "message": "Hive encrypted box migration — data will need manual migration script", "severity": "warning" }
+    ],
+    "errors": [],
+    "coverage": {
+      "screensConverted": 8,
+      "screensTotal": 8,
+      "servicesConverted": 5,
+      "servicesTotal": 5,
+      "modelsConverted": 6,
+      "modelsTotal": 6,
+      "percentage": 100
+    },
+    "checkedAt": "2024-01-15T10:32:45Z"
+  }
+}

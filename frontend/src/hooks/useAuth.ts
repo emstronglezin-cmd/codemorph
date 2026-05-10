@@ -1,0 +1,75 @@
+import { useCallback } from 'react';
+import { useRouter } from 'next/navigation';
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { useAuthStore } from '@/stores/auth.store';
+import { apiGet, apiPost } from '@/lib/api/client';
+
+interface MeResponse {
+  id: string;
+  email: string;
+  name: string;
+  avatarUrl?: string;
+  role: string;
+  plan: string;
+}
+
+export function useAuth() {
+  const router = useRouter();
+  const queryClient = useQueryClient();
+  const { user, isAuthenticated, isLoading, setAuth, clearAuth } = useAuthStore();
+
+  // Fetch current user
+  const { data: me, isLoading: isMeLoading } = useQuery({
+    queryKey: ['auth', 'me'],
+    queryFn: () => apiGet<MeResponse>('/auth/me'),
+    enabled: isAuthenticated,
+    staleTime: 5 * 60 * 1000,
+    retry: false,
+  });
+
+  // Sign in mutation
+  const signInMutation = useMutation({
+    mutationFn: ({ email, password }: { email: string; password: string }) =>
+      apiPost<{ user: MeResponse; accessToken: string }>('/auth/sign-in', { email, password }),
+    onSuccess: (data) => {
+      setAuth(data.user, data.accessToken);
+      queryClient.setQueryData(['auth', 'me'], data.user);
+      router.push('/dashboard');
+    },
+  });
+
+  // Sign up mutation
+  const signUpMutation = useMutation({
+    mutationFn: ({ name, email, password }: { name: string; email: string; password: string }) =>
+      apiPost<{ user: MeResponse; accessToken: string }>('/auth/sign-up', { name, email, password }),
+    onSuccess: (data) => {
+      setAuth(data.user, data.accessToken);
+      queryClient.setQueryData(['auth', 'me'], data.user);
+      router.push('/dashboard');
+    },
+  });
+
+  // Sign out
+  const signOut = useCallback(async () => {
+    try {
+      await apiPost('/auth/sign-out');
+    } finally {
+      clearAuth();
+      queryClient.clear();
+      router.push('/auth/sign-in');
+    }
+  }, [clearAuth, queryClient, router]);
+
+  return {
+    user: me ?? user,
+    isAuthenticated,
+    isLoading: isLoading || isMeLoading,
+    signIn: signInMutation.mutateAsync,
+    signInError: signInMutation.error,
+    signInLoading: signInMutation.isPending,
+    signUp: signUpMutation.mutateAsync,
+    signUpError: signUpMutation.error,
+    signUpLoading: signUpMutation.isPending,
+    signOut,
+  };
+}

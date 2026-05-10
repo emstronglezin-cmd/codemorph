@@ -1,0 +1,184 @@
+version: '3.9'
+
+services:
+  # ── PostgreSQL ──────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: codemorph-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: codemorph
+      POSTGRES_USER: codemorph
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-codemorph_dev_password}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - '5432:5432'
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U codemorph -d codemorph']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - codemorph-net
+
+  # ── Redis ───────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: codemorph-redis
+    restart: unless-stopped
+    command: redis-server --requirepass ${REDIS_PASSWORD:-codemorph_redis_dev}
+    volumes:
+      - redis_data:/data
+    ports:
+      - '6379:6379'
+    healthcheck:
+      test: ['CMD', 'redis-cli', '-a', '${REDIS_PASSWORD:-codemorph_redis_dev}', 'ping']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - codemorph-net
+
+  # ── PgAdmin ─────────────────────────────────────────────────────────────────
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: codemorph-pgadmin
+    restart: unless-stopped
+    profiles: ['tools']
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@codemorph.dev
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-admin}
+    ports:
+      - '5050:80'
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - codemorph-net
+
+  # ── AI Engine ───────────────────────────────────────────────────────────────
+  ai-engine:
+    build:
+      context: .
+      dockerfile: infra/docker/Dockerfile.ai-engine
+    container_name: codemorph-ai-engine
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 5000
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o}
+      BACKEND_URL: http://backend:4000
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    ports:
+      - '5000:5000'
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -qO- http://localhost:5000/health/liveness || exit 1']
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    networks:
+      - codemorph-net
+
+  # ── Backend (NestJS) ────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: .
+      dockerfile: infra/docker/Dockerfile.backend
+    container_name: codemorph-backend
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 4000
+      DATABASE_URL: postgresql://codemorph:${POSTGRES_PASSWORD:-codemorph_dev_password}@postgres:5432/codemorph
+      REDIS_URL: redis://:${REDIS_PASSWORD:-codemorph_redis_dev}@redis:6379
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET}
+      JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-15m}
+      JWT_REFRESH_EXPIRES_IN: ${JWT_REFRESH_EXPIRES_IN:-7d}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET}
+      GOOGLE_CALLBACK_URL: ${GOOGLE_CALLBACK_URL:-http://localhost:4000/api/v1/auth/google/callback}
+      GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID}
+      GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET}
+      GITHUB_CALLBACK_URL: ${GITHUB_CALLBACK_URL:-http://localhost:4000/api/v1/auth/github/callback}
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      AI_ENGINE_URL: http://ai-engine:5000
+      API_URL: ${API_URL:-http://localhost:4000}
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3000}
+      UPLOAD_DIR: /tmp/codemorph-uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ai-engine:
+        condition: service_healthy
+    ports:
+      - '4000:4000'
+    volumes:
+      - uploads_data:/tmp/codemorph-uploads
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -qO- http://localhost:4000/health/liveness || exit 1']
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks:
+      - codemorph-net
+
+  # ── Frontend (Next.js) ──────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: .
+      dockerfile: infra/docker/Dockerfile.frontend
+    container_name: codemorph-frontend
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:4000/api/v1}
+      NEXT_PUBLIC_APP_URL: ${NEXT_PUBLIC_APP_URL:-http://localhost:3000}
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - '3000:3000'
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -qO- http://localhost:3000 || exit 1']
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    networks:
+      - codemorph-net
+
+  # ── Nginx (reverse proxy) ───────────────────────────────────────────────────
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: codemorph-nginx
+    restart: unless-stopped
+    ports:
+      - '80:80'
+      - '443:443'
+    volumes:
+      - ./infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./infra/nginx/certs:/etc/nginx/certs:ro
+    depends_on:
+      - frontend
+      - backend
+      - ai-engine
+    networks:
+      - codemorph-net
+
+volumes:
+  postgres_data:
+  redis_data:
+  uploads_data:
+
+networks:
+  codemorph-net:
+    driver: bridge

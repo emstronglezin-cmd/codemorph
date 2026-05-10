@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "compilerOptions": {
+    "module": "CommonJS",
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "baseUrl": "./",
+    "paths": {
+      "@codemorph/shared": ["../shared/src/index.ts"],
+      "@codemorph/shared/*": ["../shared/src/*"]
+    },
+    "strict": true,
+    "strictNullChecks": true,
+    "noImplicitAny": true,
+    "noImplicitReturns": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "experimentalDecorators": true,
+    "emitDecoratorMetadata": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "resolveJsonModule": true,
+    "sourceMap": true,
+    "incremental": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist", "test", "**/*.spec.ts"]
+}

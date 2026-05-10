@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "display": "CodeMorph Base TypeScript Config",
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "resolveJsonModule": true,
+    "allowJs": false,
+    "checkJs": false,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "composite": true,
+    "incremental": true,
+    "strict": true,
+    "strictNullChecks": true,
+    "strictFunctionTypes": true,
+    "strictBindCallApply": true,
+    "strictPropertyInitialization": true,
+    "noImplicitAny": true,
+    "noImplicitThis": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "forceConsistentCasingInFileNames": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "skipLibCheck": true,
+    "experimentalDecorators": true,
+    "emitDecoratorMetadata": true,
+    "paths": {
+      "@codemorph/shared": ["./shared/src/index.ts"],
+      "@codemorph/shared/*": ["./shared/src/*"]
+    }
+  },
+  "exclude": ["node_modules", "dist", ".next", "coverage", "**/*.spec.ts", "**/*.test.ts"]
+}
