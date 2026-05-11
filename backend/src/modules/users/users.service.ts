@@ -127,6 +127,11 @@ export class UsersService {
     await this.usersRepo.update(id, data);
   }
 
+  // ── Find by Stripe customer ID ────────────────────────
+  async findByStripeCustomerId(customerId: string): Promise<UserEntity | null> {
+    return this.usersRepo.findOne({ where: { stripeCustomerId: customerId } });
+  }
+
   // ── Count ─────────────────────────────────────────────
   async count(): Promise<number> {
     return this.usersRepo.count();

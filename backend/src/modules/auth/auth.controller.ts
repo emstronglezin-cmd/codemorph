@@ -1,5 +1,5 @@
 // ============================================================
-// CodeMorph — Auth Controller
+// CodeMorph — Auth Controller (Email + Google + GitHub OAuth)
 // ============================================================
 import {
   Controller,
@@ -13,18 +13,25 @@ import {
   Req,
 } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiResponse, ApiBearerAuth } from '@nestjs/swagger';
+import { AuthGuard } from '@nestjs/passport';
 import type { Response, Request } from 'express';
 
-import { AuthService }     from './auth.service';
-import { SignUpDto }       from './dto/sign-up.dto';
-import { SignInDto }       from './dto/sign-in.dto';
-import { ForgotPasswordDto } from './dto/forgot-password.dto';
-import { ResetPasswordDto }  from './dto/reset-password.dto';
-import { RefreshTokenDto }   from './dto/refresh-token.dto';
-import { Public }          from '../../common/decorators/public.decorator';
-import { JwtAuthGuard }    from '../../common/guards/jwt-auth.guard';
-import { CurrentUser }     from '../../common/decorators/current-user.decorator';
-import type { JwtPayload } from '@codemorph/shared';
+import { AuthService }        from './auth.service';
+import { SignUpDto }          from './dto/sign-up.dto';
+import { SignInDto }          from './dto/sign-in.dto';
+import { ForgotPasswordDto }  from './dto/forgot-password.dto';
+import { ResetPasswordDto }   from './dto/reset-password.dto';
+import { RefreshTokenDto }    from './dto/refresh-token.dto';
+import { Public }             from '../../common/decorators/public.decorator';
+import { JwtAuthGuard }       from '../../common/guards/jwt-auth.guard';
+import { CurrentUser }        from '../../common/decorators/current-user.decorator';
+import type { JwtPayload }    from '@codemorph/shared';
+import type { UserEntity }    from '../users/entities/user.entity';
+
+// ── Typed OAuth request ──────────────────────────────────
+interface OAuthRequest extends Request {
+  user: UserEntity;
+}
 
 @ApiTags('auth')
 @Controller('auth')
@@ -88,7 +95,7 @@ export class AuthController {
     @Req()  req: Request,
     @Res({ passthrough: true }) res: Response,
   ): Promise<unknown> {
-    const token = dto.refreshToken ?? (req.cookies as Record<string, string>)['cm_refresh_token'];
+    const token  = dto.refreshToken ?? (req.cookies as Record<string, string>)['cm_refresh_token'];
     const result = await this.authService.refreshTokens(token);
     this.setRefreshTokenCookie(res, result.tokens.refreshToken);
     return result;
@@ -123,14 +130,64 @@ export class AuthController {
     return this.authService.getMe(user.sub);
   }
 
+  // ── Google OAuth ──────────────────────────────────────
+  // GET /auth/google  → redirects to Google consent screen
+  @Public()
+  @Get('google')
+  @UseGuards(AuthGuard('google'))
+  @ApiOperation({ summary: 'Initiate Google OAuth2 login' })
+  googleAuth(): void {
+    // Passport redirects — nothing to do here
+  }
+
+  // GET /auth/google/callback  → receives Google token → issues JWT
+  @Public()
+  @Get('google/callback')
+  @UseGuards(AuthGuard('google'))
+  @ApiOperation({ summary: 'Google OAuth2 callback' })
+  async googleCallback(
+    @Req()  req: OAuthRequest,
+    @Res()  res: Response,
+  ): Promise<void> {
+    const tokens = await this.authService.loginOAuthUser(req.user);
+    this.setRefreshTokenCookie(res, tokens.refreshToken);
+    const frontendUrl = process.env['FRONTEND_URL'] ?? 'http://localhost:3000';
+    res.redirect(`${frontendUrl}/auth/oauth-success?token=${tokens.accessToken}`);
+  }
+
+  // ── GitHub OAuth ──────────────────────────────────────
+  // GET /auth/github  → redirects to GitHub consent screen
+  @Public()
+  @Get('github')
+  @UseGuards(AuthGuard('github'))
+  @ApiOperation({ summary: 'Initiate GitHub OAuth login' })
+  githubAuth(): void {
+    // Passport redirects
+  }
+
+  // GET /auth/github/callback → receives GitHub token → issues JWT
+  @Public()
+  @Get('github/callback')
+  @UseGuards(AuthGuard('github'))
+  @ApiOperation({ summary: 'GitHub OAuth callback' })
+  async githubCallback(
+    @Req()  req: OAuthRequest,
+    @Res()  res: Response,
+  ): Promise<void> {
+    const tokens = await this.authService.loginOAuthUser(req.user);
+    this.setRefreshTokenCookie(res, tokens.refreshToken);
+    const frontendUrl = process.env['FRONTEND_URL'] ?? 'http://localhost:3000';
+    res.redirect(`${frontendUrl}/auth/oauth-success?token=${tokens.accessToken}`);
+  }
+
   // ── Private helpers ───────────────────────────────────
   private setRefreshTokenCookie(res: Response, token: string): void {
     res.cookie('cm_refresh_token', token, {
-      httpOnly:  true,
-      secure:    process.env['NODE_ENV'] === 'production',
-      sameSite:  'lax',
-      maxAge:    7 * 24 * 60 * 60 * 1000, // 7 days
-      path:      '/api/v1/auth/refresh',
+      httpOnly: true,
+      secure:   process.env['NODE_ENV'] === 'production',
+      sameSite: 'lax',
+      maxAge:   7 * 24 * 60 * 60 * 1000,
+      path:     '/api/v1/auth/refresh',
     });
   }
 }

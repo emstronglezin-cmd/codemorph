@@ -1,0 +1,279 @@
+# ============================================================
+# CodeMorph — Production Docker Compose
+# Usage: docker-compose -f docker-compose.prod.yml up -d
+# ============================================================
+version: '3.9'
+
+x-restart: &restart
+  restart: unless-stopped
+
+x-logging: &logging
+  logging:
+    driver: 'json-file'
+    options:
+      max-size: '50m'
+      max-file: '5'
+
+services:
+
+  # ── PostgreSQL ────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    <<: [*restart, *logging]
+    environment:
+      POSTGRES_USER:     ${POSTGRES_USER:-codemorph}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD required}
+      POSTGRES_DB:       ${POSTGRES_DB:-codemorph_prod}
+      PGDATA:            /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - '127.0.0.1:5432:5432'          # bind to localhost only
+    networks:
+      - internal
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-codemorph} -d ${POSTGRES_DB:-codemorph_prod}']
+      interval: 10s
+      timeout:  5s
+      retries:  5
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus:   '1.0'
+          memory: '512m'
+        reservations:
+          memory: '256m'
+
+  # ── Redis ─────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    <<: [*restart, *logging]
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD required}
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --save 900 1
+      --save 300 10
+      --appendonly yes
+      --appendfsync everysec
+    volumes:
+      - redis_data:/data
+    ports:
+      - '127.0.0.1:6379:6379'
+    networks:
+      - internal
+    healthcheck:
+      test: ['CMD', 'redis-cli', '-a', '${REDIS_PASSWORD}', 'ping']
+      interval: 10s
+      timeout:  5s
+      retries:  5
+    deploy:
+      resources:
+        limits:
+          cpus:   '0.5'
+          memory: '384m'
+        reservations:
+          memory: '128m'
+
+  # ── AI Engine ─────────────────────────────────────────────
+  ai-engine:
+    build:
+      context:    .
+      dockerfile: infra/docker/Dockerfile.ai-engine
+      target:     runner
+    image: codemorph/ai-engine:${TAG:-latest}
+    <<: [*restart, *logging]
+    environment:
+      NODE_ENV:       production
+      PORT:           5000
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?OPENAI_API_KEY required}
+      LOG_LEVEL:      ${LOG_LEVEL:-info}
+    networks:
+      - internal
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -qO- http://localhost:5000/health/live || exit 1']
+      interval: 30s
+      timeout:  10s
+      retries:  3
+      start_period: 30s
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus:   '2.0'
+          memory: '1g'
+        reservations:
+          cpus:   '0.5'
+          memory: '256m'
+
+  # ── Backend (NestJS) ──────────────────────────────────────
+  backend:
+    build:
+      context:    .
+      dockerfile: infra/docker/Dockerfile.backend
+      target:     runner
+    image: codemorph/backend:${TAG:-latest}
+    <<: [*restart, *logging]
+    environment:
+      NODE_ENV:             production
+      PORT:                 4000
+      DATABASE_URL:         postgresql://${POSTGRES_USER:-codemorph}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-codemorph_prod}
+      REDIS_URL:            redis://:${REDIS_PASSWORD}@redis:6379/0
+      REDIS_HOST:           redis
+      REDIS_PORT:           6379
+      REDIS_PASSWORD:       ${REDIS_PASSWORD}
+      REDIS_DB:             0
+      REDIS_QUEUE_DB:       1
+      AI_ENGINE_URL:        http://ai-engine:5000
+      API_URL:              ${API_URL:-https://api.codemorph.ai}
+      FRONTEND_URL:         ${FRONTEND_URL:-https://app.codemorph.ai}
+      JWT_SECRET:           ${JWT_SECRET:?JWT_SECRET required}
+      JWT_REFRESH_SECRET:   ${JWT_REFRESH_SECRET:?JWT_REFRESH_SECRET required}
+      JWT_EXPIRES_IN:       ${JWT_EXPIRES_IN:-15m}
+      JWT_REFRESH_EXPIRES_IN: ${JWT_REFRESH_EXPIRES_IN:-7d}
+      GOOGLE_CLIENT_ID:     ${GOOGLE_CLIENT_ID}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET}
+      GOOGLE_CALLBACK_URL:  ${GOOGLE_CALLBACK_URL}
+      GITHUB_CLIENT_ID:     ${GITHUB_CLIENT_ID}
+      GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET}
+      GITHUB_CALLBACK_URL:  ${GITHUB_CALLBACK_URL}
+      STRIPE_SECRET_KEY:    ${STRIPE_SECRET_KEY}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET}
+      STRIPE_PRO_MONTHLY_PRICE_ID:     ${STRIPE_PRO_MONTHLY_PRICE_ID}
+      STRIPE_PRO_YEARLY_PRICE_ID:      ${STRIPE_PRO_YEARLY_PRICE_ID}
+      STRIPE_PRO_MAX_MONTHLY_PRICE_ID: ${STRIPE_PRO_MAX_MONTHLY_PRICE_ID}
+      STRIPE_PRO_MAX_YEARLY_PRICE_ID:  ${STRIPE_PRO_MAX_YEARLY_PRICE_ID}
+      SENTRY_DSN:           ${SENTRY_DSN}
+      UPLOAD_DIR:           /app/uploads
+      LOG_LEVEL:            ${LOG_LEVEL:-info}
+    volumes:
+      - uploads_data:/app/uploads
+    networks:
+      - internal
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ai-engine:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -qO- http://localhost:4000/api/v1/health || exit 1']
+      interval: 30s
+      timeout:  10s
+      retries:  3
+      start_period: 40s
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus:   '1.5'
+          memory: '512m'
+        reservations:
+          cpus:   '0.25'
+          memory: '128m'
+
+  # ── Frontend (Next.js) ────────────────────────────────────
+  frontend:
+    build:
+      context:    .
+      dockerfile: infra/docker/Dockerfile.frontend
+      target:     runner
+      args:
+        NEXT_PUBLIC_API_URL:                 ${NEXT_PUBLIC_API_URL:-https://api.codemorph.ai/api/v1}
+        NEXT_PUBLIC_APP_URL:                 ${NEXT_PUBLIC_APP_URL:-https://app.codemorph.ai}
+        NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY:  ${NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY}
+    image: codemorph/frontend:${TAG:-latest}
+    <<: [*restart, *logging]
+    environment:
+      NODE_ENV: production
+      PORT:     3000
+    networks:
+      - internal
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -qO- http://localhost:3000 || exit 1']
+      interval: 30s
+      timeout:  10s
+      retries:  3
+      start_period: 30s
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus:   '1.0'
+          memory: '512m'
+        reservations:
+          memory: '128m'
+
+  # ── Nginx (reverse proxy + SSL termination) ───────────────
+  nginx:
+    image: nginx:1.25-alpine
+    <<: [*restart, *logging]
+    ports:
+      - '80:80'
+      - '443:443'
+    volumes:
+      - ./infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./infra/nginx/conf.d:/etc/nginx/conf.d:ro
+      - certbot_certs:/etc/letsencrypt:ro
+      - certbot_www:/var/www/certbot:ro
+    networks:
+      - internal
+      - external
+    depends_on:
+      - backend
+      - frontend
+    healthcheck:
+      test: ['CMD', 'nginx', '-t']
+      interval: 30s
+      timeout:  5s
+      retries:  3
+    deploy:
+      resources:
+        limits:
+          cpus:   '0.5'
+          memory: '64m'
+
+  # ── Certbot (SSL auto-renewal) ────────────────────────────
+  certbot:
+    image: certbot/certbot:latest
+    volumes:
+      - certbot_certs:/etc/letsencrypt
+      - certbot_www:/var/www/certbot
+    networks:
+      - internal
+    entrypoint: /bin/sh -c 'trap exit TERM; while :; do certbot renew --webroot -w /var/www/certbot; sleep 12h & wait $${!}; done'
+    <<: *logging
+    deploy:
+      resources:
+        limits:
+          memory: '64m'
+
+# ── Networks ──────────────────────────────────────────────────
+networks:
+  internal:
+    driver: bridge
+    internal: true      # not exposed to the outside
+  external:
+    driver: bridge      # nginx only — bridges internal to internet
+
+# ── Volumes ───────────────────────────────────────────────────
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  uploads_data:
+    driver: local
+  certbot_certs:
+    driver: local
+  certbot_www:
+    driver: local

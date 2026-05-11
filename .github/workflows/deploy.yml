@@ -1,22 +1,29 @@
+# ============================================================
+# CodeMorph — Deploy Pipeline
+# Build → Push GHCR → SSH Deploy → Slack notification
+# Supports: preview deployments (PRs) + production (main)
+# ============================================================
 name: Deploy
 
 on:
   push:
     branches: [main]
-    tags: ['v*.*.*']
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
 
 concurrency:
   group: deploy-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: false   # never cancel an active deploy
 
 env:
-  REGISTRY: ghcr.io
-  IMAGE_PREFIX: ${{ github.repository_owner }}/codemorph
+  REGISTRY:     ghcr.io
+  IMAGE_PREFIX: ghcr.io/${{ github.repository_owner }}/codemorph
 
 jobs:
-  # ── Build & Push Docker Images ───────────────────────────────────────────────
-  build-and-push:
-    name: Build & Push Images
+  # ── Build & Push images to GHCR ───────────────────────────
+  build-push:
+    name: Build & Push (${{ matrix.service }})
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -24,126 +31,219 @@ jobs:
 
     strategy:
       matrix:
-        service:
-          - name: backend
+        include:
+          - service:    backend
             dockerfile: infra/docker/Dockerfile.backend
-          - name: ai-engine
-            dockerfile: infra/docker/Dockerfile.ai-engine
-          - name: frontend
+          - service:    frontend
             dockerfile: infra/docker/Dockerfile.frontend
+          - service:    ai-engine
+            dockerfile: infra/docker/Dockerfile.ai-engine
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to Container Registry
+      - name: Login to GHCR
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata
+      - name: Docker meta
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-${{ matrix.service.name }}
+          images: ${{ env.IMAGE_PREFIX }}-${{ matrix.service }}
           tags: |
+            type=sha,prefix=sha-
             type=ref,event=branch
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=sha,prefix=sha-,format=short
+            type=ref,event=pr,prefix=pr-
+            type=raw,value=latest,enable={{is_default_branch}}
 
-      - name: Build and push ${{ matrix.service.name }}
+      - name: Build & Push
         uses: docker/build-push-action@v5
         with:
-          context: .
-          file: ${{ matrix.service.dockerfile }}
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          context:    .
+          file:       ${{ matrix.dockerfile }}
+          push:       true
+          tags:       ${{ steps.meta.outputs.tags }}
+          labels:     ${{ steps.meta.outputs.labels }}
+          cache-from: type=registry,ref=${{ env.IMAGE_PREFIX }}-${{ matrix.service }}:buildcache
+          cache-to:   type=registry,ref=${{ env.IMAGE_PREFIX }}-${{ matrix.service }}:buildcache,mode=max
+          build-args: |
+            NEXT_PUBLIC_API_URL=${{ secrets.NEXT_PUBLIC_API_URL }}
+            NEXT_PUBLIC_APP_URL=${{ secrets.NEXT_PUBLIC_APP_URL }}
 
-  # ── Deploy to Production ──────────────────────────────────────────────────────
-  deploy-production:
-    name: Deploy to Production
+  # ── Preview Deployment (PRs only) ─────────────────────────
+  deploy-preview:
+    name: Deploy Preview
     runs-on: ubuntu-latest
-    needs: build-and-push
-    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    needs: build-push
+    if: github.event_name == 'pull_request'
     environment:
-      name: production
-      url: ${{ vars.PRODUCTION_URL }}
+      name: preview-pr-${{ github.event.pull_request.number }}
+      url:  https://pr-${{ github.event.pull_request.number }}.preview.codemorph.ai
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Set image tag
-        id: tag
-        run: |
-          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
-            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
-          else
-            echo "tag=sha-$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Deploy via SSH
-        uses: appleboy/ssh-action@v1
+      - name: Deploy preview via SSH
+        uses: appleboy/ssh-action@v1.0.0
         with:
-          host: ${{ secrets.DEPLOY_HOST }}
-          username: ${{ secrets.DEPLOY_USER }}
-          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          host:     ${{ secrets.PREVIEW_HOST }}
+          username: ${{ secrets.PREVIEW_USER }}
+          key:      ${{ secrets.PREVIEW_SSH_KEY }}
           script: |
             set -e
+            export TAG=pr-${{ github.event.pull_request.number }}
+            export PR_NUMBER=${{ github.event.pull_request.number }}
+
+            cd /opt/codemorph-preview
+            docker compose -f docker-compose.prod.yml pull
+            docker compose -f docker-compose.prod.yml up -d --remove-orphans
+            docker system prune -f --filter "until=48h"
+
+            echo "✅ Preview deployed: pr-${PR_NUMBER}"
+
+      - name: Comment PR with preview URL
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const url = `https://pr-${{ github.event.pull_request.number }}.preview.codemorph.ai`;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner:        context.repo.owner,
+              repo:         context.repo.repo,
+              body:         `## 🚀 Preview Deployment\n\n` +
+                            `✅ Déployé sur: **${url}**\n\n` +
+                            `- Image: \`sha-${{ github.sha }}\`\n` +
+                            `- Commit: \`${{ github.sha }}\`\n` +
+                            `- Branch: \`${{ github.head_ref }}\`\n\n` +
+                            `> Cette preview sera automatiquement supprimée à la fermeture de la PR.`,
+            });
+
+  # ── Production Deployment (main branch only) ──────────────
+  deploy-production:
+    name: Deploy Production
+    runs-on: ubuntu-latest
+    needs: build-push
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment:
+      name: production
+      url:  https://app.codemorph.ai
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Record rollback snapshot
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host:     ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key:      ${{ secrets.DEPLOY_SSH_KEY }}
+          script: |
+            # Save current image tags for rollback
             cd /opt/codemorph
-            
-            # Pull latest images
-            export IMAGE_TAG=${{ steps.tag.outputs.tag }}
-            docker compose pull backend ai-engine frontend
-            
-            # Rolling restart — no downtime
-            docker compose up -d --no-deps backend ai-engine frontend
-            
-            # Cleanup old images
-            docker image prune -f
-            
-            echo "✅ Deployment complete — tag: $IMAGE_TAG"
+            docker compose -f docker-compose.prod.yml config --images > /opt/codemorph/.rollback_images_$(date +%Y%m%d_%H%M%S) 2>/dev/null || true
+            # Keep only last 5 snapshots
+            ls -t /opt/codemorph/.rollback_images_* 2>/dev/null | tail -n +6 | xargs rm -f || true
 
-      - name: Health check
-        run: |
-          sleep 15
-          curl -f "${{ vars.PRODUCTION_URL }}/api/v1/health" || exit 1
-          echo "✅ Health check passed"
+      - name: Deploy to production
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host:     ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key:      ${{ secrets.DEPLOY_SSH_KEY }}
+          script: |
+            set -e
+            export TAG=sha-${{ github.sha }}
+            cd /opt/codemorph
 
-      - name: Notify on success
+            echo "📦 Pulling new images (tag=${TAG})…"
+            docker compose -f docker-compose.prod.yml pull
+
+            echo "🔄 Rolling update (zero-downtime)…"
+            # Update services one by one with health checks
+            for svc in ai-engine backend frontend; do
+              docker compose -f docker-compose.prod.yml up -d --no-deps $svc
+              sleep 10
+              # Verify health
+              if ! docker compose -f docker-compose.prod.yml ps $svc | grep -q "healthy"; then
+                echo "❌ $svc failed health check — rolling back…"
+                docker compose -f docker-compose.prod.yml up -d --no-deps $svc --scale $svc=0 || true
+                exit 1
+              fi
+              echo "✅ $svc healthy"
+            done
+
+            echo "🧹 Cleaning up old images…"
+            docker system prune -f --filter "until=72h"
+
+            echo "✅ Production deployment complete — tag=${TAG}"
+
+      - name: Notify Slack (success)
         if: success()
-        uses: slackapi/slack-github-action@v1
+        uses: slackapi/slack-github-action@v1.27.0
         with:
           payload: |
             {
-              "text": "✅ CodeMorph deployed to production — <${{ vars.PRODUCTION_URL }}|View App>",
-              "attachments": [{
-                "color": "good",
-                "fields": [
-                  { "title": "Branch", "value": "${{ github.ref_name }}", "short": true },
-                  { "title": "Commit", "value": "${{ github.sha }}", "short": true },
-                  { "title": "Author", "value": "${{ github.actor }}", "short": true }
-                ]
-              }]
+              "text": "✅ *CodeMorph deployed to production*",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "✅ *Production deployment successful*\n>*Commit:* `${{ github.sha }}`\n>*Author:* ${{ github.actor }}\n>*Message:* ${{ github.event.head_commit.message }}\n>*URL:* <https://app.codemorph.ai|app.codemorph.ai>"
+                  }
+                }
+              ]
             }
         env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_URL:  ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
 
-      - name: Notify on failure
+      - name: Notify Slack (failure + rollback)
         if: failure()
-        uses: slackapi/slack-github-action@v1
+        uses: slackapi/slack-github-action@v1.27.0
         with:
           payload: |
             {
-              "text": "❌ CodeMorph deployment FAILED — <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Run>",
-              "attachments": [{ "color": "danger" }]
+              "text": "❌ *CodeMorph production deployment FAILED — manual rollback may be needed*",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "❌ *Deployment failed — checking rollback*\n>*Commit:* `${{ github.sha }}`\n>*Author:* ${{ github.actor }}\n>*Action:* <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View logs>"
+                  }
+                }
+              ]
             }
         env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_URL:  ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+  # ── Cleanup preview on PR close ───────────────────────────
+  cleanup-preview:
+    name: Cleanup Preview
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' && github.event.action == 'closed'
+    steps:
+      - name: Remove preview environment
+        uses: appleboy/ssh-action@v1.0.0
+        continue-on-error: true
+        with:
+          host:     ${{ secrets.PREVIEW_HOST }}
+          username: ${{ secrets.PREVIEW_USER }}
+          key:      ${{ secrets.PREVIEW_SSH_KEY }}
+          script: |
+            export PR_NUMBER=${{ github.event.pull_request.number }}
+            cd /opt/codemorph-preview
+            docker compose -f docker-compose.prod.yml down --remove-orphans --volumes 2>/dev/null || true
+            echo "🗑️ Preview pr-${PR_NUMBER} cleaned up"

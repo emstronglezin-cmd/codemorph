@@ -178,6 +178,17 @@ export class AuthService {
     return newUser;
   }
 
+  // ── Login OAuth User → issue JWT ─────────────────────
+  async loginOAuthUser(user: {
+    id: string;
+    email: string;
+    role: string;
+    plan: string;
+  }): Promise<AuthTokens> {
+    await this.usersService.updateLastLogin(user.id as UserId);
+    return this.generateTokens(user);
+  }
+
   // ── Generate tokens ───────────────────────────────────
   private async generateTokens(user: {
     id: string;
