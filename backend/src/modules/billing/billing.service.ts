@@ -7,6 +7,7 @@ import Stripe from 'stripe';
 
 import type { UserId } from '@codemorph/shared';
 import { UsersService } from '../users/users.service';
+import type { Plan } from '../subscription/plan-limits.config';
 
 @Injectable()
 export class BillingService {
@@ -25,26 +26,28 @@ export class BillingService {
   // ── Create checkout session ────────────────────────────
   async createCheckoutSession(
     userId: UserId,
-    plan: 'starter' | 'pro' | 'enterprise',
+    plan: Plan,
   ): Promise<{ url: string }> {
     const user = await this.usersService.findByIdOrFail(userId);
-    const appUrl = this.config.get<string>('app.appUrl', 'http://localhost:3000');
+    const frontendUrl = this.config.get<string>('FRONTEND_URL',
+      this.config.get<string>('app.appUrl', 'http://localhost:3000'),
+    );
 
     const priceIds: Record<string, string> = {
-      starter:    this.config.get<string>('STRIPE_STARTER_PRICE_ID', ''),
-      pro:        this.config.get<string>('STRIPE_PRO_PRICE_ID', ''),
-      enterprise: this.config.get<string>('STRIPE_ENTERPRISE_PRICE_ID', ''),
+      free:    '',
+      pro:     this.config.get<string>('STRIPE_PRICE_PRO_MONTHLY', ''),
+      pro_max: this.config.get<string>('STRIPE_PRICE_PRO_MAX_MONTHLY', ''),
     };
 
     const priceId = priceIds[plan];
-    if (!priceId) throw new BadRequestException(`Invalid plan: ${plan}`);
+    if (!priceId) throw new BadRequestException(`Invalid plan or no price configured: ${plan}`);
 
     const session = await this.stripe.checkout.sessions.create({
       customer_email: user.email,
       line_items: [{ price: priceId, quantity: 1 }],
       mode: 'subscription',
-      success_url: `${appUrl}/dashboard/org/billing?success=true&session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url:  `${appUrl}/dashboard/org/billing?canceled=true`,
+      success_url: `${frontendUrl}/dashboard/billing?success=true&session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url:  `${frontendUrl}/dashboard/billing?canceled=true`,
       metadata:    { userId: userId as string, plan },
     });
 
@@ -58,10 +61,12 @@ export class BillingService {
       throw new BadRequestException('No billing account found. Please subscribe first.');
     }
 
-    const appUrl = this.config.get<string>('app.appUrl', 'http://localhost:3000');
+    const frontendUrl = this.config.get<string>('FRONTEND_URL',
+      this.config.get<string>('app.appUrl', 'http://localhost:3000'),
+    );
     const session = await this.stripe.billingPortal.sessions.create({
       customer:   user.stripeCustomerId,
-      return_url: `${appUrl}/dashboard/org/billing`,
+      return_url: `${frontendUrl}/dashboard/billing`,
     });
 
     return { url: session.url };
@@ -95,7 +100,7 @@ export class BillingService {
 
   private async handleCheckoutCompleted(session: Stripe.Checkout.Session): Promise<void> {
     const userId = session.metadata?.['userId'] as string | undefined;
-    const plan   = session.metadata?.['plan'] as 'starter' | 'pro' | 'enterprise' | undefined;
+    const plan   = session.metadata?.['plan'] as Plan | undefined;
 
     if (!userId || !plan) return;
 
@@ -107,9 +112,10 @@ export class BillingService {
 
   private async handleSubscriptionDeleted(subscription: Stripe.Subscription): Promise<void> {
     const customerId = subscription.customer as string;
-    // Find user by stripeCustomerId and downgrade to free
-    void customerId;
-    // TODO: implement lookup by stripe customer ID
+    const user = await this.usersService.findByStripeCustomerId(customerId);
+    if (user) {
+      await this.usersService.update(user.id as UserId, { plan: 'free' });
+    }
   }
 
   private async handleSubscriptionUpdated(subscription: Stripe.Subscription): Promise<void> {

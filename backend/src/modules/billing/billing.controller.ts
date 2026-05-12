@@ -20,6 +20,7 @@ import { JwtAuthGuard }   from '../../common/guards/jwt-auth.guard';
 import { CurrentUser }    from '../../common/decorators/current-user.decorator';
 import { Public }         from '../../common/decorators/public.decorator';
 import type { JwtPayload } from '@codemorph/shared';
+import type { Plan }       from '../subscription/plan-limits.config';
 
 @ApiTags('billing')
 @UseGuards(JwtAuthGuard)
@@ -33,7 +34,7 @@ export class BillingController {
   @ApiOperation({ summary: 'Create Stripe checkout session' })
   async createCheckout(
     @CurrentUser() user: JwtPayload,
-    @Body() body: { plan: 'starter' | 'pro' | 'enterprise' },
+    @Body() body: { plan: Plan },
   ): Promise<{ url: string }> {
     return this.billingService.createCheckoutSession(user.sub, body.plan);
   }

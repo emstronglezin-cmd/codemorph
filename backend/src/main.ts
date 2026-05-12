@@ -34,11 +34,26 @@ async function bootstrap(): Promise<void> {
   }));
 
   // ── CORS ─────────────────────────────────────────────────
+  // Support both FRONTEND_URL (production) and APP_URL (legacy) + localhost dev
+  const allowedOrigins = [
+    config.get<string>('FRONTEND_URL', ''),
+    config.get<string>('APP_URL', ''),
+    config.get<string>('AI_ENGINE_URL', ''),
+    'http://localhost:3000',
+    'http://127.0.0.1:3000',
+  ].filter(Boolean);
+
   app.enableCors({
-    origin: [
-      config.get<string>('APP_URL', 'http://localhost:3000'),
-      config.get<string>('AI_ENGINE_URL', 'http://localhost:5000'),
-    ],
+    origin: (origin, callback) => {
+      // Allow requests with no origin (server-to-server, curl)
+      if (!origin) return callback(null, true);
+      if (allowedOrigins.includes(origin)) return callback(null, true);
+      // In development, allow all localhost origins
+      if (nodeEnv !== 'production' && /^https?:\/\/localhost(:\d+)?$/.test(origin)) {
+        return callback(null, true);
+      }
+      callback(new Error(`CORS: origin '${origin}' not allowed`));
+    },
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     credentials: true,
     allowedHeaders: ['Content-Type', 'Authorization', 'X-Request-ID', 'X-Org-ID'],

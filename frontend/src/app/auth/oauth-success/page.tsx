@@ -3,11 +3,21 @@
 import { useEffect, Suspense } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
 import { useAuthStore } from '@/stores/auth.store';
+import { apiGet } from '@/lib/api/client';
 
-function OAuthSuccessInner() {
+interface MeResponse {
+  id: string;
+  email: string;
+  name: string;
+  avatarUrl?: string;
+  role: string;
+  plan: string;
+}
+
+function OAuthSuccessInner(): React.JSX.Element {
   const searchParams = useSearchParams();
   const router       = useRouter();
-  const setToken     = useAuthStore(s => s.setToken);
+  const setAuth      = useAuthStore(s => s.setAuth);
 
   useEffect(() => {
     const token = searchParams.get('token');
@@ -15,14 +25,27 @@ function OAuthSuccessInner() {
       router.replace('/auth/sign-in?error=oauth_failed');
       return;
     }
-    // Store token in memory store
-    setToken(token);
-    // Inject into window for axios interceptor
+
+    // Inject into window for axios interceptor immediately
     if (typeof window !== 'undefined') {
-      (window as Record<string, unknown>)['__CODEMORPH_ACCESS_TOKEN__'] = token;
+      window.__CODEMORPH_ACCESS_TOKEN__ = token;
     }
-    router.replace('/dashboard');
-  }, [searchParams, router, setToken]);
+
+    // Fetch user profile with the new token
+    apiGet<MeResponse>('/auth/me')
+      .then((user) => {
+        setAuth(user, token);
+        router.replace('/dashboard');
+      })
+      .catch(() => {
+        // Fallback: store token with minimal user info
+        setAuth(
+          { id: '', email: '', name: '', role: 'member', plan: 'free' },
+          token,
+        );
+        router.replace('/dashboard');
+      });
+  }, [searchParams, router, setAuth]);
 
   return (
     <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-slate-900 to-slate-800">
@@ -39,7 +62,7 @@ function OAuthSuccessInner() {
   );
 }
 
-export default function OAuthSuccessPage() {
+export default function OAuthSuccessPage(): React.JSX.Element {
   return (
     <Suspense fallback={
       <div className="min-h-screen flex items-center justify-center bg-slate-900">

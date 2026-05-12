@@ -38,7 +38,7 @@ interface ProjectState {
   clearError: () => void;
 }
 
-export const useProjectStore = create<ProjectState>((set, get) => ({
+export const useProjectStore = create<ProjectState>((set, _get) => ({
   projects: [],
   currentProject: null,
   total: 0,

@@ -38,10 +38,10 @@ export class UserEntity {
 
   @Column({
     type: 'enum',
-    enum: ['free', 'starter', 'pro', 'enterprise'],
+    enum: ['free', 'pro', 'pro_max'],
     default: 'free',
   })
-  plan!: 'free' | 'starter' | 'pro' | 'enterprise';
+  plan!: 'free' | 'pro' | 'pro_max';
 
   @Column({
     type: 'enum',

@@ -20,10 +20,19 @@ import {
   Code2,
 } from 'lucide-react';
 
+// ── Tooltip stubs (Radix UI pending) ─────────────────────
+function Tooltip({ children }: { children: React.ReactNode }): React.JSX.Element {
+  return <>{children}</>;
+}
+function TooltipTrigger({ children, asChild: _ }: { children: React.ReactNode; asChild?: boolean }): React.JSX.Element {
+  return <>{children}</>;
+}
+function TooltipContent({ children, side: _, className: __ }: { children: React.ReactNode; side?: string; className?: string }): React.JSX.Element {
+  return <>{children}</>;
+}
+
 import { cn } from '@/lib/utils/cn';
-import { Button } from '@/components/ui/button';
 import { Separator } from '@/components/ui/separator';
-import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 
 // ── Nav items config ──────────────────────────────────────
 const MAIN_NAV = [
@@ -182,13 +191,4 @@ function NavItem({ label, href, icon: Icon, active, collapsed }: NavItemProps): 
   return item;
 }
 
-// Tooltip stub (will be replaced by real Radix import)
-function Tooltip({ children }: { children: React.ReactNode }): React.JSX.Element {
-  return <>{children}</>;
-}
-function TooltipTrigger({ children, asChild: _ }: { children: React.ReactNode; asChild?: boolean }): React.JSX.Element {
-  return <>{children}</>;
-}
-function TooltipContent({ children, side: _, className: __ }: { children: React.ReactNode; side?: string; className?: string }): React.JSX.Element {
-  return <>{children}</>;
-}
+

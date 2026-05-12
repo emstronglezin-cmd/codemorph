@@ -1,5 +1,9 @@
 // ============================================================
-// CodeMorph — cn() re-export
-// Allows both @/lib/utils/cn and @/lib/utils to work
+// CodeMorph — PostCSS Configuration
 // ============================================================
-export { cn } from '@/lib/utils';
+module.exports = {
+  plugins: {
+    tailwindcss: {},
+    autoprefixer: {},
+  },
+};

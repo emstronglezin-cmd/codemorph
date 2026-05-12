@@ -1,0 +1,52 @@
+# ============================================================
+# CodeMorph — Netlify Deployment Configuration
+# Framework: Next.js 14 (SSR via @netlify/plugin-nextjs)
+# ============================================================
+
+[build]
+  base    = "frontend"
+  command = "npm run build"
+  publish = ".next"
+
+[build.environment]
+  NODE_VERSION = "20"
+  NPM_VERSION  = "10"
+
+# ── Next.js plugin (handles SSR + API routes on Netlify) ──
+[[plugins]]
+  package = "@netlify/plugin-nextjs"
+
+# ── Headers ───────────────────────────────────────────────
+[[headers]]
+  for = "/*"
+  [headers.values]
+    X-Frame-Options        = "DENY"
+    X-Content-Type-Options = "nosniff"
+    X-XSS-Protection       = "1; mode=block"
+    Referrer-Policy        = "strict-origin-when-cross-origin"
+    Permissions-Policy     = "camera=(), microphone=(), geolocation=()"
+
+[[headers]]
+  for = "/_next/static/*"
+  [headers.values]
+    Cache-Control = "public, max-age=31536000, immutable"
+
+[[headers]]
+  for = "/fonts/*"
+  [headers.values]
+    Cache-Control = "public, max-age=31536000, immutable"
+
+# ── Redirects ─────────────────────────────────────────────
+[[redirects]]
+  from   = "/login"
+  to     = "/auth/sign-in"
+  status = 301
+
+[[redirects]]
+  from   = "/signup"
+  to     = "/auth/sign-up"
+  status = 301
+
+# ── Environment variables (set in Netlify dashboard) ──────
+# NEXT_PUBLIC_API_URL       = https://your-backend.onrender.com/api/v1
+# NEXT_PUBLIC_APP_URL       = https://your-app.netlify.app
