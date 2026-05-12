@@ -79,3 +79,5 @@ ai-engine/.cache/
 
 # Wrangler
 .wrangler/
+frontend/core
+core
