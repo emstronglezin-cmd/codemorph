@@ -2,14 +2,10 @@ import { Request, Response, NextFunction } from 'express';
 import pino from 'pino';
 import { randomUUID } from 'crypto';
 
-const logger = pino({
-  name: 'ai-engine:http',
-  level: process.env.LOG_LEVEL ?? 'info',
-  transport:
-    process.env.NODE_ENV === 'development'
-      ? { target: 'pino-pretty', options: { colorize: true, translateTime: 'SYS:standard' } }
-      : undefined,
-});
+const pinoOpts = process.env.NODE_ENV === 'development'
+  ? { name: 'ai-engine:http', level: process.env['LOG_LEVEL'] ?? 'info', transport: { target: 'pino-pretty', options: { colorize: true, translateTime: 'SYS:standard' } } }
+  : { name: 'ai-engine:http', level: process.env['LOG_LEVEL'] ?? 'info' };
+const logger = pino(pinoOpts);
 
 // Attach request ID and logger to every request
 export function requestLogger(req: Request, res: Response, next: NextFunction): void {

@@ -137,7 +137,7 @@ export class IRGenerator {
   }
 
   // ── UI Graph generation ────────────────────────────────
-  private async generateUIGraph(ctx: ConversionContext, ast: ASTResult, arch: ArchResult): Promise<{ data: IRDocument['uiGraph']; tokens: number }> {
+  private async generateUIGraph(ctx: ConversionContext, ast: ASTResult, _arch: ArchResult): Promise<{ data: IRDocument['uiGraph']; tokens: number }> {
     const uiFiles = ast.files.filter((f) => /screen|page|view|widget|component/i.test(f.path));
     if (uiFiles.length === 0) return { data: { screens: [], components: [], navigationFlow: [], stateFlow: [] }, tokens: 0 };
 
@@ -167,7 +167,7 @@ Target: ${ctx.targetFramework}. Return ONLY valid JSON.`;
   }
 
   // ── Backend Graph generation ────────────────────────────
-  private async generateBackendGraph(ctx: ConversionContext, ast: ASTResult, arch: ArchResult): Promise<{ data: IRDocument['backendGraph']; tokens: number }> {
+  private async generateBackendGraph(ctx: ConversionContext, ast: ASTResult, _arch: ArchResult): Promise<{ data: IRDocument['backendGraph']; tokens: number }> {
     const beFiles = ast.files.filter((f) => /service|controller|router|route|handler/i.test(f.path));
     if (beFiles.length === 0) return { data: { routes: [], services: [], entities: [], middlewares: [] }, tokens: 0 };
 
@@ -197,7 +197,7 @@ Target: ${ctx.targetFramework}. Return ONLY valid JSON.`;
   }
 
   // ── Data Layer generation ───────────────────────────────
-  private async generateDataLayer(ctx: ConversionContext, ast: ASTResult): Promise<{ data: IRDocument['dataLayer']; tokens: number }> {
+  private async generateDataLayer(_ctx: ConversionContext, ast: ASTResult): Promise<{ data: IRDocument['dataLayer']; tokens: number }> {
     const dataFiles = ast.files.filter((f) => /model|entity|schema|migration/i.test(f.path));
     if (dataFiles.length === 0) return { data: { models: [], relationships: [], migrations: [] }, tokens: 0 };
 

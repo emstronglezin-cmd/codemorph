@@ -38,7 +38,7 @@ export class LoggerService implements NestLoggerService {
   private readonly isDev:   boolean;
   private readonly host:    string;
 
-  constructor(private readonly config: ConfigService) {
+  constructor(config: ConfigService) {
     this.env     = config.get<string>('NODE_ENV', 'development');
     this.service = config.get<string>('SERVICE_NAME', 'codemorph-backend');
     this.isDev   = this.env === 'development';

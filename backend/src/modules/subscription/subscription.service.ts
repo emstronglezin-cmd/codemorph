@@ -3,8 +3,8 @@
 // Modulaire : Stripe aujourd'hui, LemonSqueezy/Paddle demain
 // ============================================================
 import {
-  Injectable, Logger, NotFoundException,
-  BadRequestException, ForbiddenException,
+  Injectable, Logger,
+  BadRequestException, ForbiddenException
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
@@ -63,7 +63,7 @@ export class SubscriptionService {
   ) {
     this.stripe = new Stripe(
       this.config.get<string>('STRIPE_SECRET_KEY', 'sk_test_placeholder'),
-      { apiVersion: '2024-12-18.acacia' },
+      { apiVersion: '2023-10-16' },
     );
   }
 
@@ -85,7 +85,7 @@ export class SubscriptionService {
     });
 
     const user = await this.usersService.findById(userId as any);
-    const plan: Plan = (user?.plan as Plan) ?? 'free';
+    const _unusedPlan: Plan = (user?.plan as Plan) ?? 'free'; void _unusedPlan;
 
     const summary: SubscriptionSummary = sub
       ? {
@@ -288,8 +288,8 @@ export class SubscriptionService {
         providerCustomerId:     sub.customer as string,
         currentPeriodStart:     new Date(sub.current_period_start * 1000),
         currentPeriodEnd:       new Date(sub.current_period_end * 1000),
-        trialEnd:               sub.trial_end ? new Date(sub.trial_end * 1000) : null,
-        cancelAtPeriodEnd:      sub.cancel_at_period_end ? new Date(sub.cancel_at * 1000) : null,
+        trialEnd:               sub.trial_end ? new Date(sub.trial_end * 1000) : undefined,
+        cancelAtPeriodEnd:      sub.cancel_at_period_end && sub.cancel_at ? new Date(sub.cancel_at * 1000) : undefined,
       })
       .orUpdate(
         ['plan', 'status', 'interval', 'currentPeriodStart', 'currentPeriodEnd', 'trialEnd', 'cancelAtPeriodEnd', 'updatedAt'],

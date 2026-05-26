@@ -3,7 +3,7 @@
 // Tracks & enforces per-user monthly usage limits
 // ============================================================
 import {
-  Injectable, Logger, ForbiddenException,
+  Injectable, ForbiddenException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
@@ -22,8 +22,8 @@ interface QuotaCheckResult {
 
 @Injectable()
 export class QuotaService {
-  private readonly logger = new Logger(QuotaService.name);
-  private readonly CACHE_TTL = 60; // seconds
+  
+  
 
   constructor(
     @InjectRepository(UsageQuotaEntity)
@@ -142,15 +142,17 @@ export class QuotaService {
   }
 
   // ── Check AI request rate limit ──────────────────────────
-  async checkAiRateLimit(userId: string, plan: Plan): Promise<boolean> {
+  async checkAiRateLimit(userId: string, plan: Plan): Promise<{ allowed: boolean; resetInSeconds: number }> {
     const limits = getPlanLimits(plan);
-    if (isUnlimited(limits.aiRequestsPerHour)) return true;
+    if (isUnlimited(limits.aiRequestsPerHour)) return { allowed: true, resetInSeconds: 0 };
 
     const key    = `ratelimit:ai:${userId}:${Math.floor(Date.now() / 3_600_000)}`;
     const count  = await this.redis.incr(key);
     if (count === 1) await this.redis.expire(key, 3600);
 
-    return count <= limits.aiRequestsPerHour;
+    const allowed = count <= limits.aiRequestsPerHour;
+    const resetInSeconds = allowed ? 0 : 3600 - (Math.floor(Date.now() / 1000) % 3600);
+    return { allowed, resetInSeconds };
   }
 
   // ── Check concurrent jobs ────────────────────────────────
@@ -161,13 +163,13 @@ export class QuotaService {
     return { allowed: current < limits.concurrentJobs, current, limit: limits.concurrentJobs };
   }
 
-  async incrementConcurrentJobs(userId: string): Promise<void> {
+  async incrementConcurrentJobs(userId: string, _plan?: Plan): Promise<void> {
     const key = `concurrent:${userId}`;
     await this.redis.incr(key);
     await this.redis.expire(key, 3600); // auto-cleanup after 1h
   }
 
-  async decrementConcurrentJobs(userId: string): Promise<void> {
+  async decrementConcurrentJobs(userId: string, _plan?: Plan): Promise<void> {
     const key = `concurrent:${userId}`;
     const val = await this.redis.decr(key);
     if (val < 0) await this.redis.set(key, '0');

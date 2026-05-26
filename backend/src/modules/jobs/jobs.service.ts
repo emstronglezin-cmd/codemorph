@@ -153,6 +153,7 @@ export class JobsService {
     status: JobStatus,
     extra?: Partial<JobEntity>,
   ): Promise<void> {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await this.jobRepo.update(id, {
       status,
       ...(status === JobStatus.ANALYZING || status === JobStatus.CONVERTING
@@ -160,7 +161,7 @@ export class JobsService {
       ...(status === JobStatus.DONE || status === JobStatus.FAILED
         ? { completedAt: new Date() } : {}),
       ...extra,
-    });
+    } as any);
   }
 
   // ── Append phase log ──────────────────────────────────
@@ -181,6 +182,7 @@ export class JobsService {
     files:       Array<{ path: string; content: string }>,
     goalPrompt?: string,
   ): Promise<string> {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const callbackUrl = `${this.config.get<string>('API_URL', 'http://backend:4000')}/api/v1/jobs/${job.id}/callback`;
 
     const aiJobId = await this.aiEngineClient.submitConversion({
@@ -192,7 +194,7 @@ export class JobsService {
       callbackUrl,
     });
 
-    return aiJobId;
+    return String(aiJobId);
   }
 
   // ── Handle callback from AI Engine ────────────────────

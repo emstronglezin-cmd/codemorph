@@ -7,7 +7,7 @@ import { AuthService } from '../auth.service';
 @Injectable()
 export class GoogleStrategy extends PassportStrategy(Strategy, 'google') {
   constructor(
-    private readonly configService: ConfigService,
+    configService: ConfigService,
     private readonly authService: AuthService,
   ) {
     super({
@@ -43,7 +43,7 @@ export class GoogleStrategy extends PassportStrategy(Strategy, 'google') {
         avatarUrl,
       });
 
-      done(null, user);
+      done(null, user as false | Express.User);
     } catch (err) {
       done(err as Error, undefined);
     }

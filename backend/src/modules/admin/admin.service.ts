@@ -4,7 +4,7 @@
 // ============================================================
 import { Injectable, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, MoreThan, Between } from 'typeorm';
+import { Repository, MoreThan } from 'typeorm';
 import { UserEntity } from '../users/entities/user.entity';
 import { JobEntity, JobStatus } from '../jobs/jobs.entity';
 import { SubscriptionEntity, SubscriptionStatus } from '../subscription/subscription.entity';
@@ -33,7 +33,7 @@ export class AdminService {
       const now = new Date();
       const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
       const last24h = new Date(Date.now() - 86_400_000);
-      const last7d  = new Date(Date.now() - 7 * 86_400_000);
+
 
       const [
         totalUsers,
@@ -104,7 +104,7 @@ export class AdminService {
         },
         generatedAt: now.toISOString(),
       };
-    }, CacheService.TTL.SHORT);
+    }, CacheService.TTL['SHORT']);
   }
 
   // ── User list (paginated) ────────────────────────────────
@@ -210,7 +210,7 @@ export class AdminService {
         .orderBy('COUNT(*)', 'DESC')
         .limit(20)
         .getRawMany<{ error: string; count: string }>();
-    }, CacheService.TTL.SHORT);
+    }, CacheService.TTL['SHORT']);
   }
 
   // ── Force cancel stuck job ───────────────────────────────

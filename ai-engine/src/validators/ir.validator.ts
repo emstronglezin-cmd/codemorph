@@ -5,23 +5,29 @@ import type { IRDocument } from '../models/ir.types';
 
 export class IRValidator {
   async validate(ir: IRDocument): Promise<IRDocument> {
-    const warnings: string[] = [...(ir.validation.warnings ?? [])];
-    const blockers:  string[] = [...(ir.validation.blockers ?? [])];
+    // Defensive guards: handle incomplete IR from fallback generators
+    const validation = ir.validation ?? { warnings: [], blockers: [], buildable: true, riskLevel: 'low' };
+    const projectMeta = ir.projectMeta ?? { name: 'unknown', sourceStack: 'Flutter', targetStack: 'React', complexityScore: 50 };
+    const architecture = ir.architecture ?? { modules: [], patterns: [], layers: [] };
+    const conversionPlan = ir.conversionPlan ?? [];
 
-    if (!ir.projectMeta.name) blockers.push('projectMeta.name is required');
-    if (!ir.projectMeta.sourceStack) blockers.push('projectMeta.sourceStack is required');
-    if (!ir.projectMeta.targetStack) blockers.push('projectMeta.targetStack is required');
-    if (ir.projectMeta.complexityScore < 0 || ir.projectMeta.complexityScore > 100) {
+    const warnings: string[] = [...(validation.warnings ?? [])];
+    const blockers:  string[] = [...(validation.blockers ?? [])];
+
+    if (!projectMeta.name) blockers.push('projectMeta.name is required');
+    if (!projectMeta.sourceStack) blockers.push('projectMeta.sourceStack is required');
+    if (!projectMeta.targetStack) blockers.push('projectMeta.targetStack is required');
+    if ((projectMeta.complexityScore ?? 0) < 0 || (projectMeta.complexityScore ?? 0) > 100) {
       warnings.push('complexityScore must be 0-100, clamping');
-      ir.projectMeta.complexityScore = Math.min(100, Math.max(0, ir.projectMeta.complexityScore));
+      projectMeta.complexityScore = Math.min(100, Math.max(0, projectMeta.complexityScore ?? 50));
     }
-    if (ir.conversionPlan.length === 0) warnings.push('conversionPlan is empty');
-    if (ir.architecture.modules.length === 0) warnings.push('No architecture modules detected');
+    if (conversionPlan.length === 0) warnings.push('conversionPlan is empty');
+    if (architecture.modules.length === 0) warnings.push('No architecture modules detected');
 
     return {
       ...ir,
       validation: {
-        ...ir.validation,
+        ...validation,
         buildable:  blockers.length === 0,
         riskLevel:  blockers.length > 0 ? 'critical' : warnings.length > 2 ? 'high' : warnings.length > 0 ? 'medium' : 'low',
         warnings,

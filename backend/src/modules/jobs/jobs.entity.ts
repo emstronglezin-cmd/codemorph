@@ -31,88 +31,62 @@ export enum JobType {
 @Index(['projectId', 'createdAt'])
 export class JobEntity {
   @PrimaryGeneratedColumn('uuid')
-  id: string;
-
+  id!: string;
   @Column({ type: 'enum', enum: JobType })
-  type: JobType;
-
+  type!: JobType;
   @Column({ type: 'enum', enum: JobStatus, default: JobStatus.PENDING })
-  status: JobStatus;
-
+  status!: JobStatus;
   @Column({ nullable: true })
-  sourceLanguage: string;
-
+  sourceLanguage!: string;
   @Column({ nullable: true })
-  targetLanguage: string;
-
+  targetLanguage!: string;
   @Column({ nullable: true })
-  sourceRepo: string;
-
+  sourceRepo!: string;
   @Column({ nullable: true })
-  sourceBranch: string;
-
+  sourceBranch!: string;
   @Column({ nullable: true })
-  zipPath: string;
-
+  zipPath!: string;
   @Column({ nullable: true })
-  aiEngineJobId: string;
-
+  aiEngineJobId!: string;
   @Column({ type: 'int', default: 0 })
-  progress: number;
-
+  progress!: number;
   @Column({ nullable: true })
-  currentPhase: string;
+  currentPhase!: string;
+  @Column({ type: 'jsonb', nullable: true })
+  phaseLogs!: Array<{ phase: string; status: string; message: string; timestamp: string }>;
 
   @Column({ type: 'jsonb', nullable: true })
-  phaseLogs: Array<{ phase: string; status: string; message: string; timestamp: string }>;
-
+  irDocument!: Record<string, unknown>;
   @Column({ type: 'jsonb', nullable: true })
-  irDocument: Record<string, unknown>;
-
+  result!: Record<string, unknown>;
+  @Column({ nullable: true })
+  errorMessage!: string;
   @Column({ type: 'jsonb', nullable: true })
-  result: Record<string, unknown>;
-
+  errorDetails!: Record<string, unknown>;
   @Column({ nullable: true })
-  errorMessage: string;
-
-  @Column({ type: 'jsonb', nullable: true })
-  errorDetails: Record<string, unknown>;
-
+  outputZipPath!: string;
   @Column({ nullable: true })
-  outputZipPath: string;
-
-  @Column({ nullable: true })
-  outputGithubPrUrl: string;
-
+  outputGithubPrUrl!: string;
   @Column({ type: 'int', nullable: true })
-  filesGenerated: number;
-
+  filesGenerated!: number;
   @Column({ type: 'int', nullable: true })
-  linesGenerated: number;
-
+  linesGenerated!: number;
   @Column({ nullable: true })
-  startedAt: Date;
-
+  startedAt!: Date;
   @Column({ nullable: true })
-  completedAt: Date;
-
+  completedAt!: Date;
   @Column()
-  userId: string;
-
+  userId!: string;
   @Column({ nullable: true })
-  projectId: string;
-
+  projectId!: string;
   @ManyToOne(() => UserEntity, { onDelete: 'CASCADE' })
   @JoinColumn({ name: 'userId' })
-  user: UserEntity;
-
+  user!: UserEntity;
   @ManyToOne(() => ProjectEntity, { onDelete: 'SET NULL', nullable: true })
   @JoinColumn({ name: 'projectId' })
-  project: ProjectEntity;
-
+  project!: ProjectEntity;
   @CreateDateColumn()
-  createdAt: Date;
-
+  createdAt!: Date;
   @UpdateDateColumn()
-  updatedAt: Date;
+  updatedAt!: Date;
 }

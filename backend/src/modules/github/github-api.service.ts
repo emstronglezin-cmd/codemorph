@@ -59,7 +59,7 @@ export class GitHubApiService {
 
   constructor(
     private readonly httpService: HttpService,
-    private readonly configService: ConfigService,
+    _configService: ConfigService,
     @InjectRepository(UserEntity)
     private readonly userRepo: Repository<UserEntity>,
   ) {}

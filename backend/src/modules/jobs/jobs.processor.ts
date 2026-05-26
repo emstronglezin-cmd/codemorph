@@ -7,7 +7,6 @@ import { Job }    from 'bull';
 
 import { JobsService }      from './jobs.service';
 import { JobStatus, JobType } from './jobs.entity';
-import { AiEngineClient }   from './ai-engine.client';
 import { GitHubApiService } from '../github/github-api.service';
 import { UploadsService }   from '../uploads/uploads.service';
 import { QuotaService }     from '../quota/quota.service';
@@ -34,7 +33,6 @@ export class JobsProcessor {
 
   constructor(
     private readonly jobsService:       JobsService,
-    private readonly aiEngineClient:    AiEngineClient,
     private readonly githubApiService:  GitHubApiService,
     private readonly uploadsService:    UploadsService,
     private readonly quotaService:      QuotaService,

@@ -49,8 +49,11 @@ export class CodePlanner {
       this.staticFile('src/lib/api.ts',     API_CLIENT),
     );
 
+    // Defensive: ensure uiGraph exists
+    const uiGraph = ir.uiGraph ?? { screens: [], components: [], stateFlow: [], stateSlices: [], theme: {} };
+
     // Generate screens from IR
-    for (const screen of ir.uiGraph.screens) {
+    for (const screen of (uiGraph.screens ?? [])) {
       const content = await this.generateScreenFile(ctx, ir, screen.name, screen.components, 'react');
       files.push({
         path:     `src/pages/${screen.name}.tsx`,
@@ -62,7 +65,7 @@ export class CodePlanner {
     }
 
     // Generate components from IR
-    for (const comp of ir.uiGraph.components.filter((c) => c.type === 'ui' || c.type === 'shared')) {
+    for (const comp of (uiGraph.components ?? []).filter((c) => c.type === 'ui' || c.type === 'shared')) {
       const content = await this.generateComponentFile(ctx, comp.name, comp.props ?? [], 'react');
       files.push({
         path:     `src/components/${comp.name}.tsx`,
@@ -73,7 +76,7 @@ export class CodePlanner {
     }
 
     // State stores from IR
-    for (const sf of ir.uiGraph.stateFlow) {
+    for (const sf of (uiGraph.stateFlow ?? [])) {
       files.push({
         path:     `src/stores/${sf.store.toLowerCase()}.store.ts`,
         content:  this.generateZustandStore(sf.store, sf.actions),
@@ -83,10 +86,10 @@ export class CodePlanner {
     }
 
     // Router
-    if (ir.uiGraph.screens.length > 0) {
+    if ((uiGraph.screens ?? []).length > 0) {
       files.push({
         path:    'src/router/index.tsx',
-        content: this.generateReactRouter(ir.uiGraph.screens),
+        content: this.generateReactRouter(uiGraph.screens ?? []),
         language: 'typescript',
         warnings: [],
       });
@@ -106,7 +109,8 @@ export class CodePlanner {
       this.staticFile('app/index.tsx',         RN_INDEX),
     );
 
-    for (const screen of ir.uiGraph.screens) {
+    const uiGraphRN = ir.uiGraph ?? { screens: [], components: [], stateFlow: [], stateSlices: [], theme: {} };
+    for (const screen of (uiGraphRN.screens ?? [])) {
       const content = await this.generateScreenFile(ctx, ir, screen.name, screen.components, 'react-native');
       files.push({
         path:     `app/${screen.name.toLowerCase()}.tsx`,
@@ -173,7 +177,7 @@ export class CodePlanner {
   }
 
   // ── AI-powered file generators ────────────────────────
-  private async generateScreenFile(ctx: ConversionContext, _ir: IRDocument, name: string, components: string[], framework: string): Promise<string> {
+  private async generateScreenFile(_ctx: ConversionContext, _ir: IRDocument, name: string, components: string[], framework: string): Promise<string> {
     const prompt = `Generate a ${framework === 'react' ? 'React + TypeScript + TailwindCSS' : 'React Native + TypeScript'} screen component named "${name}".
 Components to include: ${components.join(', ')}.
 Requirements: TypeScript strict, clean code, proper imports, no placeholder comments.
@@ -190,7 +194,7 @@ Return ONLY the file content, no markdown.`;
     }
   }
 
-  private async generateComponentFile(ctx: ConversionContext, name: string, props: Array<{ name: string; type: string; required: boolean }>, framework: string): Promise<string> {
+  private async generateComponentFile(_ctx: ConversionContext, name: string, props: Array<{ name: string; type: string; required: boolean }>, framework: string): Promise<string> {
     const propTypes = props.map((p) => `${p.name}${p.required ? '' : '?'}: ${p.type}`).join('; ');
     const prompt = `Generate a ${framework === 'react' ? 'React + TypeScript + TailwindCSS' : 'React Native + TypeScript'} UI component named "${name}".
 Props interface: { ${propTypes} }

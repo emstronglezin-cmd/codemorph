@@ -11,7 +11,7 @@ export const convertRouter = Router();
 // POST /api/convert
 convertRouter.post('/', async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
-    const { jobId, projectId, irDocument, sourceCode, sourceLanguage, sourceFramework, targetFramework, userGoal, callbackUrl } = req.body as {
+    const { jobId, projectId, irDocument: _irDocument, sourceCode, sourceLanguage, sourceFramework, targetFramework, userGoal, callbackUrl } = req.body as {
       jobId?:          string;
       projectId:       string;
       irDocument?:     unknown;
@@ -30,7 +30,7 @@ convertRouter.post('/', async (req: Request, res: Response, next: NextFunction):
       sourceLanguage:  sourceLanguage ?? 'typescript',
       sourceFramework,
       targetFramework,
-      userGoal,
+      ...(userGoal !== undefined ? { userGoal } : {}),
       options: {
         preserveComments:   true,
         generateTests:      true,
@@ -89,7 +89,7 @@ convertRouter.post('/sync', async (req: Request, res: Response, next: NextFuncti
       sourceLanguage: 'typescript',
       sourceFramework,
       targetFramework,
-      userGoal,
+      ...(userGoal !== undefined ? { userGoal } : {}),
       options: { preserveComments: true, generateTests: false, strictMode: true, addTypeAnnotations: true },
     };
 

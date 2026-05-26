@@ -8,8 +8,8 @@
     "rootDir": "./src",
     "baseUrl": "./",
     "paths": {
-      "@codemorph/shared": ["../shared/src/index.ts"],
-      "@codemorph/shared/*": ["../shared/src/*"]
+      "@codemorph/shared": ["../shared/dist/index.d.ts"],
+      "@codemorph/shared/*": ["../shared/dist/*"]
     },
     "strict": true,
     "strictNullChecks": true,

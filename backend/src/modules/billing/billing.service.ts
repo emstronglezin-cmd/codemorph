@@ -19,7 +19,7 @@ export class BillingService {
   ) {
     this.stripe = new Stripe(
       this.config.get<string>('STRIPE_SECRET_KEY') ?? 'sk_test_placeholder',
-      { apiVersion: '2024-12-18.acacia' },
+      { apiVersion: '2023-10-16' },
     );
   }
 

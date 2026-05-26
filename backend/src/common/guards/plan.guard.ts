@@ -8,7 +8,7 @@ import {
   ForbiddenException, SetMetadata,
 } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
-import { Plan, PLAN_LIMITS } from '../../modules/subscription/plan-limits.config';
+import { Plan } from '../../modules/subscription/plan-limits.config';
 
 export const PLAN_KEY = 'requiredPlan';
 export const RequirePlan = (...plans: Plan[]) => SetMetadata(PLAN_KEY, plans);

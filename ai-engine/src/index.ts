@@ -19,13 +19,14 @@ async function bootstrap(): Promise<void> {
   const { port } = appConfig;
 
   app.use(json({ limit: '50mb' }));
-  app.use(requestLogger(logger));
+  app.use((req, res, next) => requestLogger(req, res, next));
 
   // Routes
   app.use('/api/health',  healthRouter);
   app.use('/api/convert', convertRouter);
 
-  app.use(errorHandler(logger));
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  app.use(errorHandler as any);
 
   app.listen(port, '0.0.0.0', () => {
     logger.info(`🤖 CodeMorph AI Engine running on http://0.0.0.0:${port}`);

@@ -16,13 +16,13 @@ export class CacheService {
   private readonly logger = new Logger(CacheService.name);
 
   // Default TTLs (seconds)
-  static readonly TTL = {
+  static readonly TTL: Record<string, number> = {
     SHORT:    30,
     MEDIUM:   300,
     LONG:     3_600,
     DAY:      86_400,
     WEEK:     604_800,
-  } as const;
+  };
 
   constructor(
     @InjectRedis()
@@ -41,7 +41,7 @@ export class CacheService {
     }
   }
 
-  async set<T>(key: string, value: T, ttl = CacheService.TTL.MEDIUM): Promise<void> {
+  async set<T>(key: string, value: T, ttl: number = CacheService.TTL['MEDIUM']): Promise<void> {
     try {
       await this.redis.setex(key, ttl, JSON.stringify(value));
     } catch (err) {
@@ -74,7 +74,7 @@ export class CacheService {
   async remember<T>(
     key: string,
     factory: () => Promise<T>,
-    ttl = CacheService.TTL.MEDIUM,
+    ttl: number = CacheService.TTL['MEDIUM'],
   ): Promise<T> {
     const cached = await this.get<T>(key);
     if (cached !== null) return cached;

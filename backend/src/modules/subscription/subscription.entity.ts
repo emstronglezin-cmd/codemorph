@@ -32,67 +32,48 @@ export enum BillingProvider {
 @Index(['currentPeriodEnd'])
 export class SubscriptionEntity {
   @PrimaryGeneratedColumn('uuid')
-  id: string;
-
+  id!: string;
   @Column()
-  userId: string;
-
+  userId!: string;
   @ManyToOne(() => UserEntity, { onDelete: 'CASCADE' })
   @JoinColumn({ name: 'userId' })
-  user: UserEntity;
-
+  user!: UserEntity;
   @Column({ type: 'varchar', length: 32 })
-  plan: Plan;
-
+  plan!: Plan;
   @Column({ type: 'enum', enum: SubscriptionStatus, default: SubscriptionStatus.ACTIVE })
-  status: SubscriptionStatus;
-
+  status!: SubscriptionStatus;
   @Column({ type: 'enum', enum: BillingInterval, default: BillingInterval.MONTHLY })
-  interval: BillingInterval;
-
+  interval!: BillingInterval;
   @Column({ type: 'enum', enum: BillingProvider, default: BillingProvider.STRIPE })
-  provider: BillingProvider;
-
+  provider!: BillingProvider;
   // Provider references
   @Column({ nullable: true })
-  providerSubscriptionId: string;
-
+  providerSubscriptionId!: string;
   @Column({ nullable: true })
-  providerCustomerId: string;
-
+  providerCustomerId!: string;
   @Column({ nullable: true })
-  providerPriceId: string;
-
+  providerPriceId!: string;
   // Billing period
   @Column({ type: 'timestamptz', nullable: true })
-  currentPeriodStart: Date;
-
+  currentPeriodStart!: Date;
   @Column({ type: 'timestamptz', nullable: true })
-  currentPeriodEnd: Date;
-
+  currentPeriodEnd!: Date;
   @Column({ type: 'timestamptz', nullable: true })
-  trialEnd: Date;
-
+  trialEnd!: Date;
   @Column({ type: 'timestamptz', nullable: true })
-  canceledAt: Date;
-
+  canceledAt!: Date;
   @Column({ type: 'timestamptz', nullable: true })
-  cancelAtPeriodEnd: Date;
-
+  cancelAtPeriodEnd!: Date;
   // Pricing snapshot (at time of purchase)
   @Column({ type: 'int', default: 0 })
-  priceAmountCents: number;
-
+  priceAmountCents!: number;
   @Column({ length: 3, default: 'usd' })
-  currency: string;
-
+  currency!: string;
   // Metadata
   @Column({ type: 'jsonb', nullable: true })
-  metadata: Record<string, unknown>;
-
+  metadata!: Record<string, unknown>;
   @CreateDateColumn({ type: 'timestamptz' })
-  createdAt: Date;
-
+  createdAt!: Date;
   @UpdateDateColumn({ type: 'timestamptz' })
-  updatedAt: Date;
+  updatedAt!: Date;
 }

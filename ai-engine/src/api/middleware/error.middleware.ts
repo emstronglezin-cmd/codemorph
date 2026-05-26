@@ -99,7 +99,7 @@ export function errorHandler(
     error: {
       code: err.code ?? 'INTERNAL_ERROR',
       message: isOperational ? err.message : 'An unexpected error occurred',
-      ...(err.details && { details: err.details }),
+      ...(err.details && typeof err.details === 'object' ? { details: err.details } : {}),
       ...(isDev && !isOperational && { stack: err.stack }),
     },
     timestamp: new Date().toISOString(),

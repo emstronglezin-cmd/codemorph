@@ -2,7 +2,7 @@
 // CodeMorph AI Engine — Mapping Engine
 // Maps IR from source patterns to target patterns
 // ============================================================
-import type { ConversionContext, IRDocument, IRComponent, IRRoute, IRService } from '../models/ir.types';
+import type { ConversionContext, IRDocument, IRComponent, IRRoute } from '../models/ir.types';
 
 export class MappingEngine {
   async map(ctx: ConversionContext, ir: IRDocument): Promise<IRDocument> {
@@ -23,31 +23,34 @@ export class MappingEngine {
 
   // ── Flutter → React ──────────────────────────────────
   private flutterToReact(ir: IRDocument, _ctx: ConversionContext): IRDocument {
+    const uiGraph = ir.uiGraph ?? { components: [], screens: [], stateSlices: [], theme: {} };
+    const backendGraph = ir.backendGraph ?? { routes: [], services: [], middlewares: [], entities: [] };
     return {
       ...ir,
       uiGraph: {
-        ...ir.uiGraph,
-        components: ir.uiGraph.components.map((c) => this.mapFlutterWidgetToReact(c)),
-        screens:    ir.uiGraph.screens.map((s) => ({
+        ...uiGraph,
+        components: (uiGraph.components ?? []).map((c) => this.mapFlutterWidgetToReact(c)),
+        screens:    (uiGraph.screens ?? []).map((s) => ({
           ...s,
           path: `/src/pages/${s.name.toLowerCase()}`,
           route: s.route ?? `/${s.name.toLowerCase()}`,
         })),
       },
       backendGraph: {
-        ...ir.backendGraph,
-        routes: ir.backendGraph.routes.map((r) => this.addApiPrefix(r, '/api')),
+        ...backendGraph,
+        routes: (backendGraph.routes ?? []).map((r) => this.addApiPrefix(r, '/api')),
       },
     };
   }
 
   // ── Flutter → React Native ────────────────────────────
   private flutterToReactNative(ir: IRDocument, _ctx: ConversionContext): IRDocument {
+    const uiGraph = ir.uiGraph ?? { components: [], screens: [], stateSlices: [], theme: {} };
     return {
       ...ir,
       uiGraph: {
-        ...ir.uiGraph,
-        components: ir.uiGraph.components.map((c) => this.mapFlutterWidgetToRN(c)),
+        ...uiGraph,
+        components: (uiGraph.components ?? []).map((c) => this.mapFlutterWidgetToRN(c)),
         screens:    ir.uiGraph.screens.map((s) => ({
           ...s,
           path: `src/screens/${s.name}Screen.tsx`,

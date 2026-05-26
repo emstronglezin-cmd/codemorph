@@ -9,54 +9,42 @@ import { UserEntity } from '../users/entities/user.entity';
 @Unique(['userId', 'periodStart'])
 export class UsageQuotaEntity {
   @PrimaryGeneratedColumn('uuid')
-  id: string;
-
+  id!: string;
   @Column()
-  userId: string;
-
+  userId!: string;
   @ManyToOne(() => UserEntity, { onDelete: 'CASCADE' })
   @JoinColumn({ name: 'userId' })
-  user: UserEntity;
-
+  user!: UserEntity;
   // Billing period (YYYY-MM-01 normalized)
   @Column({ type: 'date' })
-  periodStart: Date;
-
+  periodStart!: Date;
   @Column({ type: 'date' })
-  periodEnd: Date;
-
+  periodEnd!: Date;
   // Conversion usage
   @Column({ type: 'int', default: 0 })
-  conversionsUsed: number;
-
+  conversionsUsed!: number;
   @Column({ type: 'int', default: 0 })
-  conversionsLimit: number;  // snapshot of plan limit at period start
+  conversionsLimit!: number;  // snapshot of plan limit at period start
 
   // AI tokens/requests
   @Column({ type: 'int', default: 0 })
-  aiRequestsUsed: number;
-
+  aiRequestsUsed!: number;
   @Column({ type: 'int', default: 0 })
-  aiTokensUsed: number;
-
+  aiTokensUsed!: number;
   // Storage
   @Column({ type: 'bigint', default: 0 })
-  storageBytesUsed: string;  // stored as string due to bigint
+  storageBytesUsed!: string;  // stored as string due to bigint
 
   // Files processed
   @Column({ type: 'int', default: 0 })
-  filesProcessed: number;
-
+  filesProcessed!: number;
   @Column({ type: 'int', default: 0 })
-  linesProcessed: number;
-
+  linesProcessed!: number;
   // Plan snapshot
   @Column({ length: 32 })
-  plan: string;
-
+  plan!: string;
   @CreateDateColumn({ type: 'timestamptz' })
-  createdAt: Date;
-
+  createdAt!: Date;
   @UpdateDateColumn({ type: 'timestamptz' })
-  updatedAt: Date;
+  updatedAt!: Date;
 }

@@ -5,7 +5,7 @@
 // ============================================================
 import pino from 'pino';
 
-import type { ConversionContext, ConversionResult, IRDocument } from '../models/ir.types';
+import type { ConversionContext, ConversionResult } from '../models/ir.types';
 import { ASTAnalyzer }          from './ast-analyzer';
 import { ArchitectureDetector } from './architecture-detector';
 import { IRGenerator }          from './ir-generator';
@@ -51,7 +51,7 @@ export class ConversionPipeline {
 
     // ── PHASE 4: Mapping Engine ────────────────────────
     logger.info({ jobId: ctx.jobId }, '🗺️  Phase 4: Mapping Engine');
-    const mappedIR = await this.mappingEngine.map(ctx, irDocument);
+    const mappedIR = await this.mappingEngine.map(ctx, irDocument as any);
 
     // ── PHASE 5: Target Code Plan ──────────────────────
     logger.info({ jobId: ctx.jobId }, '📋 Phase 5: Code Planning');

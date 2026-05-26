@@ -31,6 +31,7 @@ interface UpdateUserInput {
   status?: UserEntity['status'];
   emailVerified?: boolean;
   stripeCustomerId?: string;
+  plan?: 'free' | 'pro' | 'pro_max';
 }
 
 @Injectable()

@@ -2,7 +2,7 @@ import { Injectable, Logger, BadRequestException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import * as fs from 'fs';
 import * as path from 'path';
-import * as AdmZip from 'adm-zip';
+import AdmZip from 'adm-zip';
 
 export interface RepoFile {
   path: string;

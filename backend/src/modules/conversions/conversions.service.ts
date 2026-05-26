@@ -100,12 +100,12 @@ export class ConversionsService {
     await this.jobsRepo.update(jobId, {
       status,
       progress:     status === 'completed' ? 100 : job.progress,
-      output:       output ?? null,
-      errorMessage: errorMessage ?? null,
+      output:       output ?? undefined,
+      errorMessage: errorMessage ?? undefined,
       tokensUsed:   tokensUsed ?? 0,
       completedAt:  now,
       durationMs,
-    });
+    } as any);
 
     await this.projectsService.updateStatus(
       job.projectId as ProjectId,

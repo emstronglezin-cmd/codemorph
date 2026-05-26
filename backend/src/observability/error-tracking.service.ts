@@ -34,11 +34,11 @@ export class ErrorTrackingService {
   private readonly errorStore = new Map<string, ErrorSummary>();
 
   constructor(
-    private readonly config: ConfigService,
+    readonly _config: ConfigService,
     private readonly logger: LoggerService,
   ) {
-    this.sentryDsn   = config.get<string>('SENTRY_DSN');
-    this.environment = config.get<string>('NODE_ENV', 'development');
+    this.sentryDsn   = this._config.get<string>('SENTRY_DSN');
+    this.environment = this._config.get<string>('NODE_ENV', 'development');
     this.enabled     = !!this.sentryDsn && this.environment === 'production';
   }
 

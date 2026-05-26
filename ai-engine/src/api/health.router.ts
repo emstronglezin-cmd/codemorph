@@ -27,9 +27,9 @@ healthRouter.get('/', (_req: Request, res: Response): void => {
       arch: os.arch(),
       cpus: os.cpus().length,
       loadAverage: {
-        '1m': loadAvg[0].toFixed(2),
-        '5m': loadAvg[1].toFixed(2),
-        '15m': loadAvg[2].toFixed(2),
+        '1m': (loadAvg[0] ?? 0).toFixed(2),
+        '5m': (loadAvg[1] ?? 0).toFixed(2),
+        '15m': (loadAvg[2] ?? 0).toFixed(2),
       },
       freeMemory: `${Math.round(os.freemem() / 1024 / 1024)}MB`,
       totalMemory: `${Math.round(os.totalmem() / 1024 / 1024)}MB`,

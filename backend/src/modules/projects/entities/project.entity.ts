@@ -10,7 +10,6 @@ import {
   Index,
   ManyToOne,
   JoinColumn,
-  OneToMany,
 } from 'typeorm';
 import { UserEntity } from '../../users/entities/user.entity';
 
