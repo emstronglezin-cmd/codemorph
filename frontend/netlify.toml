@@ -1,6 +1,7 @@
 # ============================================================
 # CodeMorph — Netlify Deployment Configuration
 # Framework: Next.js 14 (SSR via @netlify/plugin-nextjs)
+# PWA:       Service worker + manifest + icons cached correctly
 # ============================================================
 
 [build]
@@ -11,12 +12,14 @@
 [build.environment]
   NODE_VERSION = "20"
   NPM_VERSION  = "10"
+  # Needed by @serwist/next to disable SW in dev (enabled in production build)
+  NODE_ENV     = "production"
 
-# ── Next.js plugin (handles SSR + API routes on Netlify) ──
+# ── Next.js plugin (handles SSR + API routes on Netlify) ────
 [[plugins]]
   package = "@netlify/plugin-nextjs"
 
-# ── Headers ───────────────────────────────────────────────
+# ── Global security headers ──────────────────────────────────
 [[headers]]
   for = "/*"
   [headers.values]
@@ -26,17 +29,52 @@
     Referrer-Policy        = "strict-origin-when-cross-origin"
     Permissions-Policy     = "camera=(), microphone=(), geolocation=()"
 
+# ── Service Worker — never cached (must always be fresh) ────
+[[headers]]
+  for = "/sw.js"
+  [headers.values]
+    Cache-Control        = "no-store, no-cache, must-revalidate, proxy-revalidate"
+    Content-Type         = "application/javascript; charset=utf-8"
+    Service-Worker-Allowed = "/"
+
+# ── PWA Manifest ─────────────────────────────────────────────
+[[headers]]
+  for = "/site.webmanifest"
+  [headers.values]
+    Content-Type  = "application/manifest+json"
+    Cache-Control = "public, max-age=86400, stale-while-revalidate=3600"
+
+# ── Next.js static chunks (immutable — content-hashed) ───────
 [[headers]]
   for = "/_next/static/*"
   [headers.values]
     Cache-Control = "public, max-age=31536000, immutable"
 
+# ── Next.js image optimization ────────────────────────────────
+[[headers]]
+  for = "/_next/image*"
+  [headers.values]
+    Cache-Control = "public, max-age=86400, stale-while-revalidate=3600"
+
+# ── PWA icons ─────────────────────────────────────────────────
+[[headers]]
+  for = "/icons/*"
+  [headers.values]
+    Cache-Control = "public, max-age=2592000, immutable"
+
+# ── Screenshots ───────────────────────────────────────────────
+[[headers]]
+  for = "/screenshots/*"
+  [headers.values]
+    Cache-Control = "public, max-age=86400"
+
+# ── Fonts ─────────────────────────────────────────────────────
 [[headers]]
   for = "/fonts/*"
   [headers.values]
     Cache-Control = "public, max-age=31536000, immutable"
 
-# ── Redirects ─────────────────────────────────────────────
+# ── Redirects ─────────────────────────────────────────────────
 [[redirects]]
   from   = "/login"
   to     = "/auth/sign-in"
@@ -47,6 +85,12 @@
   to     = "/auth/sign-up"
   status = 301
 
-# ── Environment variables (set in Netlify dashboard) ──────
-# NEXT_PUBLIC_API_URL       = https://your-backend.onrender.com/api/v1
-# NEXT_PUBLIC_APP_URL       = https://your-app.netlify.app
+[[redirects]]
+  from   = "/register"
+  to     = "/auth/sign-up"
+  status = 301
+
+# ── Environment variables ─────────────────────────────────────
+# Set these in Netlify dashboard > Site settings > Environment variables
+# NEXT_PUBLIC_API_URL  = https://codemorph-backend.onrender.com/api/v1
+# NEXT_PUBLIC_APP_URL  = https://your-app.netlify.app

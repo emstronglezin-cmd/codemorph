@@ -182,6 +182,11 @@ const config: Config = {
         // Vercel-style card shadows
         'card':        '0 0 0 1px hsl(var(--border)), 0 2px 4px 0 rgb(0 0 0 / 0.04)',
         'card-hover':  '0 0 0 1px hsl(var(--primary)), 0 8px 24px -4px rgb(0 0 0 / 0.08)',
+        // Alias for consistent naming
+        'shadow-card':       '0 0 0 1px hsl(var(--border)), 0 2px 4px 0 rgb(0 0 0 / 0.04)',
+        'shadow-card-hover': '0 0 0 1px hsl(var(--primary)), 0 8px 24px -4px rgb(0 0 0 / 0.08)',
+        'shadow-glow-sm':    '0 0 10px rgb(99 102 241 / 0.15)',
+        'shadow-glow-md':    '0 0 20px rgb(99 102 241 / 0.2)',
       },
 
       // ── Animations ────────────────────────────────────
@@ -209,6 +214,10 @@ const config: Config = {
         'slide-out-to-right': {
           from: { transform: 'translateX(0)' },
           to:   { transform: 'translateX(100%)' },
+        },
+        'slide-in-from-bottom-4': {
+          from: { opacity: '0', transform: 'translateY(1rem)' },
+          to:   { opacity: '1', transform: 'translateY(0)' },
         },
         'shimmer': {
           '0%':   { backgroundPosition: '-200% 0' },
@@ -238,6 +247,7 @@ const config: Config = {
         'pulse-ring':            'pulse-ring 1.5s ease-out infinite',
         'spin-slow':             'spin-slow 3s linear infinite',
         'count-up':              'count-up 0.5s ease-out',
+        'slide-in-from-bottom-4':'slide-in-from-bottom-4 0.3s ease-out',
       },
 
       // ── Transitions ───────────────────────────────────
