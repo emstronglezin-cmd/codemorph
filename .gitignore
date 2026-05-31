@@ -79,5 +79,7 @@ ai-engine/.cache/
 
 # Wrangler
 .wrangler/
-frontend/core
-core
+
+# Core dumps (ne pas ignorer les dossiers src/core !)
+*.core
+core.dump

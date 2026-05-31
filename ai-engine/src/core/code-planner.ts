@@ -135,18 +135,22 @@ export class CodePlanner {
       this.staticFile('src/app.module.ts',     NEST_APP_MODULE),
     );
 
-    // Generate modules from IR architecture
-    for (const mod of ir.architecture.modules.filter((m) => m.type === 'feature')) {
+    // Generate modules from IR architecture (defensive guards — ir.architecture may be undefined without OpenAI key)
+    const architecture = ir.architecture ?? { modules: [], patterns: [], layers: [] };
+    const backendGraph = ir.backendGraph ?? { routes: [], services: [], middlewares: [], entities: [] };
+    const dataLayer = ir.dataLayer ?? { models: [], migrations: [], seeders: [] };
+
+    for (const mod of (architecture.modules ?? []).filter((m) => m.type === 'feature')) {
       const modName = mod.name.toLowerCase();
       files.push(
         { path: `src/modules/${modName}/${modName}.module.ts`,     content: this.generateNestModule(mod.name),     language: 'typescript', warnings: [] },
-        { path: `src/modules/${modName}/${modName}.controller.ts`, content: this.generateNestController(mod.name, ir.backendGraph.routes.filter((r) => r.path.includes(modName))), language: 'typescript', warnings: [] },
-        { path: `src/modules/${modName}/${modName}.service.ts`,    content: this.generateNestService(mod.name, ir.backendGraph.services.find((s) => s.name.toLowerCase().includes(modName))), language: 'typescript', warnings: [] },
+        { path: `src/modules/${modName}/${modName}.controller.ts`, content: this.generateNestController(mod.name, (backendGraph.routes ?? []).filter((r) => r.path.includes(modName))), language: 'typescript', warnings: [] },
+        { path: `src/modules/${modName}/${modName}.service.ts`,    content: this.generateNestService(mod.name, (backendGraph.services ?? []).find((s) => s.name.toLowerCase().includes(modName))), language: 'typescript', warnings: [] },
       );
     }
 
     // Generate entities from IR
-    for (const entity of ir.dataLayer.models) {
+    for (const entity of (dataLayer.models ?? [])) {
       files.push({
         path:     `src/entities/${entity.name.toLowerCase()}.entity.ts`,
         content:  this.generateTypeORMEntity(entity),
@@ -156,7 +160,7 @@ export class CodePlanner {
     }
 
     // Migrations
-    for (const migration of ir.dataLayer.migrations) {
+    for (const migration of (dataLayer.migrations ?? [])) {
       files.push({
         path:     `src/database/migrations/${String(migration.order).padStart(4, '0')}_${migration.name}.ts`,
         content:  this.generateMigration(migration),
@@ -170,8 +174,11 @@ export class CodePlanner {
 
   // ── Generic fallback ──────────────────────────────────
   private async planGeneric(_ctx: ConversionContext, ir: IRDocument): Promise<CodePlan> {
+    // Defensive guards — ir.architecture may be undefined without OpenAI key
+    const architecture = ir.architecture ?? { modules: [], patterns: [], layers: [] };
+    const patterns = (architecture.patterns ?? []).join(', ') || 'unknown';
     const files: GeneratedFile[] = [
-      this.staticFile('README.md', `# Converted Project\n\nIR-based conversion completed.\n\n## Architecture\n${ir.architecture.patterns.join(', ')}`),
+      this.staticFile('README.md', `# Converted Project\n\nIR-based conversion completed.\n\n## Architecture\n${patterns}`),
     ];
     return { files, summary: this.buildSummary(files, ir) };
   }
