@@ -1,66 +1,71 @@
 # ============================================================
-# CodeMorph — Render.com Deployment Configuration
-# Services: backend (NestJS API) + Redis (Bull queues)
+# CodeMorph — Render Blueprint
+# Services: backend (NestJS) + Redis + PostgreSQL
+# Deploy: Render Dashboard → New → Blueprint → connect repo
 # Doc: https://render.com/docs/blueprint-spec
 # ============================================================
 
 services:
 
-  # ── Backend API (NestJS) ────────────────────────────────────
+  # ── Backend API (NestJS — Docker) ──────────────────────────
   - type: web
     name: codemorph-backend
     runtime: docker
     dockerfilePath: ./backend/Dockerfile
-    dockerContext: .
-    region: frankfurt  # eu-central (change to: oregon, ohio, virginia, singapore)
-    plan: starter      # $7/mo — upgrade to standard for production load
+    dockerContext: .                    # build context = repo root
+    region: frankfurt                   # eu-central — change to: oregon, ohio, singapore
+    plan: starter                       # $7/mo — upgrade to standard ($25) for production load
     branch: main
+    autoDeploy: true
 
-    # Render injects PORT automatically — app reads process.env.PORT
     envVars:
+      # ── App ──────────────────────────────────────────────────
       - key: NODE_ENV
         value: production
 
       - key: PORT
         value: 4000
 
-      # ── Database (PostgreSQL — add Render Postgres service below) ──
+      - key: LOG_LEVEL
+        value: warn
+
+      # ── Database — auto-injected from codemorph-postgres ─────
       - key: DATABASE_URL
         fromDatabase:
           name: codemorph-postgres
           property: connectionString
 
-      # ── Redis (add Render Redis service below) ──
+      - key: DATABASE_SSL
+        value: "true"
+
+      # ── Redis — auto-injected from codemorph-redis ───────────
       - key: REDIS_URL
         fromService:
           name: codemorph-redis
           type: redis
           property: connectionString
 
-      # ── JWT secrets (set in Render dashboard > Environment) ──
+      # ── JWT — set manually in Render dashboard ───────────────
       - key: JWT_SECRET
-        sync: false   # Must be set manually in Render dashboard
+        sync: false               # openssl rand -base64 64
 
       - key: JWT_REFRESH_SECRET
-        sync: false
+        sync: false               # openssl rand -base64 64
+
+      - key: JWT_EXPIRES_IN
+        value: 15m
+
+      - key: JWT_REFRESH_EXPIRES_IN
+        value: 7d
 
       - key: COOKIE_SECRET
-        sync: false
+        sync: false               # openssl rand -base64 32
 
-      # ── CORS ──────────────────────────────────────────────────
+      # ── CORS ─────────────────────────────────────────────────
       - key: FRONTEND_URL
-        sync: false   # Set to your Netlify URL in Render dashboard
+        sync: false               # https://your-site.netlify.app
 
-      # ── OAuth (set in Render dashboard) ───────────────────────
-      - key: GOOGLE_CLIENT_ID
-        sync: false
-
-      - key: GOOGLE_CLIENT_SECRET
-        sync: false
-
-      - key: GOOGLE_CALLBACK_URL
-        sync: false   # https://your-backend.onrender.com/api/v1/auth/google/callback
-
+      # ── OAuth — GitHub ────────────────────────────────────────
       - key: GITHUB_CLIENT_ID
         sync: false
 
@@ -68,38 +73,55 @@ services:
         sync: false
 
       - key: GITHUB_CALLBACK_URL
-        sync: false   # https://your-backend.onrender.com/api/v1/auth/github/callback
+        sync: false               # https://codemorph-backend.onrender.com/api/v1/auth/github/callback
 
-      # ── AI Engine ─────────────────────────────────────────────
+      # ── OAuth — Google ────────────────────────────────────────
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+
+      - key: GOOGLE_CALLBACK_URL
+        sync: false               # https://codemorph-backend.onrender.com/api/v1/auth/google/callback
+
+      # ── AI Engine URL (if deployed separately) ────────────────
       - key: AI_ENGINE_URL
-        sync: false   # URL of your Python AI engine (if deployed separately)
+        sync: false               # https://codemorph-ai.onrender.com OR http://localhost:5000
 
-      # ── Stripe (set in Render dashboard) ──────────────────────
+      - key: AI_ENGINE_SECRET
+        sync: false               # same as AI_ENGINE_SECRET in ai-engine
+
+      # ── Stripe ───────────────────────────────────────────────
       - key: STRIPE_SECRET_KEY
         sync: false
 
       - key: STRIPE_WEBHOOK_SECRET
         sync: false
 
-    # Health check endpoint
-    healthCheckPath: /api/v1/health
+      # ── Feature flags ─────────────────────────────────────────
+      - key: FEATURE_BILLING
+        value: "false"            # set to "true" after Stripe configured
 
-    # Auto-deploy on push to main
-    autoDeploy: true
+      - key: FEATURE_ANALYTICS
+        value: "false"
+
+    # Render health check — returns 200 when app is ready
+    healthCheckPath: /api/v1/health
 
   # ── Redis (Bull job queues) ─────────────────────────────────
   - type: redis
     name: codemorph-redis
     region: frankfurt
-    plan: starter   # $10/mo — 25MB RAM
+    plan: starter                 # $10/mo — 25MB RAM
     maxmemoryPolicy: allkeys-lru
-    ipAllowList: []  # Allow all — internal Render network only
+    ipAllowList: []               # Internal Render network only
 
-# ── PostgreSQL Database ────────────────────────────────────
+# ── PostgreSQL ───────────────────────────────────────────────
 databases:
   - name: codemorph-postgres
     region: frankfurt
-    plan: starter   # $7/mo — 1GB storage, 1 connection pool
+    plan: starter                 # $7/mo — 1GB storage
     databaseName: codemorph
     user: codemorph
-    ipAllowList: []  # Allow all — internal Render network only
+    ipAllowList: []               # Internal Render network only

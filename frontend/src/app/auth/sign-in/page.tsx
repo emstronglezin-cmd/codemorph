@@ -1,13 +1,59 @@
 // ============================================================
-// CodeMorph — Sign In Page
+// CodeMorph — Sign In Page (Client Component)
+// Supports: Email/Password + GitHub OAuth + Google OAuth
 // ============================================================
-import type { Metadata } from 'next';
-import Link from 'next/link';
-import { Code2 } from 'lucide-react';
+'use client';
 
-export const metadata: Metadata = { title: 'Sign In' };
+import { useState } from 'react';
+import Link from 'next/link';
+import { useRouter } from 'next/navigation';
+import { Code2, Loader2 } from 'lucide-react';
+
+const API_URL = process.env['NEXT_PUBLIC_API_URL'] ?? 'http://localhost:4000/api/v1';
 
 export default function SignInPage(): React.JSX.Element {
+  const router = useRouter();
+  const [email,    setEmail]    = useState('');
+  const [password, setPassword] = useState('');
+  const [error,    setError]    = useState('');
+  const [loading,  setLoading]  = useState(false);
+
+  // ── Email / Password sign-in ─────────────────────────────
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    setError('');
+    setLoading(true);
+    try {
+      const res = await fetch(`${API_URL}/auth/sign-in`, {
+        method:      'POST',
+        headers:     { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body:        JSON.stringify({ email, password }),
+      });
+      if (!res.ok) {
+        const data = await res.json() as { message?: string };
+        throw new Error(data.message ?? 'Invalid credentials');
+      }
+      const data = await res.json() as { tokens: { accessToken: string } };
+      if (typeof window !== 'undefined') {
+        localStorage.setItem('cm_access_token', data.tokens.accessToken);
+      }
+      router.replace('/dashboard');
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Sign in failed');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  // ── OAuth redirects ──────────────────────────────────────
+  function handleGitHub() {
+    window.location.href = `${API_URL}/auth/github`;
+  }
+  function handleGoogle() {
+    window.location.href = `${API_URL}/auth/google`;
+  }
+
   return (
     <div className="flex min-h-screen items-center justify-center bg-surface-1 p-4">
       <div className="w-full max-w-sm space-y-6">
@@ -24,12 +70,21 @@ export default function SignInPage(): React.JSX.Element {
 
         {/* Card */}
         <div className="rounded-xl border border-border bg-card p-6 shadow-card space-y-4">
-          {/* OAuth */}
-          <button className="flex w-full items-center justify-center gap-2 rounded-lg border border-border bg-background py-2.5 text-sm font-medium transition-all hover:bg-accent">
+
+          {/* OAuth Buttons */}
+          <button
+            type="button"
+            onClick={handleGitHub}
+            className="flex w-full items-center justify-center gap-2 rounded-lg border border-border bg-background py-2.5 text-sm font-medium transition-all hover:bg-accent active:scale-95"
+          >
             <GithubIcon />
             Continue with GitHub
           </button>
-          <button className="flex w-full items-center justify-center gap-2 rounded-lg border border-border bg-background py-2.5 text-sm font-medium transition-all hover:bg-accent">
+          <button
+            type="button"
+            onClick={handleGoogle}
+            className="flex w-full items-center justify-center gap-2 rounded-lg border border-border bg-background py-2.5 text-sm font-medium transition-all hover:bg-accent active:scale-95"
+          >
             <GoogleIcon />
             Continue with Google
           </button>
@@ -41,8 +96,15 @@ export default function SignInPage(): React.JSX.Element {
             <div className="flex-1 border-t border-border" />
           </div>
 
-          {/* Form */}
-          <form className="space-y-3">
+          {/* Error banner */}
+          {error && (
+            <div className="rounded-lg bg-red-500/10 border border-red-500/30 px-3 py-2 text-sm text-red-400">
+              {error}
+            </div>
+          )}
+
+          {/* Email / Password Form */}
+          <form onSubmit={handleSubmit} className="space-y-3">
             <div className="space-y-1.5">
               <label className="text-sm font-medium" htmlFor="email">Email</label>
               <input
@@ -50,6 +112,9 @@ export default function SignInPage(): React.JSX.Element {
                 type="email"
                 placeholder="you@example.com"
                 autoComplete="email"
+                required
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
                 className="flex h-9 w-full rounded-lg border border-input bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
               />
             </div>
@@ -65,15 +130,20 @@ export default function SignInPage(): React.JSX.Element {
                 type="password"
                 placeholder="••••••••"
                 autoComplete="current-password"
+                required
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
                 className="flex h-9 w-full rounded-lg border border-input bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
               />
             </div>
 
             <button
               type="submit"
-              className="w-full h-9 rounded-lg gradient-brand text-sm font-semibold text-white shadow-sm hover:opacity-90 transition-all"
+              disabled={loading}
+              className="w-full h-9 rounded-lg gradient-brand text-sm font-semibold text-white shadow-sm hover:opacity-90 transition-all disabled:opacity-60 flex items-center justify-center gap-2"
             >
-              Sign in
+              {loading && <Loader2 className="h-4 w-4 animate-spin" />}
+              {loading ? 'Signing in…' : 'Sign in'}
             </button>
           </form>
         </div>

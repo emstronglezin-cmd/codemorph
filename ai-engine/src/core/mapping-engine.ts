@@ -23,7 +23,7 @@ export class MappingEngine {
 
   // ── Flutter → React ──────────────────────────────────
   private flutterToReact(ir: IRDocument, _ctx: ConversionContext): IRDocument {
-    const uiGraph = ir.uiGraph ?? { components: [], screens: [], stateSlices: [], theme: {} };
+    const uiGraph = ir.uiGraph ?? { components: [], screens: [], stateFlow: [], stateSlices: [], navigationFlow: [], theme: {} };
     const backendGraph = ir.backendGraph ?? { routes: [], services: [], middlewares: [], entities: [] };
     return {
       ...ir,
@@ -45,19 +45,20 @@ export class MappingEngine {
 
   // ── Flutter → React Native ────────────────────────────
   private flutterToReactNative(ir: IRDocument, _ctx: ConversionContext): IRDocument {
-    const uiGraph = ir.uiGraph ?? { components: [], screens: [], stateSlices: [], theme: {} };
+    const uiGraph = ir.uiGraph ?? { components: [], screens: [], stateFlow: [], stateSlices: [], navigationFlow: [], theme: {} };
     return {
       ...ir,
       uiGraph: {
         ...uiGraph,
-        components: (uiGraph.components ?? []).map((c) => this.mapFlutterWidgetToRN(c)),
-        screens:    ir.uiGraph.screens.map((s) => ({
+        components:     (uiGraph.components ?? []).map((c) => this.mapFlutterWidgetToRN(c)),
+        screens:        (uiGraph.screens ?? []).map((s) => ({
           ...s,
           path: `src/screens/${s.name}Screen.tsx`,
         })),
-        navigationFlow: ir.uiGraph.navigationFlow.map((n) => ({
+        stateFlow:      uiGraph.stateFlow ?? [],
+        navigationFlow: (uiGraph.navigationFlow ?? []).map((n) => ({
           ...n,
-          trigger: n.trigger.replace('push(', 'navigate(').replace('pop()', 'goBack()'),
+          trigger: (n.trigger ?? '').replace('push(', 'navigate(').replace('pop()', 'goBack()'),
         })),
       },
     };
@@ -65,22 +66,23 @@ export class MappingEngine {
 
   // ── Express → NestJS ──────────────────────────────────
   private expressToNestJS(ir: IRDocument, _ctx: ConversionContext): IRDocument {
+    const backendGraph = ir.backendGraph ?? { routes: [], services: [], middlewares: [], entities: [] };
     return {
       ...ir,
       backendGraph: {
-        ...ir.backendGraph,
-        routes: ir.backendGraph.routes.map((r) => ({
+        ...backendGraph,
+        routes: (backendGraph.routes ?? []).map((r) => ({
           ...r,
           guards:      [...(r.guards ?? []), 'JwtAuthGuard'],
           middlewares: [...(r.middlewares ?? []), 'ValidationPipe'],
         })),
-        services: ir.backendGraph.services.map((s) => ({
+        services: (backendGraph.services ?? []).map((s) => ({
           ...s,
           injectable: true,
-          dependencies: [...s.dependencies.map((d) => `${d}Service`), 'InjectRepository'],
+          dependencies: [...(s.dependencies ?? []).map((d) => `${d}Service`), 'InjectRepository'],
         })),
         middlewares: [
-          ...ir.backendGraph.middlewares,
+          ...(backendGraph.middlewares ?? []),
           { name: 'ValidationPipe',   scope: 'global' as const, type: 'validation' as const },
           { name: 'JwtAuthGuard',     scope: 'global' as const, type: 'auth' as const },
           { name: 'LoggingInterceptor', scope: 'global' as const, type: 'logging' as const },

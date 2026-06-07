@@ -2,9 +2,9 @@
 // CodeMorph AI Engine — Code Planner
 // Transforms IR into a concrete file generation plan
 // AI outputs IR → backend generates actual code files
+// Uses AIProvider — supports Free (Groq), Platform (OpenAI), Pro (user key)
 // ============================================================
-import OpenAI from 'openai';
-import { appConfig } from '../config/app.config';
+import { AIProvider } from './ai-provider';
 import type { ConversionContext, IRDocument, GeneratedFile, ConversionSummary } from '../models/ir.types';
 
 export interface CodePlan {
@@ -13,10 +13,10 @@ export interface CodePlan {
 }
 
 export class CodePlanner {
-  private readonly openai: OpenAI;
+  private readonly ai: AIProvider;
 
-  constructor() {
-    this.openai = new OpenAI({ apiKey: appConfig.openaiApiKey });
+  constructor(opts?: { userOpenAIKey?: string; userAnthropicKey?: string }) {
+    this.ai = new AIProvider(opts);
   }
 
   async plan(ctx: ConversionContext, ir: IRDocument): Promise<CodePlan> {
@@ -185,34 +185,23 @@ export class CodePlanner {
 
   // ── AI-powered file generators ────────────────────────
   private async generateScreenFile(_ctx: ConversionContext, _ir: IRDocument, name: string, components: string[], framework: string): Promise<string> {
-    const prompt = `Generate a ${framework === 'react' ? 'React + TypeScript + TailwindCSS' : 'React Native + TypeScript'} screen component named "${name}".
-Components to include: ${components.join(', ')}.
-Requirements: TypeScript strict, clean code, proper imports, no placeholder comments.
-Return ONLY the file content, no markdown.`;
-
+    if (this.ai.getTier() === 'static') return this.fallbackScreen(name, framework);
+    const prompt = `Generate a ${framework === 'react' ? 'React + TypeScript + TailwindCSS' : 'React Native + TypeScript'} screen component named "${name}".\nComponents: ${components.join(', ')}.\nRequirements: TypeScript strict, clean code, proper imports. Return ONLY the file content.`;
     try {
-      const res = await this.openai.chat.completions.create({
-        model: appConfig.defaultModel, temperature: 0.3, max_tokens: 1200,
-        messages: [{ role: 'user', content: prompt }],
-      });
-      return res.choices[0]?.message?.content ?? this.fallbackScreen(name, framework);
+      const res = await this.ai.chat([{ role: 'user', content: prompt }], 1200);
+      return res.content || this.fallbackScreen(name, framework);
     } catch {
       return this.fallbackScreen(name, framework);
     }
   }
 
   private async generateComponentFile(_ctx: ConversionContext, name: string, props: Array<{ name: string; type: string; required: boolean }>, framework: string): Promise<string> {
+    if (this.ai.getTier() === 'static') return this.fallbackComponent(name);
     const propTypes = props.map((p) => `${p.name}${p.required ? '' : '?'}: ${p.type}`).join('; ');
-    const prompt = `Generate a ${framework === 'react' ? 'React + TypeScript + TailwindCSS' : 'React Native + TypeScript'} UI component named "${name}".
-Props interface: { ${propTypes} }
-Requirements: TypeScript strict, accessible, reusable. Return ONLY the file content.`;
-
+    const prompt = `Generate a ${framework === 'react' ? 'React + TypeScript + TailwindCSS' : 'React Native + TypeScript'} UI component "${name}".\nProps: { ${propTypes} }\nRequirements: TypeScript strict, accessible. Return ONLY the file content.`;
     try {
-      const res = await this.openai.chat.completions.create({
-        model: appConfig.defaultModel, temperature: 0.3, max_tokens: 800,
-        messages: [{ role: 'user', content: prompt }],
-      });
-      return res.choices[0]?.message?.content ?? this.fallbackComponent(name);
+      const res = await this.ai.chat([{ role: 'user', content: prompt }], 800);
+      return res.content || this.fallbackComponent(name);
     } catch {
       return this.fallbackComponent(name);
     }
