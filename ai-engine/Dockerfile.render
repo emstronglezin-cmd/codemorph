@@ -1,0 +1,66 @@
+# ============================================================
+# CodeMorph AI Engine — Dockerfile pour Render Free Tier
+# Runtime: Node.js 20 Alpine
+# Build context: repo root (docker context = .)
+# ============================================================
+
+# ── Stage 1: deps ────────────────────────────────────────────
+FROM node:20-alpine AS deps
+
+RUN apk add --no-cache python3 make g++ dumb-init
+
+WORKDIR /app
+
+# Copier les package.json des workspaces nécessaires
+COPY package.json package-lock.json ./
+COPY shared/package.json ./shared/
+COPY ai-engine/package.json ./ai-engine/
+
+# Installer uniquement les dépendances de prod + dev (pour le build)
+RUN npm install --legacy-peer-deps --workspace=shared --workspace=ai-engine
+
+# ── Stage 2: builder ─────────────────────────────────────────
+FROM deps AS builder
+
+WORKDIR /app
+
+# Copier le code source
+COPY shared/ ./shared/
+COPY ai-engine/ ./ai-engine/
+
+# Build shared en premier
+WORKDIR /app/shared
+RUN npm run build 2>/dev/null || npx tsc -p tsconfig.json 2>/dev/null || true
+
+# Build ai-engine
+WORKDIR /app/ai-engine
+RUN npm run build
+
+# ── Stage 3: production ──────────────────────────────────────
+FROM node:20-alpine AS production
+
+RUN apk add --no-cache dumb-init
+
+# User non-root pour la sécurité
+RUN addgroup -g 1001 -S nodejs && adduser -S aiengine -u 1001
+
+WORKDIR /app
+
+# Copier les deps de prod uniquement
+COPY --from=deps /app/node_modules ./node_modules
+COPY --from=builder /app/shared/dist ./shared/dist
+COPY --from=builder /app/shared/package.json ./shared/package.json
+COPY --from=builder /app/ai-engine/dist ./ai-engine/dist
+COPY --from=builder /app/ai-engine/package.json ./ai-engine/package.json
+
+# Render injecte $PORT dynamiquement — l'app doit lire process.env.PORT
+ENV NODE_ENV=production
+ENV AI_PORT=5000
+
+USER aiengine
+
+EXPOSE 5000
+
+# dumb-init pour proper signal handling (zero-downtime)
+ENTRYPOINT ["/usr/bin/dumb-init", "--"]
+CMD ["node", "ai-engine/dist/index.js"]

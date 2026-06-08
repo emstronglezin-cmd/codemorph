@@ -58,6 +58,7 @@
     "zustand": "^4.5.2"
   },
   "devDependencies": {
+    "@netlify/plugin-nextjs": "^5.9.2",
     "@playwright/test": "^1.42.1",
     "@testing-library/jest-dom": "^6.4.2",
     "@testing-library/react": "^15.0.2",

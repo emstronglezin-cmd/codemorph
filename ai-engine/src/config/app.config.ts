@@ -2,7 +2,7 @@
 // CodeMorph AI Engine — Configuration
 // ============================================================
 export const appConfig = {
-  port:           parseInt(process.env['AI_PORT'] ?? '5000', 10),
+  port:           parseInt(process.env['PORT'] ?? process.env['AI_PORT'] ?? '5000', 10),
   nodeEnv:        process.env['NODE_ENV'] ?? 'development',
 
   // ── Platform AI keys (owned by CodeMorph) ──────────────

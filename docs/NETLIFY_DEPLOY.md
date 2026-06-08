@@ -4,6 +4,21 @@
 
 ---
 
+## ⚠️ Architecture monorepo — Point critique
+
+CodeMorph est un **monorepo npm workspaces**. Le `netlify.toml` se trouve à la **racine** du repo (pas dans `frontend/`). Cela est intentionnel : npm workspaces doit installer depuis la racine pour que `tailwindcss` et les autres devDependencies soient correctement hoistées dans `node_modules/` accessible par Next.js.
+
+```
+codemorph/              ← netlify.toml ICI (racine)
+├── netlify.toml        ← ✅ lu par Netlify
+├── package.json        ← workspaces : frontend, backend, ai-engine, shared
+├── frontend/
+│   ├── netlify.toml   ← intentionnellement vide (ne pas configurer ici)
+│   └── src/
+```
+
+---
+
 ## 1. Connecter le repo GitHub à Netlify
 
 ### Étape 1 — Créer un nouveau site
@@ -16,16 +31,17 @@
 
 ### Étape 2 — Configurer le build
 
-Netlify devrait détecter automatiquement `frontend/netlify.toml`. Vérifier ces paramètres :
+Netlify lit le `netlify.toml` à la **racine** du repo. Vérifier ces paramètres :
 
 | Champ | Valeur |
 |---|---|
-| **Base directory** | `frontend` |
-| **Build command** | `npm install --legacy-peer-deps && npm run build` |
+| **Base directory** | *(laisser vide — racine du repo)* |
+| **Build command** | `npm install --legacy-peer-deps && npm run build:frontend` |
 | **Publish directory** | `frontend/.next` |
 | **Node.js version** | `20` |
 
-> ✅ Le fichier `frontend/netlify.toml` contient déjà toute cette configuration.
+> ✅ Le fichier `netlify.toml` à la racine contient déjà toute cette configuration.  
+> ⚠️ Si Netlify propose `frontend` comme Base directory, le **supprimer/laisser vide**.
 
 ### Étape 3 — Ajouter les variables d'environnement
 
@@ -119,6 +135,10 @@ https://deploy-preview-42--YOUR-SITE.netlify.app
 
 ## 6. Résolution des erreurs courantes
 
+### ❌ `Cannot find module 'tailwindcss'`
+**Cause** : Monorepo npm workspaces — Netlify installait depuis `frontend/` au lieu de la racine  
+**Fix** : Déjà résolu — `netlify.toml` à la racine, build command = `npm install ... && npm run build:frontend`
+
 ### ❌ `husky: command not found`
 **Cause** : Husky tente de s'installer en CI  
 **Fix** : Déjà résolu — `HUSKY=0` dans `netlify.toml` + `"prepare": "husky install || true"` dans `package.json`
@@ -127,20 +147,20 @@ https://deploy-preview-42--YOUR-SITE.netlify.app
 **Cause** : Conflits de peer deps React 18  
 **Fix** : Déjà résolu — `npm install --legacy-peer-deps` dans la build command
 
-### ❌ `Module not found: Can't resolve '@/components/...'`
-**Cause** : Alias TypeScript non résolu  
-**Fix** : Vérifier `tsconfig.json` → `"paths": { "@/*": ["./src/*"] }` et `next.config.ts`
+### ❌ `Module not found: Can't resolve '@/components/...'` ou `@/lib/api/client`
+**Cause** : Alias TypeScript non résolu ou fichiers manquants  
+**Fix** : Les fichiers `frontend/src/lib/api/client.ts`, `frontend/src/components/ui/*.tsx` sont présents. Le `tsconfig.json` frontend définit `"@/*": ["./src/*"]`. Si erreur persiste, vérifier que la build command part bien de la racine.
 
 ### ❌ `Build failed: Cannot find module '@netlify/plugin-nextjs'`
 **Cause** : Plugin manquant  
-**Fix** : Netlify installe les plugins déclarés dans `netlify.toml` automatiquement. Si erreur persistante, ajouter dans `frontend/package.json` devDependencies : `"@netlify/plugin-nextjs": "^5.0.0"`
+**Fix** : `@netlify/plugin-nextjs` est dans `frontend/package.json` devDependencies. Il est installé automatiquement par `npm install` depuis la racine via workspaces.
 
 ### ❌ `NEXT_PUBLIC_API_URL` non défini au build
 **Cause** : Variable ajoutée après le premier build  
-**Fix** : **Site settings > Environment variables** → Ajouter la variable → **Trigger new deploy** (bouton dans l'interface Netlify)
+**Fix** : **Site settings > Environment variables** → Ajouter la variable → **Trigger new deploy**
 
 ### ❌ OAuth redirect vers localhost
-**Cause** : `NEXTAUTH_URL` ou callbacks OAuth pointent vers localhost  
+**Cause** : Callbacks OAuth pointent vers localhost  
 **Fix** : Mettre à jour les callbacks dans GitHub OAuth App et Google OAuth avec l'URL Netlify production. Voir `docs/GITHUB_OAUTH.md` et `docs/GOOGLE_OAUTH.md`.
 
 ---
