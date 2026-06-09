@@ -47,23 +47,23 @@ export class ProjectEntity {
   })
   targetLanguage!: 'typescript' | 'rust' | 'kotlin' | 'swift' | 'dart';
 
-  @Column({ name: 'owner_id' })
+  @Column({ name: 'owner_id', type: 'varchar' })
   ownerId!: string;
 
   @ManyToOne(() => UserEntity, { onDelete: 'CASCADE' })
   @JoinColumn({ name: 'owner_id' })
   owner!: UserEntity;
 
-  @Column({ name: 'org_id', nullable: true })
+  @Column({ name: 'org_id', type: 'varchar', nullable: true })
   orgId!: string | null;
 
   @Column({ name: 'ir_document', type: 'jsonb', nullable: true })
   irDocument!: Record<string, unknown> | null;
 
-  @Column({ name: 'files_count', default: 0 })
+  @Column({ name: 'files_count', type: 'int', default: 0 })
   filesCount!: number;
 
-  @Column({ name: 'lines_count', default: 0 })
+  @Column({ name: 'lines_count', type: 'int', default: 0 })
   linesCount!: number;
 
   @CreateDateColumn({ name: 'created_at', type: 'timestamptz' })

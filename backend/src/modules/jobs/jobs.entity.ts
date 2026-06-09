@@ -36,21 +36,21 @@ export class JobEntity {
   type!: JobType;
   @Column({ type: 'enum', enum: JobStatus, default: JobStatus.PENDING })
   status!: JobStatus;
-  @Column({ nullable: true })
+  @Column({ type: 'varchar', nullable: true })
   sourceLanguage!: string;
-  @Column({ nullable: true })
+  @Column({ type: 'varchar', nullable: true })
   targetLanguage!: string;
-  @Column({ nullable: true })
+  @Column({ type: 'varchar', nullable: true })
   sourceRepo!: string;
-  @Column({ nullable: true })
+  @Column({ type: 'varchar', nullable: true })
   sourceBranch!: string;
-  @Column({ nullable: true })
+  @Column({ type: 'varchar', nullable: true })
   zipPath!: string;
-  @Column({ nullable: true })
+  @Column({ type: 'varchar', nullable: true })
   aiEngineJobId!: string;
   @Column({ type: 'int', default: 0 })
   progress!: number;
-  @Column({ nullable: true })
+  @Column({ type: 'varchar', nullable: true })
   currentPhase!: string;
   @Column({ type: 'jsonb', nullable: true })
   phaseLogs!: Array<{ phase: string; status: string; message: string; timestamp: string }>;
@@ -59,25 +59,25 @@ export class JobEntity {
   irDocument!: Record<string, unknown>;
   @Column({ type: 'jsonb', nullable: true })
   result!: Record<string, unknown>;
-  @Column({ nullable: true })
+  @Column({ type: 'varchar', nullable: true })
   errorMessage!: string;
   @Column({ type: 'jsonb', nullable: true })
   errorDetails!: Record<string, unknown>;
-  @Column({ nullable: true })
+  @Column({ type: 'varchar', nullable: true })
   outputZipPath!: string;
-  @Column({ nullable: true })
+  @Column({ type: 'varchar', nullable: true })
   outputGithubPrUrl!: string;
   @Column({ type: 'int', nullable: true })
   filesGenerated!: number;
   @Column({ type: 'int', nullable: true })
   linesGenerated!: number;
-  @Column({ nullable: true })
+  @Column({ type: 'timestamptz', nullable: true })
   startedAt!: Date;
-  @Column({ nullable: true })
+  @Column({ type: 'timestamptz', nullable: true })
   completedAt!: Date;
   @Column()
   userId!: string;
-  @Column({ nullable: true })
+  @Column({ type: 'varchar', nullable: true })
   projectId!: string;
   @ManyToOne(() => UserEntity, { onDelete: 'CASCADE' })
   @JoinColumn({ name: 'userId' })

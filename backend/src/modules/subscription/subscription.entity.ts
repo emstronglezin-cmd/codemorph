@@ -47,11 +47,11 @@ export class SubscriptionEntity {
   @Column({ type: 'enum', enum: BillingProvider, default: BillingProvider.STRIPE })
   provider!: BillingProvider;
   // Provider references
-  @Column({ nullable: true })
+  @Column({ type: 'varchar', nullable: true })
   providerSubscriptionId!: string;
-  @Column({ nullable: true })
+  @Column({ type: 'varchar', nullable: true })
   providerCustomerId!: string;
-  @Column({ nullable: true })
+  @Column({ type: 'varchar', nullable: true })
   providerPriceId!: string;
   // Billing period
   @Column({ type: 'timestamptz', nullable: true })
@@ -67,7 +67,7 @@ export class SubscriptionEntity {
   // Pricing snapshot (at time of purchase)
   @Column({ type: 'int', default: 0 })
   priceAmountCents!: number;
-  @Column({ length: 3, default: 'usd' })
+  @Column({ type: 'varchar', length: 3, default: 'usd' })
   currency!: string;
   // Metadata
   @Column({ type: 'jsonb', nullable: true })

@@ -16,16 +16,16 @@ export class UserEntity {
   @PrimaryGeneratedColumn('uuid')
   id!: string;
 
-  @Column({ length: 100 })
+  @Column({ type: 'varchar', length: 100 })
   name!: string;
 
-  @Column({ unique: true, length: 255 })
+  @Column({ type: 'varchar', unique: true, length: 255 })
   email!: string;
 
-  @Column({ name: 'password_hash', select: false })
+  @Column({ name: 'password_hash', type: 'varchar', select: false })
   passwordHash!: string;
 
-  @Column({ name: 'avatar_url', nullable: true, length: 500 })
+  @Column({ name: 'avatar_url', type: 'varchar', nullable: true, length: 500 })
   avatarUrl!: string | null;
 
   @Column({
@@ -49,23 +49,23 @@ export class UserEntity {
   })
   status!: 'active' | 'inactive' | 'suspended' | 'pending_verification';
 
-  @Column({ name: 'email_verified', default: false })
+  @Column({ name: 'email_verified', type: 'boolean', default: false })
   emailVerified!: boolean;
 
   @Column({ name: 'last_login_at', nullable: true, type: 'timestamptz' })
   lastLoginAt!: Date | null;
 
-  @Column({ name: 'stripe_customer_id', nullable: true, length: 100 })
+  @Column({ name: 'stripe_customer_id', type: 'varchar', nullable: true, length: 100 })
   stripeCustomerId!: string | null;
 
   // ── OAuth fields ──────────────────────────────────────────
-  @Column({ name: 'oauth_provider', nullable: true, length: 32 })
+  @Column({ name: 'oauth_provider', type: 'varchar', nullable: true, length: 32 })
   oauthProvider!: string | null;
 
-  @Column({ name: 'oauth_provider_id', nullable: true, length: 255 })
+  @Column({ name: 'oauth_provider_id', type: 'varchar', nullable: true, length: 255 })
   oauthProviderId!: string | null;
 
-  @Column({ name: 'github_access_token', nullable: true, length: 512, select: false })
+  @Column({ name: 'github_access_token', type: 'varchar', nullable: true, length: 512, select: false })
   githubAccessToken!: string | null;
 
   @CreateDateColumn({ name: 'created_at', type: 'timestamptz' })

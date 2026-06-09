@@ -25,6 +25,9 @@ FROM deps AS builder
 WORKDIR /app
 
 # Copier le code source
+# CRITIQUE: tsconfig.base.json doit être copié depuis la racine
+# pour que les tsconfig des workspaces (qui l'étendent) le trouvent
+COPY tsconfig.base.json ./
 COPY shared/ ./shared/
 COPY ai-engine/ ./ai-engine/
 

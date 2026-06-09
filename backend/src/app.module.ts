@@ -10,6 +10,27 @@ import { TerminusModule }  from '@nestjs/terminus';
 import { BullModule }      from '@nestjs/bull';
 import { RedisModule }     from '@liaoliaots/nestjs-redis';
 
+/**
+ * Normalise une URL Redis en s'assurant qu'elle a un protocole valide.
+ * Cas Upstash : l'URL peut arriver sans protocole (ex: "hostname:port")
+ * ce qui fait que Node.js tente une connexion socket Unix → ENOENT.
+ *
+ * Retourne null si aucune URL n'est configurée → Redis sera désactivé.
+ */
+function normalizeRedisUrl(raw: string | undefined): string | null {
+  if (!raw) return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  // Déjà un protocole valide Redis ?
+  if (trimmed.startsWith('redis://') || trimmed.startsWith('rediss://')) {
+    return trimmed;
+  }
+  // URL sans protocole (ex: "hostname:port") ou avec // seulement → ajouter rediss://
+  // Upstash requiert TLS donc on force rediss://
+  const withoutSlashes = trimmed.replace(/^\/\//, '');
+  return `rediss://${withoutSlashes}`;
+}
+
 import { AuthModule }          from './modules/auth/auth.module';
 import { UsersModule }         from './modules/users/users.module';
 import { OrganizationsModule } from './modules/organizations/organizations.module';
@@ -45,36 +66,65 @@ import { redisConfig }    from './config/redis.config';
     }),
 
     // ── Redis (global, @liaoliaots/nestjs-redis) ───────────
+    // Redis est OPTIONNEL : si REDIS_URL est absent/invalide, on ne crashe pas.
+    // L'URL est normalisée pour corriger le cas Upstash (rediss:// manquant).
     RedisModule.forRootAsync({
       inject:     [ConfigService],
-      useFactory: (config: ConfigService) => ({
-        config: {
-          url:          config.get<string>('REDIS_URL', 'redis://localhost:6379'),
-          password:     config.get<string>('REDIS_PASSWORD'),
-          db:           config.get<number>('REDIS_DB', 0),
-          lazyConnect:  false,
-          retryStrategy: (times: number) => Math.min(times * 200, 3000),
-        },
-      }),
+      useFactory: (config: ConfigService) => {
+        const rawUrl  = config.get<string>('REDIS_URL');
+        const redisUrl = normalizeRedisUrl(rawUrl) ?? 'redis://localhost:6379';
+        return {
+          config: {
+            url:           redisUrl,
+            password:      config.get<string>('REDIS_PASSWORD'),
+            db:            config.get<number>('REDIS_DB', 0),
+            // lazyConnect = true : ne crashe pas au démarrage si Redis indisponible
+            lazyConnect:   true,
+            // Limiter les tentatives de reconnexion pour ne pas bloquer le démarrage
+            retryStrategy: (times: number) => {
+              if (times > 5) return null; // abandon après 5 essais
+              return Math.min(times * 500, 3000);
+            },
+            enableOfflineQueue: false,
+          },
+        };
+      },
     }),
 
     // ── Bull queue (Redis-backed) ──────────────────────────
     BullModule.forRootAsync({
       inject:     [ConfigService],
-      useFactory: (config: ConfigService) => ({
-        redis: {
-          host:     config.get<string>('REDIS_HOST', 'localhost'),
-          port:     config.get<number>('REDIS_PORT', 6379),
-          password: config.get<string>('REDIS_PASSWORD'),
-          db:       config.get<number>('REDIS_QUEUE_DB', 1),
-        },
-        defaultJobOptions: {
-          removeOnComplete: 100,
-          removeOnFail:     200,
-          attempts:         3,
-          backoff: { type: 'exponential', delay: 2000 },
-        },
-      }),
+      useFactory: (config: ConfigService) => {
+        const rawUrl  = config.get<string>('REDIS_URL');
+        const redisUrl = normalizeRedisUrl(rawUrl);
+        // Si on a une URL complète, on l'utilise directement via url
+        // Sinon on tombe sur localhost (dev sans Redis)
+        if (redisUrl) {
+          return {
+            url: redisUrl,
+            defaultJobOptions: {
+              removeOnComplete: 100,
+              removeOnFail:     200,
+              attempts:         3,
+              backoff: { type: 'exponential', delay: 2000 },
+            },
+          };
+        }
+        return {
+          redis: {
+            host:     config.get<string>('REDIS_HOST', 'localhost'),
+            port:     config.get<number>('REDIS_PORT', 6379),
+            password: config.get<string>('REDIS_PASSWORD'),
+            db:       config.get<number>('REDIS_QUEUE_DB', 1),
+          },
+          defaultJobOptions: {
+            removeOnComplete: 100,
+            removeOnFail:     200,
+            attempts:         3,
+            backoff: { type: 'exponential', delay: 2000 },
+          },
+        };
+      },
     }),
 
     // ── Database ───────────────────────────────────────────
