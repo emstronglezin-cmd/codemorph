@@ -1,5 +1,0 @@
-# ⚠️  Configuration déplacée à la RACINE du repo (../netlify.toml)
-# Ce fichier est intentionnellement vide.
-# Netlify lit le netlify.toml à la racine du repo connecté.
-# Raison : monorepo npm workspaces — tailwindcss doit être
-# installé depuis la racine pour être visible par Next.js.

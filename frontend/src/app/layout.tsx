@@ -1,3 +1,4 @@
+import type React from 'react';
 // ============================================================
 // CodeMorph — Root Layout (Next.js 14 App Router)
 // PWA-ready: manifest, theme-color, apple meta, viewport
@@ -7,6 +8,7 @@ import { Inter } from 'next/font/google';
 
 import '@/styles/globals.css';
 import { PwaInstallBanner } from '@/components/shared/pwa-install-banner';
+import { Providers } from '@/components/providers';
 
 const inter = Inter({
   subsets: ['latin'],
@@ -108,9 +110,11 @@ export default function RootLayout({
         <meta name="mobile-web-app-capable" content="yes" />
       </head>
       <body className="min-h-screen bg-background antialiased">
-        {/* PWA install banner — smart prompt for eligible browsers */}
-        <PwaInstallBanner />
-        {children}
+        <Providers>
+          {/* PWA install banner — smart prompt for eligible browsers */}
+          <PwaInstallBanner />
+          {children}
+        </Providers>
       </body>
     </html>
   );

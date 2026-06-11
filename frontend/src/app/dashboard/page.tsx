@@ -1,9 +1,10 @@
+import type React from 'react';
 // ============================================================
 // CodeMorph — Dashboard Home Page
 // ============================================================
 import type { Metadata } from 'next';
 import {
-  FolderCode,
+  FolderGit2,
   Zap,
   CheckCircle2,
   TrendingUp,
@@ -28,7 +29,7 @@ const STATS = [
     value:  '12',
     delta:  '+3 this month',
     trend:  'up',
-    icon:   FolderCode,
+    icon:   FolderGit2,
     color:  'text-brand-500',
     bg:     'bg-brand-500/10',
   },
@@ -220,7 +221,7 @@ export default function DashboardPage(): React.JSX.Element {
             </Link>
             <Link href="/dashboard/projects">
               <Button variant="outline" className="w-full justify-start gap-3" size="lg">
-                <FolderCode className="h-4 w-4 text-brand-500" />
+                <FolderGit2 className="h-4 w-4 text-brand-500" />
                 Browse Projects
               </Button>
             </Link>
@@ -268,7 +269,7 @@ export default function DashboardPage(): React.JSX.Element {
             {[
               { icon: CheckCircle2, color: 'text-success', msg: 'Project legacy-api-conversion completed successfully', time: '2 hours ago' },
               { icon: Zap,          color: 'text-warning',  msg: 'Conversion started on mobile-app-rewrite', time: '34 min ago' },
-              { icon: FolderCode,   color: 'text-primary',  msg: 'New project php-modernization created', time: '3 days ago' },
+              { icon: FolderGit2,   color: 'text-primary',  msg: 'New project php-modernization created', time: '3 days ago' },
               { icon: Clock,        color: 'text-info',     msg: 'Scheduled maintenance completed', time: '4 days ago' },
             ].map((item, i) => (
               <div key={i} className="flex items-start gap-3">

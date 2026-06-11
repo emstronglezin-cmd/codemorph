@@ -1,3 +1,4 @@
+import type React from 'react';
 // ============================================================
 // CodeMorph — Landing Page (Marketing)
 // Design: Stripe / Vercel / Linear quality

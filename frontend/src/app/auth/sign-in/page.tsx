@@ -1,8 +1,9 @@
+'use client';
 // ============================================================
 // CodeMorph — Sign In Page (Client Component)
 // Supports: Email/Password + GitHub OAuth + Google OAuth
 // ============================================================
-'use client';
+import type React from 'react';
 
 import { useState } from 'react';
 import Link from 'next/link';

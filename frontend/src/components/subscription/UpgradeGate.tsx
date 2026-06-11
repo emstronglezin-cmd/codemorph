@@ -1,5 +1,6 @@
 'use client';
 
+import type React from 'react';
 import { useState } from 'react';
 import { useSubscription, useCheckout, usePlans, type Plan, type BillingInterval } from '@/hooks/useSubscription';
 import { PlanBadge } from './PlanBadge';

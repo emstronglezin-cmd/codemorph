@@ -19,7 +19,8 @@ declare module 'lucide-react' {
 
   // ── Commonly used icons ───────────────────────────────────
   export const LayoutDashboard: Icon;
-  export const FolderCode: Icon;
+  export const FolderGit2: Icon;
+  export const FolderTree: Icon;
   export const Zap: Icon;
   export const BarChart3: Icon;
   export const Settings: Icon;

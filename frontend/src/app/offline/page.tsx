@@ -1,7 +1,9 @@
+'use client';
 // ============================================================
 // CodeMorph — Offline Fallback Page (PWA)
 // Shown when user is offline and page isn't cached
 // ============================================================
+import type React from 'react';
 
 export default function OfflinePage(): React.JSX.Element {
   return (
