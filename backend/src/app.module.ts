@@ -128,20 +128,40 @@ import { redisConfig }    from './config/redis.config';
     }),
 
     // ── Database ───────────────────────────────────────────
+    // Compatible Supabase (Connection Pooler, port 6543 ou 5432)
+    // DATABASE_SSL=true active SSL avec rejectUnauthorized: false
+    // (requis car Supabase utilise un certificat pooler auto-signé)
     TypeOrmModule.forRootAsync({
       inject:     [ConfigService],
-      useFactory: (config: ConfigService) => ({
-        type:        'postgres',
-        url:          config.get<string>('DATABASE_URL'),
-        entities:    [__dirname + '/**/*.entity{.ts,.js}'],
-        migrations:  [__dirname + '/database/migrations/*{.ts,.js}'],
-        synchronize:  config.get<string>('NODE_ENV') !== 'production',
-        logging:      config.get<string>('NODE_ENV') === 'development',
-        ssl:          config.get<boolean>('DATABASE_SSL', false)
-                       ? { rejectUnauthorized: false }
-                       : false,
-        extra:       { max: 20, idleTimeoutMillis: 30_000, connectionTimeoutMillis: 5_000 },
-      }),
+      useFactory: (config: ConfigService) => {
+        const databaseUrl = config.get<string>('DATABASE_URL');
+        const nodeEnv     = config.get<string>('NODE_ENV', 'development');
+
+        // Détection automatique Supabase si DATABASE_SSL non défini
+        const sslRaw      = config.get<string>('DATABASE_SSL');
+        let sslEnabled: boolean;
+        if (sslRaw === 'true')  sslEnabled = true;
+        else if (sslRaw === 'false') sslEnabled = false;
+        else if (databaseUrl?.includes('supabase.com')) sslEnabled = true;
+        else sslEnabled = nodeEnv === 'production';
+
+        return {
+          type:        'postgres' as const,
+          url:          databaseUrl,
+          entities:    [__dirname + '/**/*.entity{.ts,.js}'],
+          migrations:  [__dirname + '/database/migrations/*{.ts,.js}'],
+          synchronize:  nodeEnv !== 'production',
+          logging:      nodeEnv === 'development',
+          // Supabase pooler requiert ssl avec rejectUnauthorized: false
+          ssl:          sslEnabled ? { rejectUnauthorized: false } : false,
+          extra: {
+            max:                      20,
+            idleTimeoutMillis:        30_000,
+            // Timeout plus long pour Supabase (cold start pooler)
+            connectionTimeoutMillis:  10_000,
+          },
+        };
+      },
     }),
 
     // ── Rate limiting (tiered per plan via ThrottlerModule) ─

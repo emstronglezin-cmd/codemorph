@@ -32,24 +32,29 @@ Render n'a pas de Redis gratuit. On utilise **Upstash** :
 
 ---
 
-## Étape 1 — PostgreSQL (gratuit 90 jours)
+## Étape 1 — Base de données PostgreSQL via Supabase ✅ (recommandé)
 
-1. Aller sur **[dashboard.render.com](https://dashboard.render.com)**
-2. **New → PostgreSQL**
-3. Configurer :
+> **⚠️ Render PostgreSQL Free expire après 90 jours et supprime toutes les données.**  
+> On utilise **Supabase** à la place : PostgreSQL gratuit permanent (pause après 7j inactivité, pas de suppression).  
+> Voir le guide complet : **[docs/SUPABASE_SETUP.md](./SUPABASE_SETUP.md)**
+
+### Résumé rapide :
+
+1. Aller sur **[supabase.com](https://supabase.com)** → **New project**
+2. Configurer :
    ```
-   Name:     codemorph-postgres
-   Region:   Frankfurt (EU Central)
-   Plan:     Free ← IMPORTANT : sélectionner Free
+   Project name:      codemorph
+   Database Password: <choisir un mot de passe fort>
+   Region:            EU West 2 (London)
+   Plan:              Free
    ```
-4. Cliquer **Create Database**
-5. Attendre ~2 minutes que la DB soit prête
-6. Dans la page de la DB, copier **"Internal Database URL"** :
+3. Aller dans **Project Settings → Database → Connection string → Transaction pooler**
+4. Copier la connection string :
    ```
-   postgresql://codemorph:PASSWORD@dpg-XXXXX-a/codemorph
+   postgresql://postgres.XXXXXXXXXX:YOUR-PASSWORD@aws-0-eu-west-2.pooler.supabase.com:6543/postgres
    ```
-   > ⚠️ "Internal URL" = uniquement accessible depuis Render (réseau interne)  
-   > ⚠️ "External URL" = accessible depuis l'extérieur (pour migrations locales)
+
+> ⚠️ Ajouter `DATABASE_SSL=true` dans Render — obligatoire pour Supabase
 
 ---
 
@@ -81,8 +86,8 @@ NODE_ENV          = production
 PORT              = 4000
 LOG_LEVEL         = warn
 
-# Database (depuis Étape 1)
-DATABASE_URL      = <Internal Database URL depuis Render PostgreSQL>
+# Database Supabase (depuis Étape 1 — Transaction pooler, port 6543)
+DATABASE_URL      = postgresql://postgres.XXXXXXXXXX:YOUR-PASSWORD@aws-0-eu-west-2.pooler.supabase.com:6543/postgres
 DATABASE_SSL      = true
 
 # Redis (depuis Étape 0 — laisser vide si pas Upstash)
@@ -191,15 +196,15 @@ DATABASE_URL="<External Database URL depuis Render>" npx typeorm migration:run -
 
 ---
 
-## Étape 5 — Configurer Netlify avec l'URL Render
+## Étape 5 — Configurer Vercel avec l'URL Render
 
-Dans **Netlify Dashboard → Site settings → Environment variables** :
+Dans **Vercel Dashboard → Project → Settings → Environment Variables** :
 
 ```
 NEXT_PUBLIC_API_URL = https://codemorph-backend.onrender.com/api/v1
 ```
 
-Puis **Trigger deploy** pour que Next.js prenne en compte la nouvelle URL.
+Puis **Trigger deploy** (ou push sur `main`) pour que Next.js prenne en compte la nouvelle URL.
 
 ---
 
@@ -222,31 +227,15 @@ curl -X POST https://codemorph-backend.onrender.com/api/v1/convert/quick \
 
 ---
 
-## 🔄 Renouvellement PostgreSQL Free (après 90 jours)
+## 🗄️ Base de données : Supabase (migré depuis Render)
 
-Le PostgreSQL gratuit Render expire après 90 jours. Pour renouveler :
+> Render PostgreSQL Free expire après 90 jours — la base de données de CodeMorph a été **migrée vers Supabase** (PostgreSQL gratuit permanent).  
+> Voir le guide complet : **[docs/SUPABASE_SETUP.md](./SUPABASE_SETUP.md)**
 
-1. Dashboard → `codemorph-postgres` → **Delete**
-2. Recréer une nouvelle base PostgreSQL gratuite
-3. Mettre à jour `DATABASE_URL` dans le backend
-4. Réappliquer les migrations
-
-> 💡 **Alternativement** : Utiliser **Supabase** (PostgreSQL gratuit sans expiration).  
-> Voir ci-dessous.
-
----
-
-## 🎁 Alternative : Supabase (PostgreSQL gratuit permanent)
-
-Si les 90 jours Render sont trop contraignants :
-
-1. **[supabase.com](https://supabase.com)** → New Project
-2. Récupérer la **Connection String** (mode `Transaction pooler`)
-3. Format : `postgresql://postgres.XXX:PASSWORD@aws-0-eu-central-1.pooler.supabase.com:6543/postgres`
-4. Remplacer `DATABASE_URL` dans Render par cette URL
-5. Ajouter `DATABASE_SSL=true`
-
-> ✅ Supabase Free : 500MB, 2 projets, pas d'expiration (pause après 1 semaine d'inactivité)
+### Si votre base Supabase est en pause (7j d'inactivité) :
+1. Dashboard Supabase → votre projet → bouton **"Restore project"**
+2. Attendre ~2 minutes
+3. Render redémarrera automatiquement avec la nouvelle connexion
 
 ---
 
@@ -254,7 +243,7 @@ Si les 90 jours Render sont trop contraignants :
 
 | Service | URL |
 |---|---|
-| **Frontend** | `https://YOUR-SITE.netlify.app` |
+| **Frontend** | `https://YOUR-PROJECT.vercel.app` |
 | **Backend API** | `https://codemorph-backend.onrender.com` |
 | **AI Engine** | `https://codemorph-ai.onrender.com` |
 | **PostgreSQL** | Interne Render (pas exposé publiquement) |
