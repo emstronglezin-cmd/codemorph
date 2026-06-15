@@ -9,13 +9,19 @@ export const apiClient: AxiosInstance = axios.create({
   timeout: 30_000,
 });
 
-// ── Request interceptor: attach access token from memory ──────────────────────
+// ── Request interceptor: attach access token ─────────────────────────────────
+// Ordre de priorité: window.__CODEMORPH_ACCESS_TOKEN__ (mémoire) > localStorage
 apiClient.interceptors.request.use((config: InternalAxiosRequestConfig) => {
-  const token = typeof window !== 'undefined'
-    ? window.__CODEMORPH_ACCESS_TOKEN__
-    : undefined;
-  if (token && config.headers) {
-    config.headers.Authorization = `Bearer ${token}`;
+  if (typeof window !== 'undefined') {
+    const token =
+      window.__CODEMORPH_ACCESS_TOKEN__ ??
+      localStorage.getItem('cm_access_token') ??
+      undefined;
+    if (token && config.headers) {
+      config.headers.Authorization = `Bearer ${token}`;
+      // Sync mémoire pour les prochaines requêtes
+      window.__CODEMORPH_ACCESS_TOKEN__ = token;
+    }
   }
   return config;
 });
@@ -53,7 +59,10 @@ apiClient.interceptors.response.use(
       } catch {
         refreshQueue = [];
         window.__CODEMORPH_ACCESS_TOKEN__ = undefined;
-        if (typeof window !== 'undefined') window.location.href = '/auth/sign-in';
+        if (typeof window !== 'undefined') {
+          localStorage.removeItem('cm_access_token');
+          window.location.href = '/auth/sign-in';
+        }
         return Promise.reject(error);
       } finally {
         isRefreshing = false;

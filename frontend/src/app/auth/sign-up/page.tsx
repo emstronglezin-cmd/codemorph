@@ -17,6 +17,7 @@ export default function SignUpPage() {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (form.password !== form.confirm) { setError('Passwords do not match'); return; }
+    if (form.password.length < 8) { setError('Password must be at least 8 characters'); return; }
     setLoading(true); setError('');
     try {
       const res = await fetch(`${BACKEND}/auth/sign-up`, {
@@ -25,8 +26,21 @@ export default function SignUpPage() {
         body: JSON.stringify({ name: form.name, email: form.email, password: form.password }),
         credentials: 'include',
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error?.message ?? 'Sign-up failed');
+      const data = await res.json() as {
+        data?: { tokens?: { accessToken?: string }; user?: { id: string } };
+        tokens?: { accessToken?: string };
+        error?: { message?: string };
+        message?: string;
+      };
+      if (!res.ok) {
+        const msg = data.error?.message ?? data.message ?? `Error ${res.status}`;
+        throw new Error(msg);
+      }
+      // Stocker le token d'accès (même logique que sign-in)
+      const token = data.data?.tokens?.accessToken ?? data.tokens?.accessToken;
+      if (token && typeof window !== 'undefined') {
+        localStorage.setItem('cm_access_token', token);
+      }
       window.location.href = '/dashboard';
     } catch (err) {
       setError((err as Error).message);

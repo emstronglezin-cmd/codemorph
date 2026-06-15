@@ -35,9 +35,14 @@ export default function SignInPage(): React.JSX.Element {
         const data = await res.json() as { message?: string };
         throw new Error(data.message ?? 'Invalid credentials');
       }
-      const data = await res.json() as { tokens: { accessToken: string } };
-      if (typeof window !== 'undefined') {
-        localStorage.setItem('cm_access_token', data.tokens.accessToken);
+      const data = await res.json() as {
+        data?: { tokens?: { accessToken?: string } };
+        tokens?: { accessToken?: string };
+      };
+      const token = data.data?.tokens?.accessToken ?? data.tokens?.accessToken;
+      if (token && typeof window !== 'undefined') {
+        localStorage.setItem('cm_access_token', token);
+        window.__CODEMORPH_ACCESS_TOKEN__ = token;
       }
       router.replace('/dashboard');
     } catch (err: unknown) {

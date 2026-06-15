@@ -182,12 +182,16 @@ export class AuthController {
 
   // ── Private helpers ───────────────────────────────────
   private setRefreshTokenCookie(res: Response, token: string): void {
+    const isProd = process.env['NODE_ENV'] === 'production';
     res.cookie('cm_refresh_token', token, {
       httpOnly: true,
-      secure:   process.env['NODE_ENV'] === 'production',
-      sameSite: 'lax',
+      // Cross-domain (Vercel frontend ↔ Render backend) :
+      // sameSite DOIT être 'none' + secure: true en production
+      secure:   isProd,
+      sameSite: isProd ? 'none' : 'lax',
       maxAge:   7 * 24 * 60 * 60 * 1000,
-      path:     '/api/v1/auth/refresh',
+      path:     '/',  // '/' au lieu de '/api/v1/auth/refresh' pour que le cookie
+                      // soit envoyé sur toutes les routes (cross-origin en prod)
     });
   }
 }

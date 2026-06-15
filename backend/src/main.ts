@@ -34,7 +34,7 @@ async function bootstrap(): Promise<void> {
   }));
 
   // ── CORS ─────────────────────────────────────────────────
-  // Support both FRONTEND_URL (production) and APP_URL (legacy) + localhost dev
+  // Support Vercel (*.vercel.app), custom domain, localhost dev
   const allowedOrigins = [
     config.get<string>('FRONTEND_URL', ''),
     config.get<string>('APP_URL', ''),
@@ -45,13 +45,19 @@ async function bootstrap(): Promise<void> {
 
   app.enableCors({
     origin: (origin, callback) => {
-      // Allow requests with no origin (server-to-server, curl)
+      // Allow requests with no origin (server-to-server, curl, Render health checks)
       if (!origin) return callback(null, true);
+      // Exact match (FRONTEND_URL etc.)
       if (allowedOrigins.includes(origin)) return callback(null, true);
+      // Allow any *.vercel.app subdomain (preview deployments + production)
+      if (/^https:\/\/[a-z0-9-]+(\.vercel\.app)$/.test(origin)) return callback(null, true);
+      // Allow any *.onrender.com (services inter-Render)
+      if (/^https:\/\/[a-z0-9-]+(\.onrender\.com)$/.test(origin)) return callback(null, true);
       // In development, allow all localhost origins
       if (nodeEnv !== 'production' && /^https?:\/\/localhost(:\d+)?$/.test(origin)) {
         return callback(null, true);
       }
+      logger.warn(`CORS blocked: ${origin}`);
       callback(new Error(`CORS: origin '${origin}' not allowed`));
     },
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],

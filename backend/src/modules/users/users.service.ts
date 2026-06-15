@@ -57,8 +57,10 @@ export class UsersService {
       githubAccessToken: input.githubAccessToken ?? null,
       role:            'member',
       plan:            'free',
-      status:          input.status ?? 'pending_verification',
-      emailVerified:   input.emailVerified ?? false,
+      // 'active' par défaut — pas de vérification email en V1
+      // (pas de service email configuré — on active directement)
+      status:          input.status ?? 'active',
+      emailVerified:   input.emailVerified ?? true,
     });
 
     return this.usersRepo.save(user);
