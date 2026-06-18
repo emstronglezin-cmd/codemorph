@@ -23,17 +23,22 @@ export default function SignUpPage() {
       const res = await fetch(`${BACKEND}/auth/sign-up`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: form.name, email: form.email, password: form.password }),
+        body: JSON.stringify({ name: form.name, email: form.email, password: form.password, acceptTerms: true }),
         credentials: 'include',
       });
       const data = await res.json() as {
         data?: { tokens?: { accessToken?: string }; user?: { id: string } };
         tokens?: { accessToken?: string };
         error?: { message?: string };
-        message?: string;
+        message?: string | string[];
+        statusCode?: number;
       };
       if (!res.ok) {
-        const msg = data.error?.message ?? data.message ?? `Error ${res.status}`;
+        // NestJS renvoie message comme string ou string[] (validation)
+        const raw = data.message;
+        const msg = Array.isArray(raw)
+          ? raw[0]
+          : (raw ?? data.error?.message ?? `Server error ${res.status}`);
         throw new Error(msg);
       }
       // Stocker le token d'accès (même logique que sign-in)

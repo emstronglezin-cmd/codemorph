@@ -1,7 +1,7 @@
 // ============================================================
 // CodeMorph — Sign Up DTO
 // ============================================================
-import { IsEmail, IsString, MinLength, MaxLength, IsBoolean } from 'class-validator';
+import { IsEmail, IsString, MinLength, MaxLength, IsBoolean, IsOptional } from 'class-validator';
 import { ApiProperty } from '@nestjs/swagger';
 
 export class SignUpDto {
@@ -21,7 +21,9 @@ export class SignUpDto {
   @MaxLength(128)
   password!: string;
 
-  @ApiProperty({ example: true })
+  // Optionnel — le frontend peut ne pas l'envoyer (V1 sans checkbox obligatoire)
+  @ApiProperty({ example: true, required: false })
   @IsBoolean()
-  acceptTerms!: true;
+  @IsOptional()
+  acceptTerms?: boolean;
 }

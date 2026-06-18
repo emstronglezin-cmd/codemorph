@@ -32,8 +32,12 @@ export default function SignInPage(): React.JSX.Element {
         body:        JSON.stringify({ email, password }),
       });
       if (!res.ok) {
-        const data = await res.json() as { message?: string };
-        throw new Error(data.message ?? 'Invalid credentials');
+        const data = await res.json() as { message?: string | string[]; error?: string };
+        const raw = data.message;
+        const msg = Array.isArray(raw)
+          ? raw[0]
+          : (raw ?? data.error ?? 'Invalid credentials');
+        throw new Error(msg);
       }
       const data = await res.json() as {
         data?: { tokens?: { accessToken?: string } };

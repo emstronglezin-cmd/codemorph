@@ -116,6 +116,19 @@ async function bootstrap(): Promise<void> {
     logger.log(`📚 Swagger docs available at http://localhost:${port}/api/docs`);
   }
 
+  // ── Root endpoint — confirmation service en ligne ────────
+  // Visible sur https://codemorph-backend.onrender.com/
+  const httpAdapter = app.getHttpAdapter();
+  httpAdapter.get('/', (_req: unknown, res: { json: (d: unknown) => void }) => {
+    res.json({
+      name:    'CodeMorph API',
+      version: '1.0.0',
+      status:  'online',
+      docs:    `http://localhost:${port}/api/docs`,
+      health:  `/api/v1/health`,
+    });
+  });
+
   // ── Graceful shutdown ────────────────────────────────────
   app.enableShutdownHooks();
 
