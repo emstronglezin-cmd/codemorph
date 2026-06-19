@@ -145,13 +145,21 @@ import { redisConfig }    from './config/redis.config';
         else if (databaseUrl?.includes('supabase.com')) sslEnabled = true;
         else sslEnabled = nodeEnv === 'production';
 
+        // DATABASE_SYNC=true → force la création des tables (à activer 1 fois)
+        // En production sans migrations, mettre DATABASE_SYNC=true dans Render
+        // puis repasser à false après le premier démarrage réussi
+        const syncEnv = config.get<string>('DATABASE_SYNC');
+        const shouldSync =
+          syncEnv === 'true' ||           // forcé explicitement
+          nodeEnv !== 'production';       // toujours en dev
+
         return {
           type:        'postgres' as const,
           url:          databaseUrl,
           entities:    [__dirname + '/**/*.entity{.ts,.js}'],
           migrations:  [__dirname + '/database/migrations/*{.ts,.js}'],
-          synchronize:  nodeEnv !== 'production',
-          logging:      nodeEnv === 'development',
+          synchronize:  shouldSync,
+          logging:      nodeEnv === 'development' || syncEnv === 'true',
           // Supabase pooler requiert ssl avec rejectUnauthorized: false
           ssl:          sslEnabled ? { rejectUnauthorized: false } : false,
           extra: {
