@@ -1,125 +1,69 @@
 // ============================================================
-// CodeMorph — Billing Service (Stripe integration stub)
+// CodeMorph — Billing Service (LeekPay — stub Stripe retiré)
 // ============================================================
-import { Injectable, BadRequestException } from '@nestjs/common';
+import { Injectable, BadRequestException, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import Stripe from 'stripe';
 
 import type { UserId } from '@codemorph/shared';
 import { UsersService } from '../users/users.service';
 import type { Plan } from '../subscription/plan-limits.config';
+import { LeekPayService } from './leekpay.service';
 
 @Injectable()
 export class BillingService {
-  private readonly stripe: Stripe;
+  private readonly logger = new Logger(BillingService.name);
 
   constructor(
-    private readonly config: ConfigService,
+    private readonly config:       ConfigService,
     private readonly usersService: UsersService,
-  ) {
-    this.stripe = new Stripe(
-      this.config.get<string>('STRIPE_SECRET_KEY') ?? 'sk_test_placeholder',
-      { apiVersion: '2023-10-16' },
-    );
-  }
+    private readonly leekPay:      LeekPayService,
+  ) {}
 
-  // ── Create checkout session ────────────────────────────
+  // ── Créer une session checkout via LeekPay ─────────────
   async createCheckoutSession(
     userId: UserId,
-    plan: Plan,
+    plan:   Plan,
   ): Promise<{ url: string }> {
     const user = await this.usersService.findByIdOrFail(userId);
-    const frontendUrl = this.config.get<string>('FRONTEND_URL',
-      this.config.get<string>('app.appUrl', 'http://localhost:3000'),
-    );
 
-    const priceIds: Record<string, string> = {
-      free:    '',
-      pro:     this.config.get<string>('STRIPE_PRICE_PRO_MONTHLY', ''),
-      pro_max: this.config.get<string>('STRIPE_PRICE_PRO_MAX_MONTHLY', ''),
+    // Mapping plan interne → plan LeekPay
+    const planMapping: Partial<Record<Plan, string>> = {
+      pro:     'pro',
+      pro_max: 'pro_max',
     };
 
-    const priceId = priceIds[plan];
-    if (!priceId) throw new BadRequestException(`Invalid plan or no price configured: ${plan}`);
-
-    const session = await this.stripe.checkout.sessions.create({
-      customer_email: user.email,
-      line_items: [{ price: priceId, quantity: 1 }],
-      mode: 'subscription',
-      success_url: `${frontendUrl}/dashboard/billing?success=true&session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url:  `${frontendUrl}/dashboard/billing?canceled=true`,
-      metadata:    { userId: userId as string, plan },
-    });
-
-    return { url: session.url ?? '' };
-  }
-
-  // ── Create billing portal ─────────────────────────────
-  async createPortalSession(userId: UserId): Promise<{ url: string }> {
-    const user = await this.usersService.findByIdOrFail(userId);
-    if (!user.stripeCustomerId) {
-      throw new BadRequestException('No billing account found. Please subscribe first.');
+    const leekPlanId = planMapping[plan];
+    if (!leekPlanId) {
+      throw new BadRequestException(`Plan non supporté ou gratuit: ${plan}`);
     }
 
-    const frontendUrl = this.config.get<string>('FRONTEND_URL',
-      this.config.get<string>('app.appUrl', 'http://localhost:3000'),
+    const checkout = await this.leekPay.createPlanCheckout(
+      leekPlanId,
+      user.email,
+      user.name,
+      userId as string,
     );
-    const session = await this.stripe.billingPortal.sessions.create({
-      customer:   user.stripeCustomerId,
-      return_url: `${frontendUrl}/dashboard/billing`,
-    });
 
-    return { url: session.url };
+    return { url: checkout.payment_url };
   }
 
-  // ── Handle Stripe webhook ─────────────────────────────
-  async handleWebhook(payload: Buffer, signature: string): Promise<void> {
-    const webhookSecret = this.config.get<string>('STRIPE_WEBHOOK_SECRET') ?? '';
-    let event: Stripe.Event;
-
-    try {
-      event = this.stripe.webhooks.constructEvent(payload, signature, webhookSecret);
-    } catch {
-      throw new BadRequestException('Webhook signature verification failed');
-    }
-
-    switch (event.type) {
-      case 'checkout.session.completed':
-        await this.handleCheckoutCompleted(event.data.object);
-        break;
-      case 'customer.subscription.deleted':
-        await this.handleSubscriptionDeleted(event.data.object);
-        break;
-      case 'customer.subscription.updated':
-        await this.handleSubscriptionUpdated(event.data.object);
-        break;
-      default:
-        break;
-    }
+  // ── Portail de facturation (placeholder) ─────────────
+  async createPortalSession(_userId: UserId): Promise<{ url: string }> {
+    const frontendUrl = this.config.get<string>('FRONTEND_URL') ??
+                        'https://codemorph-coral.vercel.app';
+    // LeekPay n'a pas de portail client — rediriger vers la page billing
+    return { url: `${frontendUrl}/dashboard/billing` };
   }
 
-  private async handleCheckoutCompleted(session: Stripe.Checkout.Session): Promise<void> {
-    const userId = session.metadata?.['userId'] as string | undefined;
-    const plan   = session.metadata?.['plan'] as Plan | undefined;
-
-    if (!userId || !plan) return;
-
-    await this.usersService.update(userId as UserId, {
-      plan,
-      stripeCustomerId: session.customer as string | undefined,
-    });
-  }
-
-  private async handleSubscriptionDeleted(subscription: Stripe.Subscription): Promise<void> {
-    const customerId = subscription.customer as string;
-    const user = await this.usersService.findByStripeCustomerId(customerId);
-    if (user) {
-      await this.usersService.update(user.id as UserId, { plan: 'free' });
-    }
-  }
-
-  private async handleSubscriptionUpdated(subscription: Stripe.Subscription): Promise<void> {
-    void subscription;
-    // TODO: handle plan changes
+  // ── Mettre à jour le plan utilisateur après paiement ──
+  async upgradePlan(userId: UserId, planId: string): Promise<void> {
+    const planMap: Record<string, Plan> = {
+      starter: 'pro',
+      pro:     'pro',
+      pro_max: 'pro_max',
+    };
+    const plan = planMap[planId] ?? 'free';
+    await this.usersService.update(userId, { plan });
+    this.logger.log(`User ${userId as string} upgraded to plan: ${plan}`);
   }
 }

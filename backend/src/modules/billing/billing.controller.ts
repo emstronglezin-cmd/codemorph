@@ -1,24 +1,21 @@
 // ============================================================
-// CodeMorph — Billing Controller
+// CodeMorph — Billing Controller (Legacy — utilise BillingService)
+// Pour la compatibilité backward, pointe maintenant vers LeekPay
+// Les nouvelles routes LeekPay sont dans PaymentsController
 // ============================================================
 import {
   Controller,
   Post,
   Body,
-  Headers,
-  RawBodyRequest,
-  Req,
   HttpCode,
   HttpStatus,
   UseGuards,
 } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiBearerAuth } from '@nestjs/swagger';
-import type { Request } from 'express';
 
 import { BillingService } from './billing.service';
 import { JwtAuthGuard }   from '../../common/guards/jwt-auth.guard';
 import { CurrentUser }    from '../../common/decorators/current-user.decorator';
-import { Public }         from '../../common/decorators/public.decorator';
 import type { JwtPayload } from '@codemorph/shared';
 import type { Plan }       from '../subscription/plan-limits.config';
 
@@ -31,7 +28,7 @@ export class BillingController {
 
   @Post('checkout')
   @HttpCode(HttpStatus.CREATED)
-  @ApiOperation({ summary: 'Create Stripe checkout session' })
+  @ApiOperation({ summary: 'Create LeekPay checkout session (alias)' })
   async createCheckout(
     @CurrentUser() user: JwtPayload,
     @Body() body: { plan: Plan },
@@ -41,21 +38,8 @@ export class BillingController {
 
   @Post('portal')
   @HttpCode(HttpStatus.CREATED)
-  @ApiOperation({ summary: 'Create Stripe billing portal session' })
+  @ApiOperation({ summary: 'Billing portal (redirect to billing page)' })
   async createPortal(@CurrentUser() user: JwtPayload): Promise<{ url: string }> {
     return this.billingService.createPortalSession(user.sub);
-  }
-
-  @Public()
-  @Post('webhook')
-  @HttpCode(HttpStatus.OK)
-  @ApiOperation({ summary: '[Internal] Stripe webhook handler' })
-  async handleWebhook(
-    @Req()     req: RawBodyRequest<Request>,
-    @Headers('stripe-signature') signature: string,
-  ): Promise<{ received: boolean }> {
-    const payload = req.rawBody ?? Buffer.from('');
-    await this.billingService.handleWebhook(payload, signature);
-    return { received: true };
   }
 }
