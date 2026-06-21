@@ -1,5 +1,7 @@
 // ============================================================
 // CodeMorph — Projects Controller
+// FIX: accepte flutter/dart comme sourceLanguage
+//      accepte react/react-native comme targetLanguage
 // ============================================================
 import {
   Controller,
@@ -17,10 +19,11 @@ import {
 } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiBearerAuth, ApiQuery } from '@nestjs/swagger';
 
-import { ProjectsService } from './projects.service';
-import { JwtAuthGuard }    from '../../common/guards/jwt-auth.guard';
-import { CurrentUser }     from '../../common/decorators/current-user.decorator';
+import { ProjectsService }    from './projects.service';
+import { JwtAuthGuard }       from '../../common/guards/jwt-auth.guard';
+import { CurrentUser }        from '../../common/decorators/current-user.decorator';
 import type { JwtPayload, ProjectId } from '@codemorph/shared';
+import type { SourceLanguage, TargetLanguage } from './entities/project.entity';
 
 @ApiTags('projects')
 @UseGuards(JwtAuthGuard)
@@ -35,11 +38,11 @@ export class ProjectsController {
   async create(
     @CurrentUser() user: JwtPayload,
     @Body() body: {
-      name: string;
-      description?: string;
-      sourceLanguage: 'javascript' | 'python' | 'java' | 'csharp' | 'php' | 'ruby' | 'go';
-      targetLanguage: 'typescript' | 'rust' | 'kotlin' | 'swift' | 'dart';
-      orgId?: string;
+      name:            string;
+      description?:    string;
+      sourceLanguage:  SourceLanguage;
+      targetLanguage:  TargetLanguage;
+      orgId?:          string;
     },
   ): Promise<unknown> {
     return this.projectsService.create({ ...body, ownerId: user.sub });

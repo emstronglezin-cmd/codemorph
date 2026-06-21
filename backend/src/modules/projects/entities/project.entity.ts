@@ -1,5 +1,7 @@
 // ============================================================
 // CodeMorph — Project Entity (TypeORM)
+// FIX: ajout de 'flutter'/'dart' dans sourceLanguage
+//      ajout de 'react'/'react-native'/'reactnative' dans targetLanguage
 // ============================================================
 import {
   Entity,
@@ -12,6 +14,27 @@ import {
   JoinColumn,
 } from 'typeorm';
 import { UserEntity } from '../../users/entities/user.entity';
+
+export type SourceLanguage =
+  | 'javascript' | 'typescript'
+  | 'python'
+  | 'java'
+  | 'csharp'
+  | 'php'
+  | 'ruby'
+  | 'go'
+  | 'flutter'
+  | 'dart';
+
+export type TargetLanguage =
+  | 'typescript'
+  | 'rust'
+  | 'kotlin'
+  | 'swift'
+  | 'dart'
+  | 'react'
+  | 'react-native'
+  | 'reactnative';
 
 @Entity('projects')
 @Index(['ownerId'])
@@ -27,25 +50,24 @@ export class ProjectEntity {
   description!: string | null;
 
   @Column({
-    type: 'enum',
-    enum: ['active', 'archived', 'converting', 'completed', 'failed'],
+    type: 'varchar',
     default: 'active',
   })
   status!: 'active' | 'archived' | 'converting' | 'completed' | 'failed';
 
   @Column({
     name: 'source_language',
-    type: 'enum',
-    enum: ['javascript', 'python', 'java', 'csharp', 'php', 'ruby', 'go'],
+    type: 'varchar',
+    length: 32,
   })
-  sourceLanguage!: 'javascript' | 'python' | 'java' | 'csharp' | 'php' | 'ruby' | 'go';
+  sourceLanguage!: SourceLanguage;
 
   @Column({
     name: 'target_language',
-    type: 'enum',
-    enum: ['typescript', 'rust', 'kotlin', 'swift', 'dart'],
+    type: 'varchar',
+    length: 32,
   })
-  targetLanguage!: 'typescript' | 'rust' | 'kotlin' | 'swift' | 'dart';
+  targetLanguage!: TargetLanguage;
 
   @Column({ name: 'owner_id', type: 'varchar' })
   ownerId!: string;

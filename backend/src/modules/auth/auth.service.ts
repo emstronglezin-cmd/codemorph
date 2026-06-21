@@ -216,7 +216,7 @@ export class AuthService {
     return {
       accessToken,
       refreshToken,
-      expiresIn: 900, // 15 minutes in seconds
+      expiresIn: 7 * 24 * 3600, // 7 jours en secondes
       tokenType: 'Bearer',
     };
   }

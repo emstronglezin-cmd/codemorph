@@ -1,46 +1,72 @@
 // ============================================================
 // CodeMorph — Dashboard Layout avec AuthGuard client-side
+// FIX: race condition corrigée + token sync robuste
 // ============================================================
 'use client';
 
 import * as React from 'react';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef } from 'react';
 import { Sidebar } from '@/components/layout/sidebar';
 import { Header }  from '@/components/layout/header';
 import { cn }      from '@/lib/utils/cn';
 
+// ── Helpers ───────────────────────────────────────────────
+function getStoredToken(): string | null {
+  if (typeof window === 'undefined') return null;
+  // Priorité : window global > localStorage > zustand persist
+  const win = window as Window & { __CODEMORPH_ACCESS_TOKEN__?: string };
+  if (win.__CODEMORPH_ACCESS_TOKEN__) return win.__CODEMORPH_ACCESS_TOKEN__;
+
+  const ls = localStorage.getItem('cm_access_token');
+  if (ls) {
+    win.__CODEMORPH_ACCESS_TOKEN__ = ls;
+    return ls;
+  }
+
+  // Tenter de lire depuis le store Zustand sérialisé
+  try {
+    const raw = localStorage.getItem('codemorph-auth');
+    if (raw) {
+      const parsed = JSON.parse(raw) as { state?: { accessToken?: string } };
+      const t = parsed?.state?.accessToken;
+      if (t) {
+        win.__CODEMORPH_ACCESS_TOKEN__ = t;
+        localStorage.setItem('cm_access_token', t); // synchroniser
+        return t;
+      }
+    }
+  } catch { /* ignore */ }
+
+  return null;
+}
+
 // ── AuthGuard ──────────────────────────────────────────────
-// Vérifie que le token est présent dans localStorage
-// Si absent → redirection vers sign-in
 function AuthGuard({ children }: { children: React.ReactNode }): React.JSX.Element {
-  const [checked,  setChecked]  = useState(false);
-  const [authed,   setAuthed]   = useState(false);
+  const [state, setState] = React.useState<'loading' | 'authed' | 'redirect'>('loading');
+  const redirected = useRef(false);
 
   useEffect(() => {
-    // Vérifier token dans localStorage (défini lors du sign-up ou sign-in)
-    const token =
-      localStorage.getItem('cm_access_token') ??
-      (window as Window & { __CODEMORPH_ACCESS_TOKEN__?: string }).__CODEMORPH_ACCESS_TOKEN__;
+    const token = getStoredToken();
 
     if (token) {
-      // Synchroniser dans window pour axios
-      (window as Window & { __CODEMORPH_ACCESS_TOKEN__?: string }).__CODEMORPH_ACCESS_TOKEN__ = token;
-      setAuthed(true);
+      setState('authed');
     } else {
-      // Pas de token → redirection
-      const next = encodeURIComponent(window.location.pathname + window.location.search);
-      window.location.href = `/auth/sign-in?next=${next}`;
-      return;
+      // Pas de token → redirection vers sign-in
+      if (!redirected.current) {
+        redirected.current = true;
+        setState('redirect');
+        const next = encodeURIComponent(window.location.pathname + window.location.search);
+        // Utiliser window.location pour éviter les problèmes de router en SSR
+        window.location.replace(`/auth/sign-in?next=${next}`);
+      }
     }
-    setChecked(true);
   }, []);
 
-  if (!checked) {
-    // Écran de chargement pendant la vérification
+  if (state === 'loading') {
     return (
       <div className="flex h-screen items-center justify-center bg-slate-950">
         <div className="flex flex-col items-center gap-4">
-          <div className="w-10 h-10 rounded-lg bg-gradient-to-br from-indigo-500 to-violet-600 flex items-center justify-center">
+          <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-indigo-500 to-violet-600 flex items-center justify-center shadow-lg">
             <svg className="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
                 d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
@@ -52,7 +78,14 @@ function AuthGuard({ children }: { children: React.ReactNode }): React.JSX.Eleme
     );
   }
 
-  if (!authed) return <></>;
+  // state === 'redirect' : afficher spinner pendant la redirection
+  if (state === 'redirect') {
+    return (
+      <div className="flex h-screen items-center justify-center bg-slate-950">
+        <div className="w-5 h-5 border-2 border-slate-500 border-t-transparent rounded-full animate-spin" />
+      </div>
+    );
+  }
 
   return <>{children}</>;
 }

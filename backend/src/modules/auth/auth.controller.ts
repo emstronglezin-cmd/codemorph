@@ -28,7 +28,6 @@ import { CurrentUser }        from '../../common/decorators/current-user.decorat
 import type { JwtPayload }    from '@codemorph/shared';
 import type { UserEntity }    from '../users/entities/user.entity';
 
-// ── Typed OAuth request ──────────────────────────────────
 interface OAuthRequest extends Request {
   user: UserEntity;
 }
@@ -81,21 +80,33 @@ export class AuthController {
     @Res({ passthrough: true }) res: Response,
   ): Promise<{ message: string }> {
     await this.authService.signOut(user.sub);
-    res.clearCookie('cm_refresh_token');
+    res.clearCookie('cm_refresh_token', { path: '/' });
     return { message: 'Signed out successfully' };
   }
 
   // ── POST /auth/refresh ───────────────────────────────
+  // Supporte : cookie httpOnly OU body.refreshToken
   @Public()
   @Post('refresh')
   @HttpCode(HttpStatus.OK)
-  @ApiOperation({ summary: 'Refresh access token' })
+  @ApiOperation({ summary: 'Refresh access token (cookie or body)' })
   async refresh(
     @Body() dto: RefreshTokenDto,
     @Req()  req: Request,
     @Res({ passthrough: true }) res: Response,
   ): Promise<unknown> {
-    const token  = dto.refreshToken ?? (req.cookies as Record<string, string>)['cm_refresh_token'];
+    // Priorité : cookie → body
+    const token =
+      (req.cookies as Record<string, string>)?.['cm_refresh_token'] ??
+      dto.refreshToken;
+
+    if (!token) {
+      return res.status(HttpStatus.UNAUTHORIZED).json({
+        statusCode: 401,
+        message:    'No refresh token provided',
+      });
+    }
+
     const result = await this.authService.refreshTokens(token);
     this.setRefreshTokenCookie(res, result.tokens.refreshToken);
     return result;
@@ -131,16 +142,14 @@ export class AuthController {
   }
 
   // ── Google OAuth ──────────────────────────────────────
-  // GET /auth/google  → redirects to Google consent screen
   @Public()
   @Get('google')
   @UseGuards(AuthGuard('google'))
   @ApiOperation({ summary: 'Initiate Google OAuth2 login' })
   googleAuth(): void {
-    // Passport redirects — nothing to do here
+    // Passport redirects
   }
 
-  // GET /auth/google/callback  → receives Google token → issues JWT
   @Public()
   @Get('google/callback')
   @UseGuards(AuthGuard('google'))
@@ -151,12 +160,11 @@ export class AuthController {
   ): Promise<void> {
     const tokens = await this.authService.loginOAuthUser(req.user);
     this.setRefreshTokenCookie(res, tokens.refreshToken);
-    const frontendUrl = process.env['FRONTEND_URL'] ?? 'http://localhost:3000';
+    const frontendUrl = process.env['FRONTEND_URL'] ?? 'https://codemorph-coral.vercel.app';
     res.redirect(`${frontendUrl}/auth/oauth-success?token=${tokens.accessToken}`);
   }
 
   // ── GitHub OAuth ──────────────────────────────────────
-  // GET /auth/github  → redirects to GitHub consent screen
   @Public()
   @Get('github')
   @UseGuards(AuthGuard('github'))
@@ -165,7 +173,6 @@ export class AuthController {
     // Passport redirects
   }
 
-  // GET /auth/github/callback → receives GitHub token → issues JWT
   @Public()
   @Get('github/callback')
   @UseGuards(AuthGuard('github'))
@@ -176,7 +183,7 @@ export class AuthController {
   ): Promise<void> {
     const tokens = await this.authService.loginOAuthUser(req.user);
     this.setRefreshTokenCookie(res, tokens.refreshToken);
-    const frontendUrl = process.env['FRONTEND_URL'] ?? 'http://localhost:3000';
+    const frontendUrl = process.env['FRONTEND_URL'] ?? 'https://codemorph-coral.vercel.app';
     res.redirect(`${frontendUrl}/auth/oauth-success?token=${tokens.accessToken}`);
   }
 
@@ -185,13 +192,10 @@ export class AuthController {
     const isProd = process.env['NODE_ENV'] === 'production';
     res.cookie('cm_refresh_token', token, {
       httpOnly: true,
-      // Cross-domain (Vercel frontend ↔ Render backend) :
-      // sameSite DOIT être 'none' + secure: true en production
       secure:   isProd,
       sameSite: isProd ? 'none' : 'lax',
-      maxAge:   7 * 24 * 60 * 60 * 1000,
-      path:     '/',  // '/' au lieu de '/api/v1/auth/refresh' pour que le cookie
-                      // soit envoyé sur toutes les routes (cross-origin en prod)
+      maxAge:   30 * 24 * 60 * 60 * 1000, // 30 jours
+      path:     '/',
     });
   }
 }
