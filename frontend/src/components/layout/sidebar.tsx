@@ -44,7 +44,7 @@ const MAIN_NAV = [
 
 const ORG_NAV = [
   { label: 'Team',       href: '/dashboard/org/members',  icon: Users },
-  { label: 'Billing',    href: '/dashboard/org/billing',  icon: CreditCard },
+  { label: 'Billing',    href: '/dashboard/billing',      icon: CreditCard },
   { label: 'Settings',   href: '/dashboard/settings',     icon: Settings },
 ] as const;
 

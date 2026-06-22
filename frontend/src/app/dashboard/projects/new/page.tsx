@@ -41,13 +41,13 @@ const FRAMEWORKS = [
   },
   {
     id:     'express-nestjs',
-    source: 'Express',
+    source: 'Express.js',
     target: 'NestJS',
     sourceLang: 'javascript',
     targetLang: 'typescript',
     icon:   '🐈',
     badge:  'stable',
-    desc:   'Express.js → NestJS with decorators',
+    desc:   'Express.js REST API → NestJS enterprise (decorators, DI)',
   },
   {
     id:     'nodejs-nestjs',
@@ -56,8 +56,8 @@ const FRAMEWORKS = [
     sourceLang: 'javascript',
     targetLang: 'typescript',
     icon:   '🦅',
-    badge:  'stable',
-    desc:   'Plain Node.js → NestJS enterprise',
+    badge:  'beta',
+    desc:   'Node.js vanilla → NestJS architecture modulaire',
   },
 ];
 

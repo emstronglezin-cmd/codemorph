@@ -1,18 +1,17 @@
+'use client';
+// ============================================================
+// CodeMorph — Organisation Billing (redirect vers billing perso)
+// ============================================================
 import type React from 'react';
-import type { Metadata } from 'next';
-
-export const metadata: Metadata = { title: 'Organisation Billing' };
+import { useEffect } from 'react';
+import { useRouter } from 'next/navigation';
 
 export default function OrgBillingPage(): React.JSX.Element {
+  const router = useRouter();
+  useEffect(() => { router.replace('/dashboard/billing'); }, [router]);
   return (
-    <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-bold tracking-tight">Organisation Billing</h1>
-        <p className="text-muted-foreground">Manage billing for your organisation.</p>
-      </div>
-      <div className="rounded-xl border border-border bg-card p-8 text-center">
-        <p className="text-muted-foreground text-sm">Organisation billing management coming soon.</p>
-      </div>
+    <div className="flex items-center justify-center h-64">
+      <div className="w-6 h-6 border-2 border-primary border-t-transparent rounded-full animate-spin" />
     </div>
   );
 }
