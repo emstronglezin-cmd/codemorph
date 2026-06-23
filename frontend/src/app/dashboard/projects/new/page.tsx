@@ -22,12 +22,12 @@ const FRAMEWORKS = [
     id:     'flutter-react',
     source: 'Flutter',
     target: 'React',
-    // valeurs normalisées pour le backend (varchar, lowercase)
     sourceLang: 'flutter',
     targetLang: 'react',
     icon:   '🦋',
     badge:  'stable',
     desc:   'Dart + Flutter → React + TypeScript',
+    free:   true,
   },
   {
     id:     'flutter-rn',
@@ -38,6 +38,18 @@ const FRAMEWORKS = [
     icon:   '📱',
     badge:  'stable',
     desc:   'Dart + Flutter → Expo + React Native',
+    free:   true,
+  },
+  {
+    id:     'react-flutter',
+    source: 'React',
+    target: 'Flutter',
+    sourceLang: 'react',
+    targetLang: 'flutter',
+    icon:   '🎯',
+    badge:  'stable',
+    desc:   'React + TypeScript → Flutter + Dart',
+    free:   false,
   },
   {
     id:     'express-nestjs',
@@ -48,6 +60,7 @@ const FRAMEWORKS = [
     icon:   '🐈',
     badge:  'stable',
     desc:   'Express.js REST API → NestJS enterprise (decorators, DI)',
+    free:   false,
   },
   {
     id:     'nodejs-nestjs',
@@ -58,6 +71,7 @@ const FRAMEWORKS = [
     icon:   '🦅',
     badge:  'beta',
     desc:   'Node.js vanilla → NestJS architecture modulaire',
+    free:   false,
   },
 ];
 

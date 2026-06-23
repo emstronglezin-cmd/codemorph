@@ -5,7 +5,7 @@
 
 import * as React from 'react';
 import Link from 'next/link';
-import { Bell, Search, Sun, Moon, Command } from 'lucide-react';
+import { Bell, Search, Sun, Moon, Command, Menu } from 'lucide-react';
 
 import { cn } from '@/lib/utils/cn';
 import { Button } from '@/components/ui/button';
@@ -13,9 +13,10 @@ import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
 
 interface HeaderProps {
   className?: string;
+  onMobileMenuToggle?: () => void;
 }
 
-export function Header({ className }: HeaderProps): React.JSX.Element {
+export function Header({ className, onMobileMenuToggle }: HeaderProps): React.JSX.Element {
   const [isDark, setIsDark] = React.useState(false);
 
   const toggleTheme = (): void => {
@@ -26,12 +27,29 @@ export function Header({ className }: HeaderProps): React.JSX.Element {
   return (
     <header
       className={cn(
-        'flex h-14 items-center gap-4 border-b border-border px-4',
+        'flex items-center gap-4 border-b border-border px-4',
         'bg-background/80 backdrop-blur-xl',
         'sticky top-0 z-30',
+        // PWA safe-area for iPhone Dynamic Island / notch
+        'pwa-header-offset',
         className,
       )}
+      style={{
+        paddingTop: `calc(env(safe-area-inset-top, 0px))`,
+        minHeight: `calc(56px + env(safe-area-inset-top, 0px))`,
+      }}
     >
+      {/* Mobile menu button — visible only on small screens */}
+      {onMobileMenuToggle && (
+        <button
+          onClick={onMobileMenuToggle}
+          className="flex h-8 w-8 items-center justify-center rounded-lg border border-border hover:bg-surface-1 transition-colors lg:hidden"
+          aria-label="Open menu"
+        >
+          <Menu className="h-4 w-4" />
+        </button>
+      )}
+
       {/* Search trigger */}
       <button
         className={cn(

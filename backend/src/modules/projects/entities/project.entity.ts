@@ -24,7 +24,8 @@ export type SourceLanguage =
   | 'ruby'
   | 'go'
   | 'flutter'
-  | 'dart';
+  | 'dart'
+  | 'react';
 
 export type TargetLanguage =
   | 'typescript'
@@ -32,6 +33,7 @@ export type TargetLanguage =
   | 'kotlin'
   | 'swift'
   | 'dart'
+  | 'flutter'
   | 'react'
   | 'react-native'
   | 'reactnative';

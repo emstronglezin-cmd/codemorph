@@ -97,24 +97,53 @@ export default function DashboardLayout({
   children: React.ReactNode;
 }): React.JSX.Element {
   const [collapsed, setCollapsed] = React.useState(false);
+  const [mobileSidebarOpen, setMobileSidebarOpen] = React.useState(false);
 
   return (
     <AuthGuard>
       <div className="flex h-screen overflow-hidden bg-background">
-        {/* Sidebar */}
-        <Sidebar collapsed={collapsed} onCollapse={setCollapsed} />
+        {/* ── Mobile sidebar overlay ─────────────────────── */}
+        {mobileSidebarOpen && (
+          <div
+            className="fixed inset-0 z-40 bg-black/40 backdrop-blur-sm lg:hidden"
+            onClick={() => setMobileSidebarOpen(false)}
+          />
+        )}
 
-        {/* Main */}
-        <div className="flex flex-1 flex-col overflow-hidden">
-          <Header />
+        {/* ── Sidebar ────────────────────────────────────── */}
+        <div className={cn(
+          // Desktop: always visible, fixed width
+          'hidden lg:flex shrink-0',
+          // Transition width
+          collapsed ? 'w-16' : 'w-60',
+          'transition-all duration-300 ease-in-out',
+        )}>
+          <Sidebar collapsed={collapsed} onCollapse={setCollapsed} />
+        </div>
+
+        {/* Mobile sidebar */}
+        <div className={cn(
+          'fixed inset-y-0 left-0 z-50 flex lg:hidden',
+          'transition-transform duration-300 ease-in-out',
+          mobileSidebarOpen ? 'translate-x-0' : '-translate-x-full',
+        )}>
+          <Sidebar collapsed={false} onCollapse={() => setMobileSidebarOpen(false)} />
+        </div>
+
+        {/* ── Main ───────────────────────────────────────── */}
+        <div className="flex flex-1 min-w-0 flex-col overflow-hidden">
+          <Header
+            onMobileMenuToggle={() => setMobileSidebarOpen(v => !v)}
+          />
           <main
             className={cn(
-              'flex-1 overflow-y-auto',
-              'bg-surface-1',
-              'px-4 py-6 sm:px-6 lg:px-8',
+              'flex-1 overflow-y-auto bg-surface-1',
+              // Desktop-first padding: generous on large screens
+              'px-4 py-4 sm:px-6 sm:py-6 lg:px-8 lg:py-8',
             )}
           >
-            <div className="mx-auto w-full max-w-7xl">
+            {/* Max width: comfortable on 1366px, 1440p, 4K, ultrawide */}
+            <div className="mx-auto w-full max-w-screen-2xl">
               {children}
             </div>
           </main>

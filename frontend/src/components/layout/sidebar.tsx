@@ -18,6 +18,7 @@ import {
   ChevronLeft,
   ChevronRight,
   Code2,
+  Github,
 } from 'lucide-react';
 
 // ── Tooltip stubs (Radix UI pending) ─────────────────────
@@ -36,8 +37,9 @@ import { Separator } from '@/components/ui/separator';
 
 // ── Nav items config ──────────────────────────────────────
 const MAIN_NAV = [
-  { label: 'Dashboard',  href: '/dashboard',          icon: LayoutDashboard },
+  { label: 'Dashboard',  href: '/dashboard',           icon: LayoutDashboard },
   { label: 'Projects',   href: '/dashboard/projects',  icon: FolderGit2 },
+  { label: 'Import',     href: '/dashboard/import',    icon: Github },
   { label: 'Conversions',href: '/dashboard/conversions',icon: Zap },
   { label: 'Analytics',  href: '/dashboard/analytics', icon: BarChart3 },
 ] as const;

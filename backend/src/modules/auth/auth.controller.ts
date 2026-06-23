@@ -8,9 +8,11 @@ import {
   HttpCode,
   HttpStatus,
   Get,
+  Query,
   UseGuards,
   Res,
   Req,
+  BadRequestException,
 } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiResponse, ApiBearerAuth } from '@nestjs/swagger';
 import { AuthGuard } from '@nestjs/passport';
@@ -27,6 +29,7 @@ import { JwtAuthGuard }       from '../../common/guards/jwt-auth.guard';
 import { CurrentUser }        from '../../common/decorators/current-user.decorator';
 import type { JwtPayload }    from '@codemorph/shared';
 import type { UserEntity }    from '../users/entities/user.entity';
+import { UsersService }       from '../users/users.service';
 
 interface OAuthRequest extends Request {
   user: UserEntity;
@@ -35,7 +38,10 @@ interface OAuthRequest extends Request {
 @ApiTags('auth')
 @Controller('auth')
 export class AuthController {
-  constructor(private readonly authService: AuthService) {}
+  constructor(
+    private readonly authService: AuthService,
+    private readonly usersService: UsersService,
+  ) {}
 
   // ── POST /auth/sign-up ───────────────────────────────
   @Public()
@@ -185,6 +191,110 @@ export class AuthController {
     this.setRefreshTokenCookie(res, tokens.refreshToken);
     const frontendUrl = process.env['FRONTEND_URL'] ?? 'https://codemorph-coral.vercel.app';
     res.redirect(`${frontendUrl}/auth/oauth-success?token=${tokens.accessToken}`);
+  }
+
+  // ── GET /auth/github-repos ────────────────────────────
+  // Liste les repos GitHub de l'utilisateur (publics + privés)
+  // via son GitHub access token stocké lors du OAuth flow
+  @Get('github-repos')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth('JWT')
+  @ApiOperation({ summary: 'List user GitHub repositories' })
+  async getGithubRepos(
+    @CurrentUser() user: JwtPayload,
+    @Query('page') page = '1',
+    @Query('per_page') perPage = '30',
+    @Query('search') search = '',
+    @Query('type') type = 'all',
+  ): Promise<unknown> {
+    const userWithToken = await this.usersService.findByIdWithGithubToken(user.sub);
+
+    if (!userWithToken?.githubAccessToken) {
+      throw new BadRequestException({
+        code: 'GITHUB_NOT_CONNECTED',
+        message: 'GitHub account not connected. Please sign in with GitHub first.',
+        authUrl: '/api/v1/auth/github',
+      });
+    }
+
+    const token = userWithToken.githubAccessToken;
+    const pageNum = Math.max(1, parseInt(page, 10) || 1);
+    const perPageNum = Math.min(100, Math.max(1, parseInt(perPage, 10) || 30));
+
+    try {
+      // Fetch repos from GitHub API
+      const url = new URL('https://api.github.com/user/repos');
+      url.searchParams.set('page', String(pageNum));
+      url.searchParams.set('per_page', String(perPageNum));
+      url.searchParams.set('type', type === 'public' ? 'public' : type === 'private' ? 'private' : 'all');
+      url.searchParams.set('sort', 'updated');
+      url.searchParams.set('direction', 'desc');
+      if (search) url.searchParams.set('q', search);
+
+      const ghRes = await fetch(url.toString(), {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: 'application/vnd.github.v3+json',
+          'User-Agent': 'CodeMorph/1.0',
+        },
+      });
+
+      if (!ghRes.ok) {
+        const errBody = await ghRes.text().catch(() => '');
+        throw new BadRequestException(`GitHub API error: ${ghRes.status} — ${errBody}`);
+      }
+
+      const repos = await ghRes.json() as Array<{
+        id: number; name: string; full_name: string; private: boolean;
+        html_url: string; description: string | null; language: string | null;
+        updated_at: string; stargazers_count: number; forks_count: number;
+        default_branch: string; topics: string[];
+      }>;
+
+      // Filter by search if provided (GitHub search for repos needs a separate API call)
+      const filtered = search
+        ? repos.filter(r =>
+            r.name.toLowerCase().includes(search.toLowerCase()) ||
+            r.full_name.toLowerCase().includes(search.toLowerCase()),
+          )
+        : repos;
+
+      return {
+        repos: filtered.map(r => ({
+          id:           r.id,
+          name:         r.name,
+          fullName:     r.full_name,
+          private:      r.private,
+          url:          r.html_url,
+          description:  r.description,
+          language:     r.language,
+          updatedAt:    r.updated_at,
+          stars:        r.stargazers_count,
+          forks:        r.forks_count,
+          defaultBranch: r.default_branch,
+          topics:       r.topics ?? [],
+        })),
+        page: pageNum,
+        perPage: perPageNum,
+        total: filtered.length,
+      };
+    } catch (err) {
+      if (err instanceof BadRequestException) throw err;
+      throw new BadRequestException(`Failed to fetch GitHub repos: ${String(err)}`);
+    }
+  }
+
+  // ── GET /auth/github-status ───────────────────────────
+  @Get('github-status')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth('JWT')
+  @ApiOperation({ summary: 'Check GitHub connection status' })
+  async getGithubStatus(@CurrentUser() user: JwtPayload): Promise<unknown> {
+    const userWithToken = await this.usersService.findByIdWithGithubToken(user.sub);
+    return {
+      connected: !!(userWithToken?.githubAccessToken),
+      authUrl: '/api/v1/auth/github',
+    };
   }
 
   // ── Private helpers ───────────────────────────────────

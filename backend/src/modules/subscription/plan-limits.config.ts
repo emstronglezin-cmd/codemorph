@@ -136,6 +136,6 @@ export function isUnlimited(value: number): boolean {
 }
 
 export function getAllowedFrameworks(plan: Plan): string[] {
-  if (plan === 'free') return ['flutter-react'];  // free: only one framework
-  return ['flutter-react', 'flutter-rn', 'express-nestjs', 'nodejs-nestjs'];
+  if (plan === 'free') return ['flutter-react', 'flutter-rn'];  // free: flutter→react/rn
+  return ['flutter-react', 'flutter-rn', 'react-flutter', 'express-nestjs', 'nodejs-nestjs'];
 }

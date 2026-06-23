@@ -61,10 +61,12 @@
     /* Radius */
     --radius:            0.625rem;
 
-    /* Sidebar */
+    /* Sidebar — desktop-first sizing */
     --sidebar-width:           240px;
     --sidebar-collapsed-width: 64px;
     --header-height:           56px;
+    /* 1440p+ gets slightly wider sidebar */
+    --sidebar-width-xl:        260px;
   }
 
   .dark {
@@ -296,9 +298,18 @@
     min-width:  44px;
   }
 
-  /* PWA standalone mode adjustments */
+  /* PWA standalone mode adjustments — iPhone Dynamic Island */
   @media (display-mode: standalone) {
-    .pwa-header-offset { padding-top: env(safe-area-inset-top, 0px); }
+    .pwa-header-offset {
+      padding-top: env(safe-area-inset-top, 0px) !important;
+    }
+  }
+
+  /* Always apply safe-area for Safari PWA */
+  @supports (padding-top: env(safe-area-inset-top)) {
+    .pwa-header-offset {
+      padding-top: env(safe-area-inset-top, 0px);
+    }
   }
 
   /* Hide scrollbar but keep functionality */

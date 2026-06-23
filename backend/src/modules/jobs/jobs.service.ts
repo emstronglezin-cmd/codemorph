@@ -66,17 +66,19 @@ export class JobsService {
       });
     }
 
-    // 4. Validate framework access (free = Flutter→React only)
+    // 4. Validate framework access
+    // Free plan: Flutter → React / React Native seulement
+    // Pro+: tous les frameworks dont React → Flutter
     if (!limits.advancedFrameworks) {
+      const srcNorm = dto.sourceLanguage.toLowerCase().replace(/[^a-z]/g, '');
+      const tgtNorm = dto.targetLanguage.toLowerCase().replace(/[^a-z]/g, '');
+      // free autorise: flutter/dart → react/reactnative
       const allowedSrc = ['flutter', 'dart'];
       const allowedTgt = ['react', 'reactnative'];
-      if (
-        !allowedSrc.includes(dto.sourceLanguage.toLowerCase()) ||
-        !allowedTgt.includes(dto.targetLanguage.toLowerCase().replace(/[^a-z]/g, ''))
-      ) {
+      if (!allowedSrc.includes(srcNorm) || !allowedTgt.includes(tgtNorm)) {
         throw new ForbiddenException({
           code:       'FRAMEWORK_RESTRICTED',
-          message:    'Free plan only supports Flutter → React conversion. Upgrade to Pro.',
+          message:    'Free plan only supports Flutter → React / React Native. Upgrade to Pro for more frameworks.',
           upgradeUrl: '/pricing',
         });
       }

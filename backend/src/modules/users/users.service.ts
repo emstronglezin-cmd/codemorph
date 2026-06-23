@@ -135,6 +135,15 @@ export class UsersService {
     return this.usersRepo.findOne({ where: { stripeCustomerId: customerId } });
   }
 
+  // ── Find by ID (with github token, select: false) ────
+  async findByIdWithGithubToken(id: string): Promise<UserEntity | null> {
+    return this.usersRepo
+      .createQueryBuilder('user')
+      .addSelect('user.githubAccessToken')
+      .where('user.id = :id', { id })
+      .getOne();
+  }
+
   // ── Count ─────────────────────────────────────────────
   async count(): Promise<number> {
     return this.usersRepo.count();
