@@ -88,9 +88,12 @@ export class PaymentsController {
       user.sub   as string,
     );
 
+    // Retourner payment_url pour que le frontend redirige le client
     return {
       checkoutId:  checkout.id,
-      payment_url: checkout.payment_url,
+      checkoutUrl: checkout.payment_url,   // alias pour compatibilité frontend
+      payment_url: checkout.payment_url,   // valeur canonique doc LeekPay
+      url:         checkout.payment_url,   // alias supplémentaire
       amount:      checkout.amount,
       currency:    checkout.currency,
       expires_at:  checkout.expires_at,

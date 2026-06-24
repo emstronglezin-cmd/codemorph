@@ -71,7 +71,7 @@ export default function SettingsPage(): React.JSX.Element {
   const handleSaveProfile = async () => {
     setError(''); setSaving(true); setSaved(false);
     try {
-      const res = await fetch(`${BACKEND}/auth/me`, {
+      const res = await fetch(`${BACKEND}/users/me`, {
         method: 'PATCH',
         headers: authH(),
         body: JSON.stringify({ name: name.trim() }),
@@ -81,10 +81,8 @@ export default function SettingsPage(): React.JSX.Element {
         setSaved(true);
         setTimeout(() => setSaved(false), 3000);
       } else {
-        // Si PATCH /auth/me n'existe pas encore, sauvegarder localement
-        if (user) setUser({ ...user, name: name.trim() });
-        setSaved(true);
-        setTimeout(() => setSaved(false), 3000);
+        const d = await res.json().catch(() => ({})) as { message?: string };
+        setError(d.message ?? 'Erreur lors de la sauvegarde. Réessayez.');
       }
     } catch {
       setError('Erreur lors de la sauvegarde. Réessayez.');

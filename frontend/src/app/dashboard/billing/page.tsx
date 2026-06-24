@@ -1,11 +1,14 @@
 'use client';
 // ============================================================
 // CodeMorph — Billing Page
-// Style Stripe / Linear / Vercel — Clean, professional
-// Plans: Starter $5 / Pro $10 / Pro Max $20
+// LeekPay REST: POST /api/v1/payments/checkout → { payment_url }
+// Le client est redirigé vers payment_url (popup ou redirection)
+// Retour : /dashboard/billing?success=true|canceled=true
+// Plans : Starter $5 / Pro $10 / Pro Max $20
 // ============================================================
-import { useState } from 'react';
-import { Check, Zap, Crown, Sparkles, ArrowRight } from 'lucide-react';
+import { useState, useEffect, Suspense } from 'react';
+import { useSearchParams } from 'next/navigation';
+import { Check, Zap, Crown, Sparkles, ArrowRight, CheckCircle, XCircle } from 'lucide-react';
 import { cn } from '@/lib/utils/cn';
 import { getAccessToken } from '@/lib/api/client';
 import { useAuthStore } from '@/stores/auth.store';
@@ -19,8 +22,7 @@ const PLANS = [
     price:    5,
     icon:     Zap,
     popular:  false,
-    color:    'slate',
-    badge:    null,
+    badge:    null as string | null,
     features: [
       '10 conversions / month',
       'Flutter → React & React Native',
@@ -37,8 +39,7 @@ const PLANS = [
     price:    10,
     icon:     Crown,
     popular:  true,
-    color:    'indigo',
-    badge:    'Most popular',
+    badge:    'Most popular' as string | null,
     features: [
       '50 conversions / month',
       'All frameworks (React ↔ Flutter, NestJS)',
@@ -56,8 +57,7 @@ const PLANS = [
     price:    20,
     icon:     Sparkles,
     popular:  false,
-    color:    'violet',
-    badge:    'Best value',
+    badge:    'Best value' as string | null,
     features: [
       'Unlimited conversions',
       'All frameworks + custom prompts',
@@ -72,11 +72,26 @@ const PLANS = [
   },
 ];
 
-export default function BillingPage() {
-  const { user } = useAuthStore();
-  const currentPlan = (user?.plan as string) ?? 'free';
-  const [loading, setLoading] = useState<string | null>(null);
-  const [error, setError]     = useState('');
+// ── Inner page with search params ─────────────────────────
+function BillingContent() {
+  const searchParams  = useSearchParams();
+  const { user }      = useAuthStore();
+  const currentPlan   = (user?.plan as string) ?? 'free';
+
+  const [loading, setLoading]   = useState<string | null>(null);
+  const [error, setError]       = useState('');
+  const [toastType, setToastType] = useState<'success' | 'canceled' | null>(null);
+
+  // Gérer le retour depuis LeekPay
+  useEffect(() => {
+    if (searchParams.get('success') === 'true') {
+      setToastType('success');
+      setTimeout(() => setToastType(null), 6000);
+    } else if (searchParams.get('canceled') === 'true') {
+      setToastType('canceled');
+      setTimeout(() => setToastType(null), 4000);
+    }
+  }, [searchParams]);
 
   const handleUpgrade = async (planId: string) => {
     if (loading) return;
@@ -85,57 +100,104 @@ export default function BillingPage() {
 
     try {
       const token = getAccessToken();
+      if (!token) {
+        setError('Session expirée. Reconnectez-vous.');
+        setLoading(null);
+        return;
+      }
+
       const res = await fetch(`${API_URL}/payments/checkout`, {
-        method:  'POST',
+        method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          Authorization: `Bearer ${token}`,
         },
-        body: JSON.stringify({ planId, currency: 'USD' }),
+        body: JSON.stringify({ planId }),
       });
 
       const data = await res.json() as {
-        data?: { checkoutUrl?: string; url?: string };
+        data?: { payment_url?: string; checkoutUrl?: string; url?: string };
+        payment_url?: string;
         checkoutUrl?: string;
         url?: string;
+        message?: string;
       };
 
-      const url = data?.data?.checkoutUrl ?? data?.data?.url ?? data?.checkoutUrl ?? data?.url;
-      if (url) {
-        window.location.href = url;
-      } else {
-        setError('Could not initiate checkout. Please try again.');
+      if (!res.ok) {
+        // Si les clés LeekPay ne sont pas encore configurées
+        const msg = data?.message ?? `Erreur ${res.status}`;
+        if (msg.includes('Plan inconnu') || res.status === 400) {
+          setError(`Plan "${planId}" non reconnu par le serveur.`);
+        } else if (res.status === 401 || res.status === 403) {
+          setError('Session expirée. Reconnectez-vous.');
+        } else {
+          setError(`Erreur paiement : ${msg}. Vérifiez que LEEKPAY_SECRET_KEY est configuré sur Render.`);
+        }
+        setLoading(null);
+        return;
       }
+
+      // Récupérer payment_url depuis n'importe quel alias
+      const paymentUrl =
+        data?.data?.payment_url ??
+        data?.data?.checkoutUrl ??
+        data?.data?.url ??
+        data?.payment_url ??
+        data?.checkoutUrl ??
+        data?.url;
+
+      if (!paymentUrl) {
+        setError('URL de paiement manquante dans la réponse. Vérifiez la configuration LeekPay.');
+        setLoading(null);
+        return;
+      }
+
+      // Redirection vers la page de paiement LeekPay
+      // (pas d'iframe — cf. doc LeekPay : "Ne pas intégrer en iframe")
+      window.location.href = paymentUrl;
+
     } catch {
-      setError('Network error. Please try again.');
-    } finally {
+      setError('Erreur réseau. Vérifiez votre connexion et réessayez.');
       setLoading(null);
     }
   };
 
-  const isPlanActive = (planId: string): boolean => {
-    if (planId === 'starter' && currentPlan === 'free') return false;
-    return currentPlan === planId;
-  };
+  const isPlanActive = (planId: string): boolean => currentPlan === planId;
 
-  const isPlanBelow = (planId: string): boolean => {
-    const order = ['free', 'starter', 'pro', 'pro_max'];
-    return order.indexOf(currentPlan) >= order.indexOf(planId);
-  };
+  const planOrder = ['free', 'starter', 'pro', 'pro_max'];
+  const isPlanBelow = (planId: string): boolean =>
+    planOrder.indexOf(currentPlan) > planOrder.indexOf(planId);
 
   return (
     <div className="min-h-full bg-background">
-      <div className="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 py-12">
+      <div className="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 py-10">
+
+        {/* Toast retour LeekPay */}
+        {toastType === 'success' && (
+          <div className="mb-6 flex items-center gap-3 rounded-xl border border-green-500/30 bg-green-500/10 px-5 py-4 text-sm text-green-400 shadow-lg">
+            <CheckCircle className="h-5 w-5 shrink-0" />
+            <div>
+              <p className="font-semibold">Paiement confirmé !</p>
+              <p className="text-xs opacity-80 mt-0.5">Votre plan sera mis à jour d'ici quelques instants.</p>
+            </div>
+          </div>
+        )}
+        {toastType === 'canceled' && (
+          <div className="mb-6 flex items-center gap-3 rounded-xl border border-yellow-500/30 bg-yellow-500/10 px-5 py-4 text-sm text-yellow-400">
+            <XCircle className="h-5 w-5 shrink-0" />
+            <p>Paiement annulé. Vous pouvez réessayer quand vous voulez.</p>
+          </div>
+        )}
 
         {/* Header */}
-        <div className="text-center mb-12">
-          <h1 className="text-4xl font-bold tracking-tight text-foreground mb-3">
+        <div className="text-center mb-10">
+          <h1 className="text-4xl font-bold tracking-tight mb-3">
             Simple, transparent pricing
           </h1>
           <p className="text-lg text-muted-foreground">
             Choose the plan that fits your workflow. Upgrade or cancel anytime.
           </p>
-          {currentPlan !== 'free' && currentPlan !== 'starter' && (
+          {currentPlan !== 'free' && (
             <div className="mt-4 inline-flex items-center gap-2 rounded-full border border-primary/20 bg-primary/5 px-4 py-1.5 text-sm text-primary font-medium">
               <Check className="h-3.5 w-3.5" />
               Current plan: {PLANS.find(p => p.id === currentPlan)?.name ?? currentPlan}
@@ -143,20 +205,21 @@ export default function BillingPage() {
           )}
         </div>
 
-        {/* Error */}
+        {/* Error banner */}
         {error && (
-          <div className="mb-8 rounded-xl border border-destructive/20 bg-destructive/5 px-4 py-3 text-sm text-destructive text-center">
-            {error}
+          <div className="mb-8 rounded-xl border border-destructive/20 bg-destructive/5 px-5 py-4 text-sm text-destructive">
+            <p className="font-medium">Erreur de paiement</p>
+            <p className="mt-1 opacity-80">{error}</p>
           </div>
         )}
 
-        {/* Plans */}
+        {/* Plans grid */}
         <div className="grid grid-cols-1 md:grid-cols-3 gap-6 items-start">
           {PLANS.map(plan => {
-            const Icon = plan.icon;
-            const active = isPlanActive(plan.id);
-            const below = isPlanBelow(plan.id);
-            const isLoading = loading === plan.id;
+            const Icon    = plan.icon;
+            const active  = isPlanActive(plan.id);
+            const below   = isPlanBelow(plan.id);
+            const isLoad  = loading === plan.id;
 
             return (
               <div
@@ -164,18 +227,15 @@ export default function BillingPage() {
                 className={cn(
                   'relative flex flex-col rounded-2xl border p-7 transition-all duration-200',
                   plan.popular
-                    ? 'border-primary/60 bg-gradient-to-b from-primary/5 to-card shadow-xl shadow-primary/10 scale-[1.02]'
-                    : 'border-border bg-card hover:border-border/80 hover:shadow-lg',
+                    ? 'border-primary/60 bg-gradient-to-b from-primary/5 to-card shadow-xl shadow-primary/10 md:scale-[1.02]'
+                    : 'border-border bg-card hover:shadow-lg',
                 )}
               >
                 {/* Badge */}
                 {plan.badge && (
                   <div className={cn(
-                    'absolute -top-3.5 left-1/2 -translate-x-1/2 whitespace-nowrap',
-                    'rounded-full px-3.5 py-1 text-xs font-semibold shadow-sm',
-                    plan.popular
-                      ? 'bg-primary text-white'
-                      : 'bg-violet-500 text-white',
+                    'absolute -top-3.5 left-1/2 -translate-x-1/2 whitespace-nowrap rounded-full px-3.5 py-1 text-xs font-semibold shadow-sm',
+                    plan.popular ? 'bg-primary text-white' : 'bg-violet-500 text-white',
                   )}>
                     {plan.badge}
                   </div>
@@ -185,26 +245,22 @@ export default function BillingPage() {
                 <div className="flex items-center gap-3 mb-5">
                   <div className={cn(
                     'flex h-10 w-10 items-center justify-center rounded-xl',
-                    plan.popular  ? 'bg-primary/15 text-primary' :
+                    plan.popular       ? 'bg-primary/15 text-primary' :
                     plan.id === 'pro_max' ? 'bg-violet-500/10 text-violet-500' :
                     'bg-surface-2 text-muted-foreground',
                   )}>
                     <Icon className="h-5 w-5" />
                   </div>
-                  <div>
-                    <h3 className="font-bold text-foreground">{plan.name}</h3>
-                  </div>
+                  <h3 className="font-bold text-foreground text-lg">{plan.name}</h3>
                 </div>
 
                 {/* Price */}
                 <div className="mb-6">
                   <div className="flex items-baseline gap-1">
-                    <span className="text-4xl font-extrabold tracking-tight text-foreground">
-                      ${plan.price}
-                    </span>
+                    <span className="text-5xl font-extrabold tracking-tight">${plan.price}</span>
                     <span className="text-sm text-muted-foreground font-medium">/mo</span>
                   </div>
-                  <p className="mt-1 text-xs text-muted-foreground">Billed monthly. Cancel anytime.</p>
+                  <p className="mt-1 text-xs text-muted-foreground">Billed monthly · Cancel anytime</p>
                 </div>
 
                 {/* Features */}
@@ -212,14 +268,14 @@ export default function BillingPage() {
                   {plan.features.map(f => (
                     <li key={f} className="flex items-start gap-2.5 text-sm">
                       <div className={cn(
-                        'mt-0.5 flex h-4.5 w-4.5 shrink-0 items-center justify-center rounded-full',
-                        plan.popular  ? 'bg-primary/15 text-primary' :
+                        'mt-0.5 flex h-[18px] w-[18px] shrink-0 items-center justify-center rounded-full',
+                        plan.popular       ? 'bg-primary/15 text-primary' :
                         plan.id === 'pro_max' ? 'bg-violet-500/15 text-violet-500' :
                         'bg-surface-2 text-muted-foreground',
                       )}>
                         <Check className="h-3 w-3" strokeWidth={2.5} />
                       </div>
-                      <span className="text-foreground/80">{f}</span>
+                      <span className="text-foreground/80 leading-snug">{f}</span>
                     </li>
                   ))}
                 </ul>
@@ -227,11 +283,10 @@ export default function BillingPage() {
                 {/* CTA */}
                 {active ? (
                   <div className="flex items-center justify-center gap-2 rounded-xl border border-border bg-surface-1 py-3 text-sm font-semibold text-muted-foreground">
-                    <Check className="h-4 w-4" />
-                    Current plan
+                    <Check className="h-4 w-4" /> Current plan
                   </div>
                 ) : below ? (
-                  <div className="flex items-center justify-center gap-2 rounded-xl border border-border bg-surface-1 py-3 text-sm font-medium text-muted-foreground/50 cursor-default">
+                  <div className="flex items-center justify-center rounded-xl border border-border bg-surface-1 py-3 text-sm font-medium text-muted-foreground/40 cursor-default">
                     Downgrade
                   </div>
                 ) : (
@@ -240,7 +295,7 @@ export default function BillingPage() {
                     disabled={!!loading}
                     className={cn(
                       'flex w-full items-center justify-center gap-2 rounded-xl py-3 text-sm font-semibold',
-                      'transition-all duration-150 disabled:opacity-60',
+                      'transition-all duration-150 disabled:opacity-60 disabled:cursor-wait',
                       plan.popular
                         ? 'bg-primary text-white hover:bg-primary/90 shadow-md shadow-primary/25'
                         : plan.id === 'pro_max'
@@ -248,18 +303,15 @@ export default function BillingPage() {
                         : 'border border-border bg-surface-1 text-foreground hover:bg-surface-2',
                     )}
                   >
-                    {isLoading ? (
+                    {isLoad ? (
                       <span className="flex items-center gap-2">
                         <svg className="h-4 w-4 animate-spin" viewBox="0 0 24 24" fill="none">
                           <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" strokeDasharray="60" strokeDashoffset="20" />
                         </svg>
-                        Processing...
+                        Redirection…
                       </span>
                     ) : (
-                      <>
-                        {plan.cta}
-                        <ArrowRight className="h-4 w-4" />
-                      </>
+                      <>{plan.cta}<ArrowRight className="h-4 w-4" /></>
                     )}
                   </button>
                 )}
@@ -271,16 +323,13 @@ export default function BillingPage() {
         {/* Free plan note */}
         <div className="mt-10 text-center">
           <p className="text-sm text-muted-foreground">
-            Not ready to upgrade?{' '}
-            <span className="font-medium text-foreground">
-              Free plan includes 3 conversions/month (Flutter → React Native).
-            </span>
+            Free plan includes <span className="font-medium text-foreground">3 conversions/month</span> (Flutter → React Native).
           </p>
         </div>
 
-        {/* Trust badges */}
-        <div className="mt-10 flex flex-wrap items-center justify-center gap-6 border-t border-border pt-8">
-          {['Secure payment', 'Cancel anytime', 'Instant access', 'No hidden fees'].map(item => (
+        {/* Trust row */}
+        <div className="mt-8 flex flex-wrap items-center justify-center gap-6 border-t border-border pt-8">
+          {['Secure payment via LeekPay', 'Cancel anytime', 'Instant access', 'No hidden fees'].map(item => (
             <div key={item} className="flex items-center gap-1.5 text-xs text-muted-foreground">
               <Check className="h-3.5 w-3.5 text-primary" />
               {item}
@@ -289,5 +338,18 @@ export default function BillingPage() {
         </div>
       </div>
     </div>
+  );
+}
+
+// ── Page export (Suspense pour useSearchParams) ────────────
+export default function BillingPage() {
+  return (
+    <Suspense fallback={
+      <div className="flex items-center justify-center min-h-[60vh]">
+        <div className="h-8 w-8 animate-spin rounded-full border-2 border-primary border-t-transparent" />
+      </div>
+    }>
+      <BillingContent />
+    </Suspense>
   );
 }
