@@ -32,10 +32,17 @@ import { JwtAuthGuard }   from '../../common/guards/jwt-auth.guard';
 import { CurrentUser }    from '../../common/decorators/current-user.decorator';
 import { Public }         from '../../common/decorators/public.decorator';
 import type { JwtPayload } from '@codemorph/shared';
+import { IsString, IsIn } from 'class-validator';
 
 // ── DTO ──────────────────────────────────────────────────
+// CRITICAL: doit avoir des décorateurs class-validator
+// sinon ValidationPipe(whitelist:true) supprime planId du body
 class CreateCheckoutDto {
-  planId!: string;           // 'starter' | 'pro' | 'pro_max'
+  @IsString()
+  @IsIn(['starter', 'pro', 'pro_max'], {
+    message: 'planId must be one of: starter, pro, pro_max',
+  })
+  planId!: string;
 }
 
 @ApiTags('payments')

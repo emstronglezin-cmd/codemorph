@@ -218,65 +218,112 @@ export class AuthController {
     }
 
     const token = userWithToken.githubAccessToken;
-    const pageNum = Math.max(1, parseInt(page, 10) || 1);
+    const pageNum    = Math.max(1, parseInt(page, 10) || 1);
     const perPageNum = Math.min(100, Math.max(1, parseInt(perPage, 10) || 30));
 
     try {
-      // Fetch repos from GitHub API
-      const url = new URL('https://api.github.com/user/repos');
-      url.searchParams.set('page', String(pageNum));
-      url.searchParams.set('per_page', String(perPageNum));
-      url.searchParams.set('type', type === 'public' ? 'public' : type === 'private' ? 'private' : 'all');
-      url.searchParams.set('sort', 'updated');
-      url.searchParams.set('direction', 'desc');
-      if (search) url.searchParams.set('q', search);
+      let apiUrl: URL;
+      let isSearch = false;
 
-      const ghRes = await fetch(url.toString(), {
+      if (search && search.trim()) {
+        // GitHub Search API : retourne résultats sur tous les repos accessibles
+        // q=<search> user:<username> — on n'a pas le username, on utilise un endpoint différent
+        // Pour rechercher dans les repos de l'utilisateur, on utilise l'API search avec
+        // le scope user: qui couvre aussi les orgs si le token a le scope 'repo'
+        apiUrl = new URL('https://api.github.com/search/repositories');
+        apiUrl.searchParams.set('q', `${search.trim()} user:@me`);
+        apiUrl.searchParams.set('page', String(pageNum));
+        apiUrl.searchParams.set('per_page', String(perPageNum));
+        apiUrl.searchParams.set('sort', 'updated');
+        apiUrl.searchParams.set('order', 'desc');
+        isSearch = true;
+      } else {
+        // Listing complet : utilise /user/repos avec affiliation pour couvrir
+        // repos personnels + orgs + collaborations (publics ET privés)
+        apiUrl = new URL('https://api.github.com/user/repos');
+        apiUrl.searchParams.set('page', String(pageNum));
+        apiUrl.searchParams.set('per_page', String(perPageNum));
+        apiUrl.searchParams.set('sort', 'updated');
+        apiUrl.searchParams.set('direction', 'desc');
+        // affiliation=owner,collaborator,organization_member donne TOUS les repos
+        // y compris les repos privés des organisations
+        apiUrl.searchParams.set('affiliation', 'owner,collaborator,organization_member');
+        // Filtrage visibility si demandé
+        if (type === 'public')  apiUrl.searchParams.set('visibility', 'public');
+        if (type === 'private') apiUrl.searchParams.set('visibility', 'private');
+      }
+
+      const ghRes = await fetch(apiUrl.toString(), {
         headers: {
           Authorization: `Bearer ${token}`,
-          Accept: 'application/vnd.github.v3+json',
-          'User-Agent': 'CodeMorph/1.0',
+          Accept:        'application/vnd.github.v3+json',
+          'User-Agent':  'CodeMorph/1.0',
         },
       });
 
       if (!ghRes.ok) {
         const errBody = await ghRes.text().catch(() => '');
+        // Token expiré ou révoqué → forcer reconnexion
+        if (ghRes.status === 401) {
+          throw new BadRequestException({
+            code:    'GITHUB_TOKEN_EXPIRED',
+            message: 'GitHub token expired or revoked. Please reconnect your GitHub account.',
+            authUrl: '/api/v1/auth/github',
+          });
+        }
         throw new BadRequestException(`GitHub API error: ${ghRes.status} — ${errBody}`);
       }
 
-      const repos = await ghRes.json() as Array<{
+      // L'API search retourne { total_count, items: [...] }
+      // L'API /user/repos retourne directement un tableau
+      type GHRepo = {
         id: number; name: string; full_name: string; private: boolean;
         html_url: string; description: string | null; language: string | null;
         updated_at: string; stargazers_count: number; forks_count: number;
-        default_branch: string; topics: string[];
-      }>;
+        default_branch: string; topics?: string[];
+      };
 
-      // Filter by search if provided (GitHub search for repos needs a separate API call)
-      const filtered = search
-        ? repos.filter(r =>
-            r.name.toLowerCase().includes(search.toLowerCase()) ||
-            r.full_name.toLowerCase().includes(search.toLowerCase()),
-          )
+      let repos: GHRepo[];
+      let totalCount: number;
+
+      if (isSearch) {
+        const searchResult = await ghRes.json() as { total_count: number; items: GHRepo[] };
+        repos = searchResult.items ?? [];
+        totalCount = searchResult.total_count ?? repos.length;
+      } else {
+        repos = await ghRes.json() as GHRepo[];
+        // Extraire le total depuis le header Link si disponible
+        const linkHeader = ghRes.headers.get('link') ?? '';
+        const lastPageMatch = linkHeader.match(/page=(\d+)>; rel="last"/);
+        totalCount = lastPageMatch
+          ? parseInt(lastPageMatch[1], 10) * perPageNum
+          : repos.length + (pageNum - 1) * perPageNum;
+      }
+
+      // Filtre côté serveur par visibility si search + type
+      const filtered = (search && type !== 'all')
+        ? repos.filter(r => type === 'private' ? r.private : !r.private)
         : repos;
 
       return {
         repos: filtered.map(r => ({
-          id:           r.id,
-          name:         r.name,
-          fullName:     r.full_name,
-          private:      r.private,
-          url:          r.html_url,
-          description:  r.description,
-          language:     r.language,
-          updatedAt:    r.updated_at,
-          stars:        r.stargazers_count,
-          forks:        r.forks_count,
+          id:            r.id,
+          name:          r.name,
+          fullName:      r.full_name,
+          private:       r.private,
+          url:           r.html_url,
+          description:   r.description,
+          language:      r.language,
+          updatedAt:     r.updated_at,
+          stars:         r.stargazers_count,
+          forks:         r.forks_count,
           defaultBranch: r.default_branch,
-          topics:       r.topics ?? [],
+          topics:        r.topics ?? [],
         })),
-        page: pageNum,
-        perPage: perPageNum,
-        total: filtered.length,
+        page:     pageNum,
+        perPage:  perPageNum,
+        total:    totalCount,
+        hasMore:  filtered.length === perPageNum,
       };
     } catch (err) {
       if (err instanceof BadRequestException) throw err;

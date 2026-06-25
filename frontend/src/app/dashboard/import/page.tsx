@@ -109,9 +109,23 @@ export default function ImportRepositoryPage() {
       });
 
       if (!res.ok) {
-        const body = await res.json().catch(() => ({})) as { message?: string; error?: { message?: string } };
-        const msg = body?.message ?? body?.error?.message ?? 'Failed to fetch repositories';
-        if (msg.includes('GITHUB_NOT_CONNECTED')) {
+        const body = await res.json().catch(() => ({})) as {
+          message?: string;
+          code?: string;
+          error?: { message?: string; code?: string };
+        };
+        // AllExceptionsFilter retourne { message, code, ... }
+        // BadRequestException({ code: 'GITHUB_NOT_CONNECTED', ... }) retourne:
+        //   { success: false, message: '...', code: 'GEN_003', ... }
+        // mais le code interne est dans body.message si c'est un objet ou dans body.code
+        const msg  = body?.message ?? body?.error?.message ?? 'Failed to fetch repositories';
+        const code = body?.code ?? body?.error?.code ?? '';
+        const isNotConnected =
+          code === 'GITHUB_NOT_CONNECTED' ||
+          msg.includes('GITHUB_NOT_CONNECTED') ||
+          msg.includes('not connected') ||
+          res.status === 400 && msg.includes('GitHub');
+        if (isNotConnected) {
           setGithubConnected(false);
         } else {
           setError(msg);
@@ -119,10 +133,15 @@ export default function ImportRepositoryPage() {
         return;
       }
 
-      const data = await res.json() as { data?: { repos?: GithubRepo[]; total?: number }; repos?: GithubRepo[] };
-      const list: GithubRepo[] = data?.data?.repos ?? (data as { repos?: GithubRepo[] })?.repos ?? [];
+      const data = await res.json() as {
+        data?: { repos?: GithubRepo[]; total?: number; hasMore?: boolean };
+        repos?: GithubRepo[];
+      };
+      const list: GithubRepo[]  = data?.data?.repos ?? (data as { repos?: GithubRepo[] })?.repos ?? [];
+      const serverHasMore       = data?.data?.hasMore;
       setRepos(list);
-      setHasMore(list.length === 24);
+      // Utiliser hasMore retourné par le backend si disponible, sinon heuristique
+      setHasMore(serverHasMore !== undefined ? serverHasMore : list.length === 24);
     } catch (e) {
       setError(String(e));
     } finally {

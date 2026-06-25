@@ -103,19 +103,38 @@ export class JobsService {
     await this.quotaService.incrementConcurrentJobs(dto.userId, plan);
 
     // 7. Enqueue with plan priority
-    await this.conversionQueue.add(
-      'run-conversion',
-      { jobId: saved.id, dto },
-      {
-        priority:        limits.queuePriority,
-        attempts:        3,
-        backoff:         { type: 'exponential', delay: 2_000 },
-        removeOnComplete: 100,
-        removeOnFail:     200,
-      },
-    );
+    // Wrapped in try/catch: if Redis is absent, Bull throws but job is already
+    // persisted in DB. We mark it FAILED with a clear message instead of 500.
+    try {
+      await this.conversionQueue.add(
+        'run-conversion',
+        { jobId: saved.id, dto },
+        {
+          priority:         limits.queuePriority,
+          attempts:         3,
+          backoff:          { type: 'exponential', delay: 2_000 },
+          removeOnComplete: 100,
+          removeOnFail:     200,
+        },
+      );
+      this.logger.log(`Job ${saved.id} enqueued — plan=${plan} priority=${limits.queuePriority}`);
+    } catch (queueErr: unknown) {
+      const qMsg = queueErr instanceof Error ? queueErr.message : String(queueErr);
+      this.logger.error(`[Job ${saved.id}] Queue unavailable (Redis?): ${qMsg}`);
+      // Decrement concurrent counter since job won't run
+      try { await this.quotaService.decrementConcurrentJobs(dto.userId, plan); } catch { /* ignore */ }
+      // Mark job as failed with a user-friendly message
+      await this.jobRepo.update(saved.id, {
+        status:       JobStatus.FAILED,
+        errorMessage: 'Conversion queue unavailable. Redis may not be configured. Contact support.',
+        errorDetails: { cause: qMsg },
+        completedAt:  new Date(),
+      });
+      // Return the failed job (don't throw 500 — frontend handles FAILED status)
+      const failedJob = await this.jobRepo.findOne({ where: { id: saved.id } });
+      return failedJob ?? saved;
+    }
 
-    this.logger.log(`Job ${saved.id} enqueued — plan=${plan} priority=${limits.queuePriority}`);
     return saved;
   }
 
