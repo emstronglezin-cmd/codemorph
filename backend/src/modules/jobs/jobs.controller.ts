@@ -1,6 +1,8 @@
 // ============================================================
 // CodeMorph — Jobs Controller
 // FIX: CurrentUser retourne JwtPayload avec .sub (pas .id)
+// FIX: POST /jobs/start/url implémenté (téléchargement URL publique)
+// FIX: Logs détaillés à chaque étape
 // ============================================================
 import {
   Controller,
@@ -16,6 +18,8 @@ import {
   HttpStatus,
   UseGuards,
   ParseUUIDPipe,
+  BadRequestException,
+  Logger,
 } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiBearerAuth, ApiQuery } from '@nestjs/swagger';
 import { JobsService, StartConversionDto } from './jobs.service';
@@ -24,13 +28,19 @@ import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { Public } from '../../common/decorators/public.decorator';
 import type { JwtPayload } from '@codemorph/shared';
 import { JobType } from './jobs.entity';
+import { UploadsService } from '../uploads/uploads.service';
 
 @ApiTags('jobs')
 @ApiBearerAuth()
 @UseGuards(JwtAuthGuard)
 @Controller('jobs')
 export class JobsController {
-  constructor(private readonly jobsService: JobsService) {}
+  private readonly logger = new Logger(JobsController.name);
+
+  constructor(
+    private readonly jobsService:    JobsService,
+    private readonly uploadsService: UploadsService,
+  ) {}
 
   @Post()
   @ApiOperation({ summary: 'Start a new conversion job' })
@@ -38,8 +48,9 @@ export class JobsController {
     @Body() body: Omit<StartConversionDto, 'userId'>,
     @CurrentUser() user: JwtPayload,
   ) {
-    // FIX: utiliser user.sub (string UUID) au lieu de user.id (inexistant dans JwtPayload)
-    return this.jobsService.createJob({ ...body, userId: user.sub as string });
+    const userId = user.sub as string;
+    this.logger.log(`[POST /jobs] userId=${userId} type=${body.type} src=${body.sourceLanguage} tgt=${body.targetLanguage}`);
+    return this.jobsService.createJob({ ...body, userId });
   }
 
   @Get()
@@ -100,6 +111,7 @@ export class JobsController {
       linesGenerated?: number;
     },
   ) {
+    this.logger.log(`[Callback] Job ${id} → success=${body.success}`);
     await this.jobsService.handleCallback(id, body);
     return { ok: true };
   }
@@ -119,14 +131,35 @@ export class JobsController {
     },
     @CurrentUser() user: JwtPayload,
   ) {
+    const userId = user.sub as string;
+
+    // Validate required fields
+    if (!body.repo?.trim()) {
+      throw new BadRequestException({
+        code:    'MISSING_REPO',
+        message: 'GitHub repository is required (e.g. "owner/repo").',
+      });
+    }
+    if (!body.sourceLanguage?.trim() || !body.targetLanguage?.trim()) {
+      throw new BadRequestException({
+        code:    'MISSING_LANGUAGES',
+        message: 'sourceLanguage and targetLanguage are required.',
+      });
+    }
+
+    this.logger.log(
+      `[start/github] userId=${userId} repo=${body.repo} branch=${body.branch ?? 'main'} ` +
+      `src=${body.sourceLanguage} tgt=${body.targetLanguage}`,
+    );
+
     return this.jobsService.createJob({
-      userId:         user.sub as string,
+      userId,
       type:           JobType.GITHUB_IMPORT,
       sourceLanguage: body.sourceLanguage,
       targetLanguage: body.targetLanguage,
       projectId:      body.projectId,
-      sourceRepo:     body.repo,
-      sourceBranch:   body.branch ?? 'main',
+      sourceRepo:     body.repo.trim(),
+      sourceBranch:   body.branch?.trim() ?? 'main',
       goalPrompt:     body.goalPrompt,
     });
   }
@@ -145,13 +178,103 @@ export class JobsController {
     },
     @CurrentUser() user: JwtPayload,
   ) {
+    const userId = user.sub as string;
+
+    // Validate required fields
+    if (!body.zipPath?.trim()) {
+      throw new BadRequestException({
+        code:    'MISSING_ZIP_PATH',
+        message: 'zipPath is required. Upload your ZIP file first via POST /uploads/zip.',
+      });
+    }
+    if (!body.sourceLanguage?.trim() || !body.targetLanguage?.trim()) {
+      throw new BadRequestException({
+        code:    'MISSING_LANGUAGES',
+        message: 'sourceLanguage and targetLanguage are required.',
+      });
+    }
+
+    this.logger.log(
+      `[start/zip] userId=${userId} zipPath=${body.zipPath} ` +
+      `src=${body.sourceLanguage} tgt=${body.targetLanguage}`,
+    );
+
     return this.jobsService.createJob({
-      userId:         user.sub as string,
+      userId,
       type:           JobType.ZIP_IMPORT,
       sourceLanguage: body.sourceLanguage,
       targetLanguage: body.targetLanguage,
       projectId:      body.projectId,
-      zipPath:        body.zipPath,
+      zipPath:        body.zipPath.trim(),
+      goalPrompt:     body.goalPrompt,
+    });
+  }
+
+  // ── Quick-start: from public URL ───────────────────────
+  @Post('start/url')
+  @ApiOperation({ summary: 'Start conversion from public ZIP/repository URL' })
+  async startFromUrl(
+    @Body()
+    body: {
+      projectId?:     string;
+      sourceLanguage: string;
+      targetLanguage: string;
+      sourceUrl:      string;
+      goalPrompt?:    string;
+    },
+    @CurrentUser() user: JwtPayload,
+  ) {
+    const userId = user.sub as string;
+
+    // Validate required fields
+    if (!body.sourceUrl?.trim()) {
+      throw new BadRequestException({
+        code:    'MISSING_SOURCE_URL',
+        message: 'sourceUrl is required. Provide a public URL pointing to a ZIP archive.',
+      });
+    }
+    if (!body.sourceLanguage?.trim() || !body.targetLanguage?.trim()) {
+      throw new BadRequestException({
+        code:    'MISSING_LANGUAGES',
+        message: 'sourceLanguage and targetLanguage are required.',
+      });
+    }
+
+    // Validate URL format
+    let parsedUrl: URL;
+    try {
+      parsedUrl = new URL(body.sourceUrl.trim());
+    } catch {
+      throw new BadRequestException({
+        code:    'INVALID_URL',
+        message: `Invalid URL: "${body.sourceUrl}". Please provide a valid public URL (https://...).`,
+      });
+    }
+
+    if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
+      throw new BadRequestException({
+        code:    'INVALID_URL_PROTOCOL',
+        message: 'Only http:// and https:// URLs are supported.',
+      });
+    }
+
+    this.logger.log(
+      `[start/url] userId=${userId} url=${body.sourceUrl} ` +
+      `src=${body.sourceLanguage} tgt=${body.targetLanguage}`,
+    );
+
+    // Download + save the ZIP from the public URL
+    this.logger.log(`[start/url] Downloading ZIP from: ${body.sourceUrl}`);
+    const zipPath = await this.uploadsService.downloadFromUrl(body.sourceUrl.trim());
+    this.logger.log(`[start/url] ZIP downloaded and saved at: ${zipPath}`);
+
+    return this.jobsService.createJob({
+      userId,
+      type:           JobType.URL_IMPORT,
+      sourceLanguage: body.sourceLanguage,
+      targetLanguage: body.targetLanguage,
+      projectId:      body.projectId,
+      zipPath,
       goalPrompt:     body.goalPrompt,
     });
   }

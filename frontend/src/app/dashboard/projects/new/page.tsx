@@ -2,9 +2,11 @@
 
 // ============================================================
 // CodeMorph — New Project Page
-// FIX 12: Authorization Bearer header sur tous les fetch()
-//          sourceLanguage / targetLanguage normalisés (lowercase + tiret)
-//          Upload ZIP protégé par le token
+// FIX: Lecture correcte des erreurs wrappées par TransformInterceptor
+//      { success: false, message: "...", code: "..." }
+// FIX: URL import implémenté (POST /jobs/start/url)
+// FIX: Progression détaillée — plus de spinner seul
+// FIX: Affichage du vrai code + message HTTP d'erreur
 // ============================================================
 
 import { useState } from 'react';
@@ -16,6 +18,12 @@ import { Badge } from '@/components/ui/badge';
 import { getAccessToken } from '@/lib/api/client';
 
 type ImportMethod = 'github' | 'zip' | 'url';
+
+/** Étape de progression détaillée */
+interface ProgressStep {
+  label: string;
+  status: 'waiting' | 'running' | 'done' | 'error';
+}
 
 const FRAMEWORKS = [
   {
@@ -87,6 +95,52 @@ function authHeaders(extra?: Record<string, string>): Record<string, string> {
   };
 }
 
+/**
+ * Extrait le message d'erreur depuis une réponse wrappée par TransformInterceptor/AllExceptionsFilter.
+ * Format erreur  : { success: false, message: "...", code: "...", errors: [...] }
+ * Format succès  : { success: true,  data: { ... } }
+ */
+function extractErrorMessage(
+  data: Record<string, unknown>,
+  httpStatus: number,
+  fallback: string,
+): string {
+  // Erreur wrappée par AllExceptionsFilter
+  if (data['success'] === false) {
+    const code    = data['code']    ? ` [${data['code']}]` : '';
+    const message = (data['message'] as string | undefined) ?? fallback;
+    // Si des erreurs de validation sont présentes
+    if (Array.isArray(data['errors']) && data['errors'].length > 0) {
+      const errMsgs = (data['errors'] as Array<{ message?: string }>)
+        .map((e) => e.message)
+        .filter(Boolean)
+        .join(', ');
+      return `${message}${code}: ${errMsgs}`;
+    }
+    return `${message}${code}`;
+  }
+
+  // Réponse HTTP non-OK sans format NestJS
+  return `HTTP ${httpStatus}: ${fallback}`;
+}
+
+/** Labels des étapes de progression selon la méthode d'import */
+function getProgressSteps(method: ImportMethod): ProgressStep[] {
+  const steps: ProgressStep[] = [
+    { label: 'Creating project…',        status: 'waiting' },
+  ];
+  if (method === 'zip') {
+    steps.push({ label: 'Uploading ZIP…',      status: 'waiting' });
+  } else if (method === 'url') {
+    steps.push({ label: 'Fetching URL…',       status: 'waiting' });
+  } else {
+    steps.push({ label: 'Connecting GitHub…',  status: 'waiting' });
+  }
+  steps.push({ label: 'Creating conversion…', status: 'waiting' });
+  steps.push({ label: 'Starting worker…',      status: 'waiting' });
+  return steps;
+}
+
 export default function NewProjectPage() {
   const router = useRouter();
   const [step, setStep]         = useState<1 | 2 | 3>(1);
@@ -94,6 +148,7 @@ export default function NewProjectPage() {
   const [framework, setFramework] = useState('');
   const [loading, setLoading]   = useState(false);
   const [error, setError]       = useState('');
+  const [progressSteps, setProgressSteps] = useState<ProgressStep[]>([]);
 
   // Step 1
   const [projectName, setProjectName]   = useState('');
@@ -107,76 +162,106 @@ export default function NewProjectPage() {
   const [goalPrompt, setGoalPrompt]     = useState('');
   const [zipPath, setZipPath]           = useState('');
 
+  // ── Mise à jour d'une étape de progression ───────────────
+  const updateStep = (index: number, status: ProgressStep['status']) => {
+    setProgressSteps((prev) => {
+      const next = [...prev];
+      if (next[index]) next[index] = { ...next[index], status };
+      return next;
+    });
+  };
+
   // ── Upload ZIP ──────────────────────────────────────────
   const uploadZip = async (): Promise<string> => {
-    if (!zipFile) throw new Error('No ZIP file selected');
+    if (!zipFile) throw new Error('Aucun fichier ZIP sélectionné');
     const token = getAccessToken();
     const fd    = new FormData();
     fd.append('file', zipFile);
 
-    const res = await fetch(`${BACKEND}/uploads/zip`, {
+    const res  = await fetch(`${BACKEND}/uploads/zip`, {
       method:  'POST',
       headers: token ? { Authorization: `Bearer ${token}` } : {},
-      // NB: pas de Content-Type — laissé au navigateur pour multipart/form-data
       body:    fd,
     });
-    const data = await res.json() as { data?: { zipPath?: string }; zipPath?: string; error?: { message?: string } };
-    if (!res.ok) throw new Error(data.error?.message ?? 'Upload failed');
-    const path = data.data?.zipPath ?? data.zipPath ?? '';
-    setZipPath(path);
-    return path;
+    const raw  = await res.json() as Record<string, unknown>;
+
+    if (!res.ok) {
+      const msg = extractErrorMessage(raw, res.status, 'Upload failed');
+      throw new Error(msg);
+    }
+
+    // Succès wrappé : { success: true, data: { zipPath, fileName, sizeBytes } }
+    const inner = (raw['data'] as Record<string, unknown> | undefined) ?? raw;
+    const p     = (inner['zipPath'] as string | undefined) ?? '';
+    if (!p) throw new Error('ZIP uploaded but server returned no zipPath');
+    setZipPath(p);
+    return p;
   };
 
   // ── Start conversion ────────────────────────────────────
   const handleStart = async () => {
-    if (!framework) { setError('Select a conversion framework'); return; }
+    if (!framework) { setError('Sélectionne un framework de conversion'); return; }
     setLoading(true);
     setError('');
+
+    const steps = getProgressSteps(method);
+    setProgressSteps(steps);
 
     try {
       const fw = FRAMEWORKS.find((f) => f.id === framework)!;
 
-      // 1. Créer le projet avec Authorization Bearer
-      const projRes = await fetch(`${BACKEND}/projects`, {
+      // ── Step 0: Créer le projet ──────────────────────────
+      updateStep(0, 'running');
+      const projRes  = await fetch(`${BACKEND}/projects`, {
         method:  'POST',
         headers: authHeaders(),
         body:    JSON.stringify({
           name:           projectName.trim(),
           description:    description.trim() || undefined,
-          // Passer sourceLanguage/targetLanguage normalisés dès la création
           sourceLanguage: fw.sourceLang,
           targetLanguage: fw.targetLang,
         }),
       });
+      const projRaw  = await projRes.json() as Record<string, unknown>;
 
-      const projData = await projRes.json() as {
-        data?:  { id?: string };
-        id?:    string;
-        error?: { message?: string };
-      };
-      if (!projRes.ok) throw new Error(projData.error?.message ?? 'Project creation failed');
-      const projectId = projData.data?.id ?? projData.id ?? '';
-      if (!projectId) throw new Error('Project ID manquant dans la réponse');
+      if (!projRes.ok) {
+        const msg = extractErrorMessage(projRaw, projRes.status, 'Project creation failed');
+        throw new Error(msg);
+      }
+      // Réponse wrappée : { success: true, data: { id, name, ... } }
+      const projData  = (projRaw['data'] as Record<string, unknown> | undefined) ?? projRaw;
+      const projectId = (projData['id'] as string | undefined) ?? '';
+      if (!projectId) throw new Error('Project created but server returned no ID');
 
-      // 2. Démarrer le job avec Authorization Bearer
+      updateStep(0, 'done');
+
+      // ── Step 1: Import source ────────────────────────────
+      updateStep(1, 'running');
+
       let jobRes: Response;
 
       if (method === 'github') {
+        if (!githubRepo.trim()) throw new Error('Dépôt GitHub requis (ex: owner/repo)');
+
         jobRes = await fetch(`${BACKEND}/jobs/start/github`, {
           method:  'POST',
           headers: authHeaders(),
           body:    JSON.stringify({
             projectId,
-            sourceLanguage: fw.sourceLang,   // 'flutter'
-            targetLanguage: fw.targetLang,   // 'react-native'
+            sourceLanguage: fw.sourceLang,
+            targetLanguage: fw.targetLang,
             repo:           githubRepo.trim(),
             branch:         githubBranch.trim() || 'main',
             goalPrompt:     goalPrompt.trim() || undefined,
           }),
         });
+
       } else if (method === 'zip') {
         // Uploader le ZIP si pas encore fait
         const zPath = zipPath || await uploadZip();
+        updateStep(1, 'done');
+        updateStep(2, 'running');
+
         jobRes = await fetch(`${BACKEND}/jobs/start/zip`, {
           method:  'POST',
           headers: authHeaders(),
@@ -188,23 +273,71 @@ export default function NewProjectPage() {
             goalPrompt:     goalPrompt.trim() || undefined,
           }),
         });
+
       } else {
-        throw new Error('URL import not yet supported');
+        // URL import
+        if (!sourceUrl.trim()) throw new Error('URL publique requise');
+
+        jobRes = await fetch(`${BACKEND}/jobs/start/url`, {
+          method:  'POST',
+          headers: authHeaders(),
+          body:    JSON.stringify({
+            projectId,
+            sourceLanguage: fw.sourceLang,
+            targetLanguage: fw.targetLang,
+            sourceUrl:      sourceUrl.trim(),
+            goalPrompt:     goalPrompt.trim() || undefined,
+          }),
+        });
       }
 
-      const jobData = await jobRes.json() as {
-        data?:  { id?: string };
-        id?:    string;
-        error?: { message?: string };
-      };
-      if (!jobRes.ok) throw new Error(jobData.error?.message ?? 'Job start failed');
-      const jobId = jobData.data?.id ?? jobData.id ?? '';
-      if (!jobId) throw new Error('Job ID manquant dans la réponse');
+      updateStep(1, 'done');
 
-      // 3. Rediriger vers le tracker du job
+      // ── Step 2: Lire la réponse du job ─────────────────
+      updateStep(method === 'zip' ? 2 : 2, 'running');
+      const jobRaw = await jobRes.json() as Record<string, unknown>;
+
+      if (!jobRes.ok) {
+        // CRITICAL: lire le vrai message depuis la réponse wrappée
+        const msg = extractErrorMessage(jobRaw, jobRes.status, 'Job creation failed');
+        throw new Error(msg);
+      }
+
+      // Réponse wrappée : { success: true, data: { id, status, ... } }
+      const jobData = (jobRaw['data'] as Record<string, unknown> | undefined) ?? jobRaw;
+      const jobId   = (jobData['id'] as string | undefined) ?? '';
+      if (!jobId) throw new Error('Job created but server returned no ID');
+
+      const jobStatus = (jobData['status'] as string | undefined) ?? '';
+
+      // Job immédiatement FAILED (ex: queue Redis indisponible)
+      if (jobStatus === 'failed') {
+        const errMsg = (jobData['errorMessage'] as string | undefined) ?? 'Job creation failed immediately';
+        throw new Error(errMsg);
+      }
+
+      updateStep(2, 'done');
+
+      // ── Step 3: Worker démarré ──────────────────────────
+      const lastIdx = steps.length - 1;
+      updateStep(lastIdx, 'done');
+
+      // ── Rediriger vers le tracker du job ────────────────
       router.push(`/dashboard/projects/${projectId}/job/${jobId}`);
+
     } catch (err) {
-      setError((err as Error).message);
+      const message = (err as Error).message;
+      setError(message);
+      // Marquer l'étape courante comme erreur
+      setProgressSteps((prev) => {
+        const runningIdx = prev.findIndex((s) => s.status === 'running');
+        if (runningIdx >= 0) {
+          const next = [...prev];
+          next[runningIdx] = { ...next[runningIdx], status: 'error' };
+          return next;
+        }
+        return prev;
+      });
     } finally {
       setLoading(false);
     }
@@ -337,7 +470,7 @@ export default function NewProjectPage() {
                   onDrop={(e) => {
                     e.preventDefault();
                     setZipFile(e.dataTransfer.files[0] ?? null);
-                    setZipPath(''); // reset path si nouveau fichier
+                    setZipPath('');
                   }}
                   onClick={() => document.getElementById('zip-input')?.click()}
                 >
@@ -366,12 +499,20 @@ export default function NewProjectPage() {
 
             {/* URL */}
             {method === 'url' && (
-              <Input
-                label="Public repository URL"
-                placeholder="https://github.com/user/repo/archive/main.zip"
-                value={sourceUrl}
-                onChange={(e) => setSourceUrl(e.target.value)}
-              />
+              <div className="space-y-3">
+                <Input
+                  label="Public repository URL"
+                  placeholder="https://github.com/user/repo/archive/refs/heads/main.zip"
+                  value={sourceUrl}
+                  onChange={(e) => setSourceUrl(e.target.value)}
+                />
+                <p className="text-xs text-muted-foreground">
+                  💡 Pour GitHub: utilisez l&apos;URL d&apos;archive&nbsp;
+                  <code className="bg-muted px-1 rounded text-xs">
+                    https://github.com/OWNER/REPO/archive/refs/heads/BRANCH.zip
+                  </code>
+                </p>
+              </div>
             )}
 
             {/* Goal prompt */}
@@ -416,46 +557,85 @@ export default function NewProjectPage() {
             <CardDescription>Select the source → target stack for AI conversion</CardDescription>
           </CardHeader>
           <CardContent className="space-y-6">
-            {error && (
-              <div className="p-3 rounded-lg bg-red-500/10 border border-red-500/20 text-sm text-red-400">
-                {error}
+
+            {/* ── Progression détaillée ── */}
+            {loading && progressSteps.length > 0 && (
+              <div className="p-4 rounded-xl border border-border bg-muted/30 space-y-2">
+                <p className="text-sm font-semibold text-foreground mb-3">🚀 Starting conversion…</p>
+                {progressSteps.map((s, i) => (
+                  <div key={i} className="flex items-center gap-3">
+                    <div className={`w-5 h-5 rounded-full flex items-center justify-center text-xs flex-shrink-0 ${
+                      s.status === 'done'    ? 'bg-green-500 text-white'
+                      : s.status === 'running' ? 'bg-primary text-white animate-pulse'
+                      : s.status === 'error'   ? 'bg-red-500 text-white'
+                      : 'bg-muted-foreground/20 text-muted-foreground'
+                    }`}>
+                      {s.status === 'done'    ? '✓'
+                       : s.status === 'running' ? '⟳'
+                       : s.status === 'error'   ? '✗'
+                       : '·'}
+                    </div>
+                    <span className={`text-sm ${
+                      s.status === 'done'    ? 'text-green-500 line-through'
+                      : s.status === 'running' ? 'text-foreground font-medium'
+                      : s.status === 'error'   ? 'text-red-400'
+                      : 'text-muted-foreground'
+                    }`}>
+                      {s.label}
+                    </span>
+                  </div>
+                ))}
               </div>
             )}
 
-            <div className="grid grid-cols-1 gap-3">
-              {FRAMEWORKS.map((fw) => (
-                <button
-                  key={fw.id}
-                  onClick={() => setFramework(fw.id)}
-                  className={`p-4 rounded-xl border-2 text-left transition-all ${
-                    framework === fw.id
-                      ? 'border-primary bg-primary/5'
-                      : 'border-border hover:border-primary/40'
-                  }`}
-                >
-                  <div className="flex items-center gap-3">
-                    <span className="text-2xl">{fw.icon}</span>
-                    <div className="flex-1">
-                      <div className="flex items-center gap-2">
-                        <span className="font-semibold text-foreground">{fw.source}</span>
-                        <span className="text-muted-foreground">→</span>
-                        <span className="font-semibold text-foreground">{fw.target}</span>
-                        <Badge variant="success" size="sm">{fw.badge}</Badge>
+            {/* ── Erreur ── */}
+            {error && (
+              <div className="p-4 rounded-xl bg-red-500/10 border border-red-500/20 space-y-1">
+                <p className="text-sm font-semibold text-red-400">❌ Conversion failed</p>
+                <p className="text-sm text-red-400/80 break-words">{error}</p>
+              </div>
+            )}
+
+            {/* ── Framework cards ── */}
+            {!loading && (
+              <div className="grid grid-cols-1 gap-3">
+                {FRAMEWORKS.map((fw) => (
+                  <button
+                    key={fw.id}
+                    onClick={() => setFramework(fw.id)}
+                    className={`p-4 rounded-xl border-2 text-left transition-all ${
+                      framework === fw.id
+                        ? 'border-primary bg-primary/5'
+                        : 'border-border hover:border-primary/40'
+                    }`}
+                  >
+                    <div className="flex items-center gap-3">
+                      <span className="text-2xl">{fw.icon}</span>
+                      <div className="flex-1">
+                        <div className="flex items-center gap-2">
+                          <span className="font-semibold text-foreground">{fw.source}</span>
+                          <span className="text-muted-foreground">→</span>
+                          <span className="font-semibold text-foreground">{fw.target}</span>
+                          <Badge variant="success" size="sm">{fw.badge}</Badge>
+                          {!fw.free && (
+                            <Badge variant="warning" size="sm">Pro</Badge>
+                          )}
+                        </div>
+                        <p className="text-xs text-muted-foreground mt-0.5">{fw.desc}</p>
                       </div>
-                      <p className="text-xs text-muted-foreground mt-0.5">{fw.desc}</p>
+                      {framework === fw.id && (
+                        <div className="w-5 h-5 rounded-full bg-primary flex items-center justify-center text-white text-xs">
+                          ✓
+                        </div>
+                      )}
                     </div>
-                    {framework === fw.id && (
-                      <div className="w-5 h-5 rounded-full bg-primary flex items-center justify-center text-white text-xs">
-                        ✓
-                      </div>
-                    )}
-                  </div>
-                </button>
-              ))}
-            </div>
+                  </button>
+                ))}
+              </div>
+            )}
 
             <div className="flex gap-3">
-              <Button variant="outline" onClick={() => setStep(2)} className="flex-1">
+              <Button variant="outline" onClick={() => setStep(2)} className="flex-1" disabled={loading}>
                 ← Back
               </Button>
               <Button
@@ -465,7 +645,7 @@ export default function NewProjectPage() {
                 loading={loading}
                 onClick={handleStart}
               >
-                🚀 Start Conversion
+                {loading ? 'Starting…' : '🚀 Start Conversion'}
               </Button>
             </div>
           </CardContent>

@@ -65,12 +65,23 @@ export class GitHubApiService {
   ) {}
 
   private async getToken(userId: string): Promise<string> {
-    const user = await this.userRepo.findOne({
-      where: { id: userId },
-      select: ['id', 'githubAccessToken'],
-    });
+    // CRITICAL FIX: githubAccessToken has select:false — findOne({select:[...]})
+    // does NOT force-select columns with select:false in TypeORM.
+    // Must use QueryBuilder + addSelect() to retrieve the column explicitly.
+    const user = await this.userRepo
+      .createQueryBuilder('user')
+      .select('user.id')
+      .addSelect('user.githubAccessToken')
+      .where('user.id = :id', { id: userId })
+      .getOne();
+
+    this.logger.debug(`getToken(${userId}) → githubAccessToken present: ${!!user?.githubAccessToken}`);
+
     if (!user?.githubAccessToken) {
-      throw new UnauthorizedException('No GitHub access token found. Please re-authenticate with GitHub.');
+      throw new UnauthorizedException({
+        code:    'GITHUB_NOT_CONNECTED',
+        message: 'No GitHub access token found. Please connect your GitHub account in Settings → Integrations.',
+      });
     }
     return user.githubAccessToken;
   }
