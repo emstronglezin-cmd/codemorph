@@ -1,7 +1,8 @@
 // ============================================================
 // CodeMorph — Quota Service
-// Tracks & enforces per-user monthly usage limits
-// Redis is OPTIONAL — falls back to in-memory if unavailable
+// PHASE 7 FIX: Concurrent jobs basés sur la DB (pas Redis)
+//   → Compteur toujours exact, même après crash/restart
+//   → Stale jobs auto-détectés et nettoyés
 // ============================================================
 import {
   Injectable, ForbiddenException, Logger, Inject, Optional,
@@ -13,6 +14,11 @@ import { getPlanLimits, isUnlimited, Plan } from '../subscription/plan-limits.co
 
 export const REDIS_CLIENT_TOKEN = 'QUOTA_REDIS_CLIENT';
 
+// ── STALE JOB THRESHOLD ──────────────────────────────────────
+// Un job actif (PENDING/ANALYZING/CONVERTING) depuis plus de
+// STALE_JOB_MINUTES minutes sans mise à jour → considéré stale
+export const STALE_JOB_MINUTES = 15;
+
 interface QuotaCheckResult {
   allowed: boolean;
   used: number;
@@ -21,7 +27,7 @@ interface QuotaCheckResult {
   resetAt: Date;
 }
 
-// ── In-memory fallback store ──────────────────────────────
+// ── In-memory fallback store (rate limits & monthly quotas) ──
 const memStore = new Map<string, { value: string; expiresAt: number }>();
 
 function memGet(key: string): string | null {
@@ -34,26 +40,32 @@ function memSet(key: string, value: string, ttlSeconds = 3600): void {
   memStore.set(key, { value, expiresAt: Date.now() + ttlSeconds * 1000 });
 }
 function memDel(key: string): void { memStore.delete(key); }
-function memIncr(key: string): number {
+function memIncr(key: string, ttl = 3600): number {
   const cur = parseInt(memGet(key) ?? '0', 10);
   const next = cur + 1;
-  memSet(key, String(next), 3600);
-  return next;
-}
-function memDecr(key: string): number {
-  const cur = parseInt(memGet(key) ?? '0', 10);
-  const next = Math.max(0, cur - 1);
-  memSet(key, String(next), 3600);
+  memSet(key, String(next), ttl);
   return next;
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-type RedisLike = { get(k: string): Promise<string | null>; set(k: string, v: string): Promise<unknown>; setex(k: string, t: number, v: string): Promise<unknown>; del(k: string): Promise<unknown>; incr(k: string): Promise<number>; decr(k: string): Promise<number>; expire(k: string, t: number): Promise<unknown> };
+type RedisLike = {
+  get(k: string): Promise<string | null>;
+  set(k: string, v: string): Promise<unknown>;
+  setex(k: string, t: number, v: string): Promise<unknown>;
+  del(k: string): Promise<unknown>;
+  incr(k: string): Promise<number>;
+  decr(k: string): Promise<number>;
+  expire(k: string, t: number): Promise<unknown>;
+};
 
 @Injectable()
 export class QuotaService {
   private readonly logger = new Logger(QuotaService.name);
   private readonly redis: RedisLike | null;
+
+  // Injected lazily to avoid circular dependency
+  // Set by JobsModule after initialization
+  private jobRepo: Repository<{ id: string; status: string; userId: string; updatedAt: Date }> | null = null;
 
   constructor(
     @InjectRepository(UsageQuotaEntity)
@@ -66,6 +78,11 @@ export class QuotaService {
     } else {
       this.logger.warn('QuotaService: Redis not available — using in-memory fallback (not persistent)');
     }
+  }
+
+  /** Called by JobsService after initialization to enable DB-backed concurrent count */
+  setJobRepository(repo: Repository<{ id: string; status: string; userId: string; updatedAt: Date }>): void {
+    this.jobRepo = repo;
   }
 
   // ── Redis-or-memory helpers ──────────────────────────────
@@ -91,17 +108,7 @@ export class QuotaService {
         return val;
       }
     } catch (e) { this.logger.warn(`Redis INCR failed: ${String(e)}`); }
-    return memIncr(key);
-  }
-
-  private async cacheDecr(key: string): Promise<number> {
-    try {
-      if (this.redis) {
-        const val = await this.redis.decr(key);
-        return val < 0 ? 0 : val;
-      }
-    } catch (e) { this.logger.warn(`Redis DECR failed: ${String(e)}`); }
-    return memDecr(key);
+    return memIncr(key, ttl);
   }
 
   // ── Get or create current period quota ──────────────────
@@ -162,10 +169,10 @@ export class QuotaService {
         conversionsUsed: 1,
         conversionsLimit: limits.conversionsPerMonth,
         plan,
-        aiRequestsUsed: extra?.aiRequestsUsed ?? 0,
-        aiTokensUsed:   extra?.aiTokensUsed ?? 0,
-        filesProcessed: extra?.filesProcessed ?? 0,
-        linesProcessed: extra?.linesProcessed ?? 0,
+        aiRequestsUsed:   extra?.aiRequestsUsed ?? 0,
+        aiTokensUsed:     extra?.aiTokensUsed ?? 0,
+        filesProcessed:   extra?.filesProcessed ?? 0,
+        linesProcessed:   extra?.linesProcessed ?? 0,
         storageBytesUsed: String(extra?.storageBytesUsed ?? 0),
       })
       .orUpdate(
@@ -193,12 +200,12 @@ export class QuotaService {
     if (!allowed) {
       const limitStr = isUnlimited(limit) ? 'unlimited' : String(limit);
       throw new ForbiddenException({
-        code:      'QUOTA_EXCEEDED',
-        message:   `Conversion quota exceeded. You've used ${used}/${limitStr} conversions this month.`,
+        code:       'QUOTA_EXCEEDED',
+        message:    `Conversion quota exceeded. You've used ${used}/${limitStr} conversions this month.`,
         used,
         limit,
         remaining,
-        resetAt:   this.nextPeriodStart(),
+        resetAt:    this.nextPeriodStart(),
         upgradeUrl: '/pricing',
       });
     }
@@ -217,20 +224,58 @@ export class QuotaService {
     return { allowed, resetInSeconds };
   }
 
-  // ── Check concurrent jobs ────────────────────────────────
+  // ────────────────────────────────────────────────────────
+  // PHASE 7 FIX: Concurrent jobs — basé sur la DB, pas Redis
+  // ────────────────────────────────────────────────────────
+  // Raison du fix: le compteur Redis/in-memory n'est jamais
+  // remis à zéro si le process crashe ou si decrementConcurrentJobs
+  // n'est pas appelé (timeout, panic, etc.).
+  //
+  // La source de vérité UNIQUE doit être la base de données:
+  // SELECT COUNT(*) FROM jobs WHERE userId=? AND status IN ('pending','analyzing','converting')
+  // On exclut aussi les jobs stale (updatedAt > STALE_JOB_MINUTES).
+  // ────────────────────────────────────────────────────────
+
   async checkConcurrentJobs(userId: string, plan: Plan): Promise<{ allowed: boolean; current: number; limit: number }> {
     const limits = getPlanLimits(plan);
-    const key    = `concurrent:${userId}`;
-    const current = parseInt((await this.cacheGet(key)) ?? '0', 10);
+    const current = await this.countActiveJobsFromDb(userId);
+    this.logger.debug(`checkConcurrentJobs: userId=${userId} current=${current} limit=${limits.concurrentJobs}`);
     return { allowed: current < limits.concurrentJobs, current, limit: limits.concurrentJobs };
   }
 
-  async incrementConcurrentJobs(userId: string, _plan?: Plan): Promise<void> {
-    await this.cacheIncr(`concurrent:${userId}`, 3600);
+  /** Compte les jobs véritablement actifs depuis la DB (source de vérité) */
+  private async countActiveJobsFromDb(userId: string): Promise<number> {
+    if (!this.jobRepo) {
+      // Fallback si jobRepo pas encore injecté (démarrage)
+      this.logger.warn('countActiveJobsFromDb: jobRepo not set, returning 0');
+      return 0;
+    }
+
+    // Seuil de stale: jobs actifs qui n'ont pas bougé depuis STALE_JOB_MINUTES
+    const staleThreshold = new Date(Date.now() - STALE_JOB_MINUTES * 60 * 1000);
+
+    try {
+      const count = await (this.jobRepo as any)
+        .createQueryBuilder('job')
+        .where('job.userId = :userId', { userId })
+        .andWhere('job.status IN (:...statuses)', { statuses: ['pending', 'analyzing', 'converting'] })
+        .andWhere('job.updatedAt > :staleThreshold', { staleThreshold })
+        .getCount();
+      return count;
+    } catch (e) {
+      this.logger.error(`countActiveJobsFromDb failed: ${String(e)}`);
+      return 0; // En cas d'erreur DB, ne pas bloquer l'utilisateur
+    }
   }
 
-  async decrementConcurrentJobs(userId: string, _plan?: Plan): Promise<void> {
-    await this.cacheDecr(`concurrent:${userId}`);
+  // Ces méthodes sont conservées pour compatibilité mais ne font plus rien
+  // (le count est toujours recalculé depuis la DB dans checkConcurrentJobs)
+  async incrementConcurrentJobs(_userId: string, _plan?: Plan): Promise<void> {
+    // No-op: la DB est la source de vérité via countActiveJobsFromDb
+  }
+
+  async decrementConcurrentJobs(_userId: string, _plan?: Plan): Promise<void> {
+    // No-op: la DB est la source de vérité via countActiveJobsFromDb
   }
 
   // ── Get usage summary for dashboard ─────────────────────
@@ -238,6 +283,7 @@ export class QuotaService {
     const quota = await this.getOrCreateQuota(userId, plan);
     const limits = getPlanLimits(plan);
     const { periodEnd } = this.currentPeriod();
+    const activeConcurrent = await this.countActiveJobsFromDb(userId);
 
     return {
       conversions: {
@@ -248,6 +294,7 @@ export class QuotaService {
           : Math.max(0, limits.conversionsPerMonth - quota.conversionsUsed),
         unlimited: isUnlimited(limits.conversionsPerMonth),
       },
+      concurrent:  { active: activeConcurrent, limit: limits.concurrentJobs },
       aiRequests:  { used: quota.aiRequestsUsed, limit: limits.aiRequestsPerHour, unlimited: isUnlimited(limits.aiRequestsPerHour) },
       aiTokens:    { used: quota.aiTokensUsed },
       files:       { processed: quota.filesProcessed },

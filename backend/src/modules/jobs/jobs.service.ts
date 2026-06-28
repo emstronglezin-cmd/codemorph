@@ -1,24 +1,29 @@
 // ============================================================
-// CodeMorph — Jobs Service (AiEngineClient + Quota enforcement)
-// FIX: Logs détaillés à chaque étape
-// FIX: Erreurs complètes propagées sans masquage
-// FIX: dispatchToAiEngine retourne string correctement
+// CodeMorph — Jobs Service
+// PHASE 7 FIX:
+//   - Concurrent count basé sur la DB (plus de compteur Redis/mem)
+//   - Stale job auto-cleanup au démarrage et via scheduler
+//   - jobRepo injecté dans QuotaService (source de vérité DB)
+//   - dispatchToAiEngine: correction retour AiConvertResponse
+//   - Logs détaillés à chaque étape
 // ============================================================
 import {
   Injectable,
   NotFoundException,
   ForbiddenException,
   Logger,
+  OnModuleInit,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository }        from 'typeorm';
+import { Repository, In, LessThan } from 'typeorm';
 import { InjectQueue }       from '@nestjs/bull';
 import { Queue }             from 'bull';
 import { ConfigService }     from '@nestjs/config';
+import { Cron, CronExpression } from '@nestjs/schedule';
 
 import { JobEntity, JobStatus, JobType } from './jobs.entity';
 import { AiEngineClient }                from './ai-engine.client';
-import { QuotaService }                  from '../quota/quota.service';
+import { QuotaService, STALE_JOB_MINUTES } from '../quota/quota.service';
 import { SubscriptionService }           from '../subscription/subscription.service';
 import { PLAN_LIMITS }                   from '../subscription/plan-limits.config';
 
@@ -34,8 +39,11 @@ export interface StartConversionDto {
   goalPrompt?:    string;
 }
 
+// Statuts considérés comme "actifs" (bloquant le quota concurrent)
+const ACTIVE_STATUSES = [JobStatus.PENDING, JobStatus.ANALYZING, JobStatus.CONVERTING];
+
 @Injectable()
-export class JobsService {
+export class JobsService implements OnModuleInit {
   private readonly logger = new Logger(JobsService.name);
 
   constructor(
@@ -45,11 +53,65 @@ export class JobsService {
     @InjectQueue('conversion')
     private readonly conversionQueue: Queue,
 
-    private readonly aiEngineClient:    AiEngineClient,
-    private readonly quotaService:      QuotaService,
-    private readonly subscriptionSvc:   SubscriptionService,
-    private readonly config:            ConfigService,
+    private readonly aiEngineClient:  AiEngineClient,
+    private readonly quotaService:    QuotaService,
+    private readonly subscriptionSvc: SubscriptionService,
+    private readonly config:          ConfigService,
   ) {}
+
+  // ── Module init: injecter jobRepo dans QuotaService ───
+  onModuleInit(): void {
+    // Donne à QuotaService la capacité de compter les jobs actifs
+    // directement depuis la DB — source de vérité unique
+    this.quotaService.setJobRepository(this.jobRepo as any);
+    this.logger.log('JobsService: QuotaService jobRepo injected ✓');
+
+    // Nettoyer les stale jobs au démarrage
+    void this.cleanupStaleJobs();
+  }
+
+  // ── Stale job cleanup (scheduled every 5 minutes) ────
+  @Cron(CronExpression.EVERY_5_MINUTES)
+  async cleanupStaleJobs(): Promise<void> {
+    const staleThreshold = new Date(Date.now() - STALE_JOB_MINUTES * 60 * 1000);
+
+    try {
+      // Trouver les jobs bloqués (actifs mais pas mis à jour depuis STALE_JOB_MINUTES min)
+      const staleJobs = await this.jobRepo.find({
+        where: {
+          status:    In(ACTIVE_STATUSES),
+          updatedAt: LessThan(staleThreshold),
+        },
+        select: ['id', 'userId', 'status', 'updatedAt', 'type'],
+      });
+
+      if (staleJobs.length === 0) return;
+
+      this.logger.warn(
+        `[StaleCleanup] Found ${staleJobs.length} stale job(s) (inactive >${STALE_JOB_MINUTES}min): ` +
+        staleJobs.map(j => `${j.id}(${j.status})`).join(', '),
+      );
+
+      for (const job of staleJobs) {
+        await this.jobRepo.update(job.id, {
+          status:       JobStatus.FAILED,
+          errorMessage: `Job automatically failed: no activity for more than ${STALE_JOB_MINUTES} minutes. ` +
+                        `This typically means the AI Engine did not respond or the worker crashed. ` +
+                        `Please try again.`,
+          errorDetails: {
+            reason:          'stale_timeout',
+            lastStatus:      job.status,
+            staleThreshold:  staleThreshold.toISOString(),
+            detectedAt:      new Date().toISOString(),
+          },
+          completedAt: new Date(),
+        });
+        this.logger.warn(`[StaleCleanup] Job ${job.id} (${job.status}) marked FAILED (stale)`);
+      }
+    } catch (e) {
+      this.logger.error(`[StaleCleanup] Error: ${(e as Error).message}`);
+    }
+  }
 
   // ── Create + Enqueue ──────────────────────────────────
   async createJob(dto: StartConversionDto): Promise<JobEntity> {
@@ -60,32 +122,37 @@ export class JobsService {
     );
 
     // 1. Fetch user plan
-    this.logger.log(`${tag} Step 1/7: Fetching user plan…`);
+    this.logger.log(`${tag} Step 1/6: Fetching user plan…`);
     const plan   = await this.subscriptionSvc.getUserPlan(dto.userId);
     const limits = PLAN_LIMITS[plan];
     this.logger.log(`${tag} Plan: ${plan}`);
 
     // 2. Enforce monthly quota
-    this.logger.log(`${tag} Step 2/7: Enforcing monthly quota…`);
+    this.logger.log(`${tag} Step 2/6: Enforcing monthly quota…`);
     await this.quotaService.enforceConversionQuota(dto.userId, plan);
     this.logger.log(`${tag} Quota: OK`);
 
-    // 3. Enforce concurrent job limit
-    this.logger.log(`${tag} Step 3/7: Checking concurrent jobs…`);
+    // 3. Enforce concurrent job limit (source de vérité = DB)
+    this.logger.log(`${tag} Step 3/6: Checking concurrent jobs (DB count)…`);
     const concurrent = await this.quotaService.checkConcurrentJobs(dto.userId, plan);
     if (!concurrent.allowed) {
-      this.logger.warn(`${tag} Concurrent limit reached (${limits.concurrentJobs})`);
+      this.logger.warn(
+        `${tag} Concurrent limit: current=${concurrent.current} limit=${concurrent.limit}. ` +
+        `Check /dashboard/history to see active jobs.`,
+      );
       throw new ForbiddenException({
         code:    'CONCURRENT_LIMIT',
-        message: `Concurrent job limit reached (${limits.concurrentJobs}). Wait for a running job to finish.`,
+        message: `You already have ${concurrent.current} active job(s). ` +
+                 `Your ${plan} plan allows ${limits.concurrentJobs} concurrent job(s). ` +
+                 `Wait for the current job to complete or check the History page.`,
+        current: concurrent.current,
+        limit:   limits.concurrentJobs,
       });
     }
-    this.logger.log(`${tag} Concurrent: OK (${concurrent.current ?? 0}/${limits.concurrentJobs})`);
+    this.logger.log(`${tag} Concurrent: OK (${concurrent.current}/${limits.concurrentJobs} active)`);
 
     // 4. Validate framework access
-    // Free plan: Flutter → React / React Native only
-    // Pro+: all frameworks including React → Flutter, Express/Node → NestJS
-    this.logger.log(`${tag} Step 4/7: Validating framework access…`);
+    this.logger.log(`${tag} Step 4/6: Validating framework access…`);
     if (!limits.advancedFrameworks) {
       const srcNorm = dto.sourceLanguage.toLowerCase().replace(/[^a-z]/g, '');
       const tgtNorm = dto.targetLanguage.toLowerCase().replace(/[^a-z]/g, '');
@@ -101,10 +168,10 @@ export class JobsService {
         });
       }
     }
-    this.logger.log(`${tag} Framework: OK (${dto.sourceLanguage} → ${dto.targetLanguage})`);
+    this.logger.log(`${tag} Framework: OK`);
 
     // 5. Create DB record
-    this.logger.log(`${tag} Step 5/7: Creating job in database…`);
+    this.logger.log(`${tag} Step 5/6: Creating job in DB…`);
     const job = this.jobRepo.create({
       type:           dto.type,
       status:         JobStatus.PENDING,
@@ -120,13 +187,8 @@ export class JobsService {
     const saved = await this.jobRepo.save(job);
     this.logger.log(`${tag} Job created: id=${saved.id}`);
 
-    // 6. Track concurrent job
-    this.logger.log(`${tag} Step 6/7: Tracking concurrent job counter…`);
-    await this.quotaService.incrementConcurrentJobs(dto.userId, plan);
-
-    // 7. Enqueue with plan priority
-    // If Redis is absent, Bull throws — we catch it and mark job FAILED with a clear message
-    this.logger.log(`${tag} Step 7/7: Enqueueing job (priority=${limits.queuePriority})…`);
+    // 6. Enqueue with plan priority
+    this.logger.log(`${tag} Step 6/6: Enqueueing (priority=${limits.queuePriority})…`);
     try {
       await this.conversionQueue.add(
         'run-conversion',
@@ -139,23 +201,19 @@ export class JobsService {
           removeOnFail:     200,
         },
       );
-      this.logger.log(`${tag} Job ${saved.id} enqueued ✅ — plan=${plan} priority=${limits.queuePriority}`);
+      this.logger.log(`${tag} Job ${saved.id} enqueued ✅ plan=${plan}`);
     } catch (queueErr: unknown) {
       const qMsg = queueErr instanceof Error ? queueErr.message : String(queueErr);
       this.logger.error(`${tag} Queue unavailable (Redis?): ${qMsg}`);
 
-      // Decrement concurrent counter since job won't run
-      try {
-        await this.quotaService.decrementConcurrentJobs(dto.userId, plan);
-      } catch { /* ignore */ }
-
-      // Mark job as failed with a clear, actionable message
+      // Mark job as failed — concurrent count is DB-based so no need to decrement
       await this.jobRepo.update(saved.id, {
         status:       JobStatus.FAILED,
-        errorMessage: `Conversion queue unavailable: ${qMsg}. Redis may not be configured on this instance.`,
+        errorMessage: `Conversion queue unavailable: ${qMsg}. ` +
+                      `Redis may not be configured. Contact support.`,
         errorDetails: {
           cause:     qMsg,
-          hint:      'Ensure REDIS_URL environment variable is set, or contact support.',
+          hint:      'Set REDIS_URL environment variable or contact support.',
           timestamp: new Date().toISOString(),
         },
         completedAt: new Date(),
@@ -227,17 +285,18 @@ export class JobsService {
     });
   }
 
-  // ── Dispatch to AI Engine (via AiEngineClient) ────────
+  // ── Dispatch to AI Engine ─────────────────────────────
   async dispatchToAiEngine(
     job:         JobEntity,
     files:       Array<{ path: string; content: string }>,
     goalPrompt?: string,
   ): Promise<string> {
-    const apiUrl     = this.config.get<string>('API_URL', 'http://localhost:4000/api/v1');
+    const apiUrl      = this.config.get<string>('API_URL', 'http://localhost:4000/api/v1');
     const callbackUrl = `${apiUrl}/jobs/${job.id}/callback`;
 
     this.logger.log(
-      `[Job ${job.id}] dispatchToAiEngine: ${files.length} files, callback=${callbackUrl}, ` +
+      `[Job ${job.id}] dispatchToAiEngine: ${files.length} files ` +
+      `${job.sourceLanguage}→${job.targetLanguage}, callback=${callbackUrl}, ` +
       `mockMode=${this.aiEngineClient.isMockMode}`,
     );
 
@@ -250,8 +309,12 @@ export class JobsService {
       callbackUrl,
     });
 
+    // FIX: response est AiConvertResponse { jobId, accepted, message? }
+    // On retourne response.jobId (qui est string), pas l'objet entier
     const aiJobId = response.jobId ?? job.id;
-    this.logger.log(`[Job ${job.id}] AI Engine accepted: aiJobId=${aiJobId} accepted=${response.accepted}`);
+    this.logger.log(
+      `[Job ${job.id}] AI Engine accepted: aiJobId=${aiJobId} accepted=${response.accepted}`,
+    );
 
     return String(aiJobId);
   }
@@ -271,9 +334,8 @@ export class JobsService {
     const job = await this.findById(id);
     this.logger.log(`[Job ${id}] Callback received: success=${payload.success}`);
 
-    // Decrement concurrent job counter
+    // Get user plan for quota tracking
     const plan = await this.subscriptionSvc.getUserPlan(job.userId);
-    await this.quotaService.decrementConcurrentJobs(job.userId, plan);
 
     if (payload.success) {
       await this.updateStatus(id, JobStatus.DONE, {
@@ -286,7 +348,7 @@ export class JobsService {
       await this.appendLog(id, 'done', 'done',
         `Conversion complete: ${payload.filesGenerated ?? 0} files generated`,
       );
-      // Track successful conversion quota
+      // Track successful conversion (monthly quota)
       await this.quotaService.incrementConversions(job.userId, plan, {
         filesProcessed: payload.filesGenerated,
         linesProcessed: payload.linesGenerated,
@@ -303,14 +365,33 @@ export class JobsService {
     }
   }
 
+  // ── Manual reset stale (admin / user action) ──────────
+  async forceResetStaleJobsForUser(userId: string): Promise<number> {
+    const staleThreshold = new Date(Date.now() - STALE_JOB_MINUTES * 60 * 1000);
+    const staleJobs = await this.jobRepo.find({
+      where: {
+        userId,
+        status:    In(ACTIVE_STATUSES),
+        updatedAt: LessThan(staleThreshold),
+      },
+    });
+
+    for (const job of staleJobs) {
+      await this.jobRepo.update(job.id, {
+        status:       JobStatus.FAILED,
+        errorMessage: 'Manually reset: job was stuck and has been cleared.',
+        completedAt:  new Date(),
+      });
+    }
+    return staleJobs.length;
+  }
+
   // ── Cancel job ────────────────────────────────────────
   async cancel(id: string, userId: string): Promise<void> {
     const job = await this.findById(id);
     if (job.userId !== userId) throw new NotFoundException(`Job ${id} not found`);
     if ([JobStatus.DONE, JobStatus.FAILED].includes(job.status)) return;
 
-    const plan = await this.subscriptionSvc.getUserPlan(userId);
-    await this.quotaService.decrementConcurrentJobs(userId, plan);
     await this.updateStatus(id, JobStatus.FAILED, { errorMessage: 'Cancelled by user' });
     this.logger.log(`[Job ${id}] Cancelled by user ${userId}`);
   }

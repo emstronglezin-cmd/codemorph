@@ -1,8 +1,10 @@
 // ============================================================
 // CodeMorph — Jobs Controller
-// FIX: CurrentUser retourne JwtPayload avec .sub (pas .id)
-// FIX: POST /jobs/start/url implémenté (téléchargement URL publique)
-// FIX: Logs détaillés à chaque étape
+// PHASE 7 FIX:
+//   - POST /jobs/start/url implémenté
+//   - POST /jobs/reset-stale : libère les jobs bloqués
+//   - GET /jobs/stats : stats pour la page Historique
+//   - Logs détaillés
 // ============================================================
 import {
   Controller,
@@ -49,20 +51,40 @@ export class JobsController {
     @CurrentUser() user: JwtPayload,
   ) {
     const userId = user.sub as string;
-    this.logger.log(`[POST /jobs] userId=${userId} type=${body.type} src=${body.sourceLanguage} tgt=${body.targetLanguage}`);
+    this.logger.log(`[POST /jobs] userId=${userId} type=${body.type}`);
     return this.jobsService.createJob({ ...body, userId });
   }
 
   @Get()
   @ApiOperation({ summary: 'List jobs for current user' })
-  @ApiQuery({ name: 'page', required: false, type: Number })
-  @ApiQuery({ name: 'limit', required: false, type: Number })
+  @ApiQuery({ name: 'page',   required: false, type: Number })
+  @ApiQuery({ name: 'limit',  required: false, type: Number })
+  @ApiQuery({ name: 'status', required: false, type: String })
   async findAll(
     @CurrentUser() user: JwtPayload,
-    @Query('page', new DefaultValuePipe(1), ParseIntPipe) page: number,
+    @Query('page',  new DefaultValuePipe(1),  ParseIntPipe) page:  number,
     @Query('limit', new DefaultValuePipe(20), ParseIntPipe) limit: number,
   ) {
     return this.jobsService.findByUser(user.sub as string, page, limit);
+  }
+
+  @Get('stats')
+  @ApiOperation({ summary: 'Get job statistics for the current user (for History page)' })
+  async getStats(@CurrentUser() user: JwtPayload) {
+    const userId = user.sub as string;
+    const { data, total } = await this.jobsService.findByUser(userId, 1, 1000);
+
+    const stats = {
+      total,
+      pending:    data.filter(j => j.status === 'pending').length,
+      analyzing:  data.filter(j => j.status === 'analyzing').length,
+      converting: data.filter(j => j.status === 'converting').length,
+      done:       data.filter(j => j.status === 'done').length,
+      failed:     data.filter(j => j.status === 'failed').length,
+      active:     data.filter(j => ['pending', 'analyzing', 'converting'].includes(j.status)).length,
+    };
+
+    return stats;
   }
 
   @Get(':id')
@@ -92,6 +114,21 @@ export class JobsController {
     @CurrentUser() user: JwtPayload,
   ) {
     await this.jobsService.cancel(id, user.sub as string);
+  }
+
+  // ── Reset stale jobs for user ──────────────────────────
+  @Post('reset-stale')
+  @ApiOperation({ summary: 'Reset stuck/stale jobs for current user (frees concurrent quota)' })
+  async resetStale(@CurrentUser() user: JwtPayload) {
+    const userId = user.sub as string;
+    this.logger.log(`[reset-stale] userId=${userId}`);
+    const count = await this.jobsService.forceResetStaleJobsForUser(userId);
+    return {
+      message: count > 0
+        ? `${count} stale job(s) have been cleared. You can now start new conversions.`
+        : 'No stale jobs found. All your jobs are either active or already completed.',
+      cleared: count,
+    };
   }
 
   // ── Callback from AI Engine (public) ──────────────────
@@ -133,24 +170,14 @@ export class JobsController {
   ) {
     const userId = user.sub as string;
 
-    // Validate required fields
     if (!body.repo?.trim()) {
-      throw new BadRequestException({
-        code:    'MISSING_REPO',
-        message: 'GitHub repository is required (e.g. "owner/repo").',
-      });
+      throw new BadRequestException({ code: 'MISSING_REPO', message: 'GitHub repository is required (e.g. "owner/repo").' });
     }
     if (!body.sourceLanguage?.trim() || !body.targetLanguage?.trim()) {
-      throw new BadRequestException({
-        code:    'MISSING_LANGUAGES',
-        message: 'sourceLanguage and targetLanguage are required.',
-      });
+      throw new BadRequestException({ code: 'MISSING_LANGUAGES', message: 'sourceLanguage and targetLanguage are required.' });
     }
 
-    this.logger.log(
-      `[start/github] userId=${userId} repo=${body.repo} branch=${body.branch ?? 'main'} ` +
-      `src=${body.sourceLanguage} tgt=${body.targetLanguage}`,
-    );
+    this.logger.log(`[start/github] userId=${userId} repo=${body.repo} branch=${body.branch ?? 'main'}`);
 
     return this.jobsService.createJob({
       userId,
@@ -180,24 +207,14 @@ export class JobsController {
   ) {
     const userId = user.sub as string;
 
-    // Validate required fields
     if (!body.zipPath?.trim()) {
-      throw new BadRequestException({
-        code:    'MISSING_ZIP_PATH',
-        message: 'zipPath is required. Upload your ZIP file first via POST /uploads/zip.',
-      });
+      throw new BadRequestException({ code: 'MISSING_ZIP_PATH', message: 'zipPath is required. Upload your ZIP first via POST /uploads/zip.' });
     }
     if (!body.sourceLanguage?.trim() || !body.targetLanguage?.trim()) {
-      throw new BadRequestException({
-        code:    'MISSING_LANGUAGES',
-        message: 'sourceLanguage and targetLanguage are required.',
-      });
+      throw new BadRequestException({ code: 'MISSING_LANGUAGES', message: 'sourceLanguage and targetLanguage are required.' });
     }
 
-    this.logger.log(
-      `[start/zip] userId=${userId} zipPath=${body.zipPath} ` +
-      `src=${body.sourceLanguage} tgt=${body.targetLanguage}`,
-    );
+    this.logger.log(`[start/zip] userId=${userId} zipPath=${body.zipPath}`);
 
     return this.jobsService.createJob({
       userId,
@@ -212,7 +229,7 @@ export class JobsController {
 
   // ── Quick-start: from public URL ───────────────────────
   @Post('start/url')
-  @ApiOperation({ summary: 'Start conversion from public ZIP/repository URL' })
+  @ApiOperation({ summary: 'Start conversion from public ZIP URL' })
   async startFromUrl(
     @Body()
     body: {
@@ -226,47 +243,25 @@ export class JobsController {
   ) {
     const userId = user.sub as string;
 
-    // Validate required fields
     if (!body.sourceUrl?.trim()) {
-      throw new BadRequestException({
-        code:    'MISSING_SOURCE_URL',
-        message: 'sourceUrl is required. Provide a public URL pointing to a ZIP archive.',
-      });
+      throw new BadRequestException({ code: 'MISSING_SOURCE_URL', message: 'sourceUrl is required.' });
     }
     if (!body.sourceLanguage?.trim() || !body.targetLanguage?.trim()) {
-      throw new BadRequestException({
-        code:    'MISSING_LANGUAGES',
-        message: 'sourceLanguage and targetLanguage are required.',
-      });
+      throw new BadRequestException({ code: 'MISSING_LANGUAGES', message: 'sourceLanguage and targetLanguage are required.' });
     }
 
-    // Validate URL format
     let parsedUrl: URL;
-    try {
-      parsedUrl = new URL(body.sourceUrl.trim());
-    } catch {
-      throw new BadRequestException({
-        code:    'INVALID_URL',
-        message: `Invalid URL: "${body.sourceUrl}". Please provide a valid public URL (https://...).`,
-      });
+    try { parsedUrl = new URL(body.sourceUrl.trim()); } catch {
+      throw new BadRequestException({ code: 'INVALID_URL', message: `Invalid URL: "${body.sourceUrl}"` });
     }
-
     if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
-      throw new BadRequestException({
-        code:    'INVALID_URL_PROTOCOL',
-        message: 'Only http:// and https:// URLs are supported.',
-      });
+      throw new BadRequestException({ code: 'INVALID_URL_PROTOCOL', message: 'Only http:// and https:// URLs are supported.' });
     }
 
-    this.logger.log(
-      `[start/url] userId=${userId} url=${body.sourceUrl} ` +
-      `src=${body.sourceLanguage} tgt=${body.targetLanguage}`,
-    );
+    this.logger.log(`[start/url] userId=${userId} url=${body.sourceUrl}`);
 
-    // Download + save the ZIP from the public URL
-    this.logger.log(`[start/url] Downloading ZIP from: ${body.sourceUrl}`);
     const zipPath = await this.uploadsService.downloadFromUrl(body.sourceUrl.trim());
-    this.logger.log(`[start/url] ZIP downloaded and saved at: ${zipPath}`);
+    this.logger.log(`[start/url] Downloaded to: ${zipPath}`);
 
     return this.jobsService.createJob({
       userId,
