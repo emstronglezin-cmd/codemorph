@@ -382,8 +382,30 @@ export class JobsService implements OnModuleInit {
         errorMessage: 'Manually reset: job was stuck and has been cleared.',
         completedAt:  new Date(),
       });
+      this.logger.warn(`[reset-stale] Job ${job.id} (${job.status}) force-reset for user ${userId}`);
     }
     return staleJobs.length;
+  }
+
+  // ── Reset ALL active jobs (admin) ─────────────────────
+  // Remet TOUS les jobs actifs en FAILED sans aucun filtre utilisateur
+  // Utile pour nettoyer lors d'un redéploiement ou d'une migration
+  async resetAllActiveJobs(): Promise<number> {
+    const allActive = await this.jobRepo.find({
+      where: { status: In(ACTIVE_STATUSES) },
+      select: ['id', 'userId', 'status'],
+    });
+
+    for (const job of allActive) {
+      await this.jobRepo.update(job.id, {
+        status:       JobStatus.FAILED,
+        errorMessage: 'Admin reset: all active jobs have been cleared by an administrator.',
+        completedAt:  new Date(),
+      });
+    }
+
+    this.logger.warn(`[reset-all] Admin reset ${allActive.length} active job(s) to FAILED`);
+    return allActive.length;
   }
 
   // ── Cancel job ────────────────────────────────────────

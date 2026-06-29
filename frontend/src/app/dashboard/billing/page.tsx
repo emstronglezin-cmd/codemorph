@@ -79,6 +79,7 @@ function BillingContent() {
   const currentPlan   = (user?.plan as string) ?? 'free';
 
   const [loading, setLoading]   = useState<string | null>(null);
+  const [loadStep, setLoadStep] = useState<string>('');
   const [error, setError]       = useState('');
   const [toastType, setToastType] = useState<'success' | 'canceled' | null>(null);
 
@@ -96,24 +97,55 @@ function BillingContent() {
   const handleUpgrade = async (planId: string) => {
     if (loading) return;
     setLoading(planId);
+    setLoadStep('Création du paiement…');
     setError('');
+
+    // Timeout global 15 secondes
+    const timeoutId = setTimeout(() => {
+      setError('Délai dépassé (15s). Vérifiez votre connexion et réessayez.');
+      setLoading(null);
+      setLoadStep('');
+    }, 15_000);
 
     try {
       const token = getAccessToken();
       if (!token) {
+        clearTimeout(timeoutId);
         setError('Session expirée. Reconnectez-vous.');
         setLoading(null);
+        setLoadStep('');
         return;
       }
 
-      const res = await fetch(`${API_URL}/payments/checkout`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({ planId }),
-      });
+      setLoadStep('Connexion au serveur de paiement…');
+
+      const controller = new AbortController();
+      const abortTimeout = setTimeout(() => controller.abort(), 14_000);
+
+      let res: Response;
+      try {
+        res = await fetch(`${API_URL}/payments/checkout`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({ planId }),
+          signal: controller.signal,
+        });
+      } catch (fetchErr: unknown) {
+        clearTimeout(abortTimeout);
+        clearTimeout(timeoutId);
+        const isAbort = fetchErr instanceof Error && fetchErr.name === 'AbortError';
+        setError(isAbort
+          ? 'Délai dépassé. Le serveur de paiement ne répond pas. Réessayez dans quelques instants.'
+          : 'Erreur réseau. Vérifiez votre connexion et réessayez.'
+        );
+        setLoading(null);
+        setLoadStep('');
+        return;
+      }
+      clearTimeout(abortTimeout);
 
       const data = await res.json() as {
         data?: { payment_url?: string; checkoutUrl?: string; url?: string };
@@ -121,19 +153,23 @@ function BillingContent() {
         checkoutUrl?: string;
         url?: string;
         message?: string;
+        success?: boolean;
       };
 
       if (!res.ok) {
-        // Si les clés LeekPay ne sont pas encore configurées
-        const msg = data?.message ?? `Erreur ${res.status}`;
+        clearTimeout(timeoutId);
+        const msg = (data?.success === false ? data?.message : null) ?? data?.message ?? `Erreur ${res.status}`;
         if (msg.includes('Plan inconnu') || res.status === 400) {
           setError(`Plan "${planId}" non reconnu par le serveur.`);
         } else if (res.status === 401 || res.status === 403) {
           setError('Session expirée. Reconnectez-vous.');
+        } else if (msg.includes('LEEKPAY') || msg.includes('non configuré') || msg.includes('manquante')) {
+          setError(`Paiement non disponible : ${msg}`);
         } else {
-          setError(`Erreur paiement : ${msg}. Vérifiez que LEEKPAY_SECRET_KEY est configuré sur Render.`);
+          setError(`Erreur paiement : ${msg}`);
         }
         setLoading(null);
+        setLoadStep('');
         return;
       }
 
@@ -147,18 +183,26 @@ function BillingContent() {
         data?.url;
 
       if (!paymentUrl) {
-        setError('URL de paiement manquante dans la réponse. Vérifiez la configuration LeekPay.');
+        clearTimeout(timeoutId);
+        setError('URL de paiement manquante dans la réponse. Vérifiez la configuration LeekPay sur Render.');
         setLoading(null);
+        setLoadStep('');
         return;
       }
 
+      // Afficher l'étape finale avant redirection
+      clearTimeout(timeoutId);
+      setLoadStep('Redirection vers LeekPay…');
       // Redirection vers la page de paiement LeekPay
-      // (pas d'iframe — cf. doc LeekPay : "Ne pas intégrer en iframe")
       window.location.href = paymentUrl;
+      // Note: loading reste true intentionnellement pendant la redirection
 
-    } catch {
-      setError('Erreur réseau. Vérifiez votre connexion et réessayez.');
+    } catch (err: unknown) {
+      clearTimeout(timeoutId);
+      const msg = err instanceof Error ? err.message : 'Erreur inconnue';
+      setError(`Erreur : ${msg}`);
       setLoading(null);
+      setLoadStep('');
     }
   };
 
@@ -308,7 +352,7 @@ function BillingContent() {
                         <svg className="h-4 w-4 animate-spin" viewBox="0 0 24 24" fill="none">
                           <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" strokeDasharray="60" strokeDashoffset="20" />
                         </svg>
-                        Redirection…
+                        {loadStep || 'Traitement…'}
                       </span>
                     ) : (
                       <>{plan.cta}<ArrowRight className="h-4 w-4" /></>

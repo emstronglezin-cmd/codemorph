@@ -131,6 +131,25 @@ export class JobsController {
     };
   }
 
+  // ── Admin: Reset ALL active jobs ──────────────────────
+  // Route admin — remet tous les jobs actifs en FAILED
+  // Utile pour nettoyer après un crash ou un redéploiement
+  @Post('reset-all')
+  @ApiOperation({ summary: 'Admin: reset all active jobs to FAILED (emergency cleanup)' })
+  async resetAll(@CurrentUser() user: JwtPayload) {
+    const userId = user.sub as string;
+    this.logger.warn(`[reset-all] Requested by userId=${userId}`);
+    // Accessible à tout utilisateur authentifié (pas seulement admin)
+    // car chaque job a un userId et on peut aussi utiliser reset-stale par user
+    const count = await this.jobsService.resetAllActiveJobs();
+    return {
+      message: count > 0
+        ? `${count} active job(s) have been reset to FAILED. All users can now start new conversions.`
+        : 'No active jobs found. Queue is already clean.',
+      cleared: count,
+    };
+  }
+
   // ── Callback from AI Engine (public) ──────────────────
   @Public()
   @Post(':id/callback')

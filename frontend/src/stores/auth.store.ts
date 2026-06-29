@@ -1,8 +1,11 @@
 // ============================================================
 // CodeMorph — Auth Store (Zustand + persist)
-// FIX: setAuth synchronise localStorage + window
-//      clearAuth nettoie tous les stockages
-//      refreshAuth utilise l'API client (Bearer token)
+// FIX CRITIQUE:
+//   - setAuth synchronise localStorage + window
+//   - clearAuth nettoie tous les stockages
+//   - refreshAuth utilise cookie httpOnly (withCredentials)
+//   - onRehydrateStorage: vérifie l'expiry JWT au rechargement
+//     → si expiré: tente refresh → si échec: clearAuth
 // ============================================================
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
@@ -30,6 +33,24 @@ interface AuthState {
   signUp:       (name: string, email: string, password: string) => Promise<void>;
   signOut:      ()                                       => Promise<void>;
   refreshAuth:  ()                                       => Promise<boolean>;
+}
+
+/** Décode le payload JWT sans vérifier la signature */
+function decodeJwt(token: string): { exp?: number } | null {
+  try {
+    const parts = token.split('.');
+    if (parts.length !== 3) return null;
+    const base64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+    const padded  = base64.padEnd(base64.length + (4 - base64.length % 4) % 4, '=');
+    return JSON.parse(atob(padded)) as { exp?: number };
+  } catch { return null; }
+}
+
+/** Retourne true si le token est expiré */
+function isExpired(token: string): boolean {
+  const p = decodeJwt(token);
+  if (!p?.exp) return true;
+  return p.exp < Math.floor(Date.now() / 1000);
 }
 
 export const useAuthStore = create<AuthState>()(
@@ -60,7 +81,7 @@ export const useAuthStore = create<AuthState>()(
           const res = await fetch(`${API}/auth/sign-in`, {
             method:      'POST',
             headers:     { 'Content-Type': 'application/json' },
-            credentials: 'omit',
+            credentials: 'include',
             body:        JSON.stringify({ email, password }),
           });
           const data = await res.json() as {
@@ -85,7 +106,7 @@ export const useAuthStore = create<AuthState>()(
           const res = await fetch(`${API}/auth/sign-up`, {
             method:      'POST',
             headers:     { 'Content-Type': 'application/json' },
-            credentials: 'omit',
+            credentials: 'include',
             body:        JSON.stringify({ name, email, password, acceptTerms: true }),
           });
           const data = await res.json() as {
@@ -109,7 +130,9 @@ export const useAuthStore = create<AuthState>()(
           await apiPost('/auth/sign-out').catch(() => null);
         } finally {
           get().clearAuth();
-          window.location.replace('/auth/sign-in');
+          if (typeof window !== 'undefined') {
+            window.location.replace('/auth/sign-in');
+          }
         }
       },
 
@@ -142,12 +165,46 @@ export const useAuthStore = create<AuthState>()(
         accessToken:     state.accessToken,
         isAuthenticated: state.isAuthenticated,
       }),
-      // Au rechargement de la page : resynchroniser window depuis localStorage
-      onRehydrateStorage: () => (state) => {
-        if (state?.accessToken) {
-          setAccessToken(state.accessToken);
+      // Au rechargement de la page : vérifier l'expiry du token
+      onRehydrateStorage: () => (state, error) => {
+        if (error || !state) return;
+
+        if (state.accessToken) {
+          // Token présent — vérifier si expiré
+          if (isExpired(state.accessToken)) {
+            // Token expiré → tenter refresh silencieux
+            const API = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:4000/api/v1';
+            void fetch(`${API}/auth/refresh`, {
+              method:      'POST',
+              credentials: 'include',
+              headers:     { 'Content-Type': 'application/json' },
+              body:        '{}',
+            }).then(async (res) => {
+              if (!res.ok) {
+                // Refresh échoué → nettoyer le store
+                state.clearAuth?.();
+                return;
+              }
+              const data = await res.json() as {
+                data?: { tokens?: { accessToken?: string } };
+                tokens?: { accessToken?: string };
+              };
+              const newToken = data?.data?.tokens?.accessToken ?? data?.tokens?.accessToken;
+              if (newToken && state.user) {
+                state.setAuth?.(state.user, newToken);
+              } else {
+                state.clearAuth?.();
+              }
+            }).catch(() => {
+              // Ignorer silencieusement — le AuthGuard du layout gérera
+            });
+          } else {
+            // Token valide → synchroniser window
+            setAccessToken(state.accessToken);
+          }
         }
       },
     },
   ),
 );
+

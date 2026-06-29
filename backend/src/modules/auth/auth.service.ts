@@ -6,6 +6,7 @@ import {
   UnauthorizedException,
   ConflictException,
   NotFoundException,
+  Logger,
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
@@ -19,6 +20,8 @@ import type { SignInDto } from './dto/sign-in.dto';
 
 @Injectable()
 export class AuthService {
+  private readonly logger = new Logger(AuthService.name);
+
   constructor(
     private readonly usersService: UsersService,
     private readonly jwtService:   JwtService,
@@ -185,7 +188,23 @@ export class AuthService {
     plan: string;
   }): Promise<AuthTokens> {
     await this.usersService.updateLastLogin(user.id as UserId);
-    return this.generateTokens(user);
+    const tokens = await this.generateTokens(user);
+    this.logger.log(`[OAuth] JWT issued for user=${user.id} email=${user.email} expiresIn=${tokens.expiresIn}s`);
+    return tokens;
+  }
+
+  // ── Parse expiry string to milliseconds ─────────────
+  private parseExpiry(exp: string): number {
+    const match = /^(\d+)(s|m|h|d)$/.exec(exp);
+    if (!match) return 7 * 24 * 3600 * 1000; // fallback 7d
+    const value = parseInt(match[1], 10);
+    switch (match[2]) {
+      case 's': return value * 1000;
+      case 'm': return value * 60 * 1000;
+      case 'h': return value * 3600 * 1000;
+      case 'd': return value * 86400 * 1000;
+      default:  return 7 * 24 * 3600 * 1000;
+    }
   }
 
   // ── Generate tokens ───────────────────────────────────
@@ -202,21 +221,33 @@ export class AuthService {
       plan:  user.plan as JwtPayload['plan'],
     };
 
+    // ── FIX CRITIQUE : toujours lire depuis la config (jwt.config.ts)
+    // jwt.config.ts lit JWT_EXPIRES_IN (env) avec défaut '7d'
+    // NE PAS mettre de fallback court ('15m') ici — cela override la config
+    const accessExpiresIn  = this.config.get<string>('jwt.expiresIn')  ?? '7d';
+    const refreshExpiresIn = this.config.get<string>('jwt.refreshExpiresIn') ?? '30d';
+
+    this.logger.debug(`[generateTokens] accessExpiresIn=${accessExpiresIn} refreshExpiresIn=${refreshExpiresIn}`);
+
     const [accessToken, refreshToken] = await Promise.all([
       this.jwtService.signAsync(payload, {
         secret:    this.config.get<string>('jwt.secret'),
-        expiresIn: this.config.get<string>('jwt.expiresIn', '15m'),
+        expiresIn: accessExpiresIn,
       }),
       this.jwtService.signAsync(payload, {
         secret:    this.config.get<string>('jwt.refreshSecret'),
-        expiresIn: this.config.get<string>('jwt.refreshExpiresIn', '7d'),
+        expiresIn: refreshExpiresIn,
       }),
     ]);
+
+    // Calculer expiresIn en secondes selon la config réelle
+    // Pour éviter la confusion entre la valeur retournée et la valeur réelle
+    const accessExpMs = this.parseExpiry(accessExpiresIn);
 
     return {
       accessToken,
       refreshToken,
-      expiresIn: 7 * 24 * 3600, // 7 jours en secondes
+      expiresIn: Math.floor(accessExpMs / 1000),
       tokenType: 'Bearer',
     };
   }

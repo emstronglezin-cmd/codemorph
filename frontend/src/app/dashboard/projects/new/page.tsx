@@ -150,10 +150,23 @@ export default function NewProjectPage() {
   // ── GitHub status check ─────────────────────────────────
   const checkGithub = useCallback(async () => {
     try {
-      const res = await fetch(`${BACKEND}/auth/github-status`, { headers: authHeaders() });
-      if (!res.ok) { setGithubConnected(false); return; }
-      const d = await res.json() as { data?: { connected?: boolean }; connected?: boolean };
-      setGithubConnected(d?.data?.connected ?? d?.connected ?? false);
+      const controller = new AbortController();
+      const t = setTimeout(() => controller.abort(), 10_000); // 10s timeout
+      try {
+        const res = await fetch(`${BACKEND}/auth/github-status`, {
+          headers: authHeaders(),
+          signal: controller.signal,
+        });
+        clearTimeout(t);
+        if (!res.ok) { setGithubConnected(false); return; }
+        const d = await res.json() as { data?: { connected?: boolean }; connected?: boolean };
+        setGithubConnected(d?.data?.connected ?? d?.connected ?? false);
+      } catch (err) {
+        clearTimeout(t);
+        const isAbort = err instanceof Error && err.name === 'AbortError';
+        setGithubConnected(false);
+        if (!isAbort) console.warn('[checkGithub] error:', err);
+      }
     } catch { setGithubConnected(false); }
   }, []);
 
@@ -161,13 +174,19 @@ export default function NewProjectPage() {
   const fetchRepos = useCallback(async (p: number, q: string, f: string) => {
     setGhLoading(true);
     setGhError('');
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), 30_000); // 30s timeout
     try {
       const params = new URLSearchParams({
         page: String(p), per_page: '24',
         ...(q ? { search: q } : {}),
         ...(f !== 'all' ? { type: f } : {}),
       });
-      const res  = await fetch(`${BACKEND}/auth/github-repos?${params}`, { headers: authHeaders() });
+      const res  = await fetch(`${BACKEND}/auth/github-repos?${params}`, {
+        headers: authHeaders(),
+        signal: controller.signal,
+      });
+      clearTimeout(t);
       const body = await res.json() as Record<string, unknown>;
 
       if (!res.ok) {
@@ -187,7 +206,12 @@ export default function NewProjectPage() {
       setGhRepos(list);
       setGhHasMore(more);
     } catch (e) {
-      setGhError(String(e));
+      clearTimeout(t);
+      const isAbort = e instanceof Error && e.name === 'AbortError';
+      setGhError(isAbort
+        ? 'Délai dépassé (30s). GitHub API ne répond pas. Vérifiez votre connexion et réessayez.'
+        : String(e)
+      );
     } finally {
       setGhLoading(false);
     }
