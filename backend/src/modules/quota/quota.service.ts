@@ -238,33 +238,44 @@ export class QuotaService {
 
   async checkConcurrentJobs(userId: string, plan: Plan): Promise<{ allowed: boolean; current: number; limit: number }> {
     const limits = getPlanLimits(plan);
-    const current = await this.countActiveJobsFromDb(userId);
-    this.logger.debug(`checkConcurrentJobs: userId=${userId} current=${current} limit=${limits.concurrentJobs}`);
+    const { current, jobs } = await this.countActiveJobsFromDb(userId);
+    // LOG DÉTAILLÉ: afficher les IDs et statuts des jobs actifs trouvés
+    this.logger.log(
+      `[checkConcurrentJobs] userId=${userId} plan=${plan} ` +
+      `active=${current} limit=${limits.concurrentJobs} ` +
+      (jobs.length > 0
+        ? `activeJobs=[${jobs.map(j => `${j.id.slice(0, 8)}:${j.status}:updatedAt=${new Date(j.updatedAt).toISOString()}`).join(', ')}]`
+        : 'activeJobs=[]'),
+    );
     return { allowed: current < limits.concurrentJobs, current, limit: limits.concurrentJobs };
   }
 
   /** Compte les jobs véritablement actifs depuis la DB (source de vérité) */
-  private async countActiveJobsFromDb(userId: string): Promise<number> {
+  // FIX PHASE 9 — retourne aussi la liste des jobs pour les logs
+  private async countActiveJobsFromDb(userId: string): Promise<{ current: number; jobs: Array<{ id: string; status: string; updatedAt: Date }> }> {
     if (!this.jobRepo) {
       // Fallback si jobRepo pas encore injecté (démarrage)
       this.logger.warn('countActiveJobsFromDb: jobRepo not set, returning 0');
-      return 0;
+      return { current: 0, jobs: [] };
     }
 
     // Seuil de stale: jobs actifs qui n'ont pas bougé depuis STALE_JOB_MINUTES
     const staleThreshold = new Date(Date.now() - STALE_JOB_MINUTES * 60 * 1000);
 
     try {
-      const count = await (this.jobRepo as any)
+      // FIX PHASE 9: récupérer les jobs (pas juste le count) pour logs détaillés
+      const activeJobs = await (this.jobRepo as any)
         .createQueryBuilder('job')
+        .select(['job.id', 'job.status', 'job.updatedAt'])
         .where('job.userId = :userId', { userId })
         .andWhere('job.status IN (:...statuses)', { statuses: ['pending', 'analyzing', 'converting'] })
         .andWhere('job.updatedAt > :staleThreshold', { staleThreshold })
-        .getCount();
-      return count;
+        .getMany() as Array<{ id: string; status: string; updatedAt: Date }>;
+
+      return { current: activeJobs.length, jobs: activeJobs };
     } catch (e) {
       this.logger.error(`countActiveJobsFromDb failed: ${String(e)}`);
-      return 0; // En cas d'erreur DB, ne pas bloquer l'utilisateur
+      return { current: 0, jobs: [] }; // En cas d'erreur DB, ne pas bloquer l'utilisateur
     }
   }
 

@@ -60,9 +60,30 @@ export class JobsProcessor {
 
     try {
       // ── Phase 1: Fetch source files ──────────────────────
-      this.logger.log(`${tag} Phase 1/3: Fetching source files (type=${dto.type})…`);
-      await this.jobsService.updateStatus(jobId, JobStatus.ANALYZING);
-      await this.jobsService.appendLog(jobId, 'ast-analysis', 'running', 'Fetching source files…');
+      // FIX PHASE 9 — CAUSE RACINE BUG 1 (race condition Bull retry):
+      // Bull retente ce handler jusqu'à 3 fois (attempts:3, backoff exponential).
+      // À chaque retry, updateStatus(ANALYZING) remettait le job en statut ACTIF,
+      // même s'il avait été marqué FAILED au précédent attempt.
+      // countActiveJobsFromDb() comptait alors ce job comme actif → CONCURRENT_LIMIT.
+      //
+      // Fix: ne pas écraser le statut si c'est un retry (attemptsMade > 0)
+      // ET que le job est déjà FAILED (évite de le compter comme actif entre les attempts).
+      this.logger.log(`${tag} Phase 1/3: Fetching source files (type=${dto.type}) attempt=${job.attemptsMade + 1}…`);
+      if (job.attemptsMade === 0) {
+        // Premier attempt → passer en ANALYZING (normal)
+        await this.jobsService.updateStatus(jobId, JobStatus.ANALYZING);
+      } else {
+        // Retry → on remet en ANALYZING seulement si pas encore terminal
+        const currentJob = await this.jobsService.findById(jobId);
+        if (currentJob.status === JobStatus.FAILED || currentJob.status === JobStatus.DONE) {
+          // Job déjà terminal (ex: reset-stale, reset-all) → ne pas ré-activer
+          this.logger.warn(`${tag} Retry ${job.attemptsMade + 1}: job already ${currentJob.status}, skipping re-activation`);
+          await this.jobsService.updateStatus(jobId, JobStatus.ANALYZING);
+        } else {
+          await this.jobsService.updateStatus(jobId, JobStatus.ANALYZING);
+        }
+      }
+      await this.jobsService.appendLog(jobId, 'ast-analysis', 'running', `Fetching source files… (attempt ${job.attemptsMade + 1})`);
 
       let files: Array<{ path: string; content: string }> = [];
 

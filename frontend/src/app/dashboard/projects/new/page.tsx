@@ -148,26 +148,62 @@ export default function NewProjectPage() {
   const searchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // ── GitHub status check ─────────────────────────────────
+  // FIX PHASE 9 — BUG 2 CAUSE RACINE B:
+  // Avant: timeout 10s → Render cold start 25-60s → AbortError → githubConnected=false silencieux.
+  // L'utilisateur voyait "Connect GitHub" même s'il était déjà connecté,
+  // ce qui déclenchait un OAuth redirect vers un Render encore endormi → "Load failed".
+  //
+  // Fix:
+  //   - Timeout 45s (couvre cold start Render)
+  //   - Retry sur AbortError (jusqu'à 2 fois) avec message "Démarrage du backend…"
+  //   - setGithubConnected(null) pendant la 2ème tentative pour garder le spinner
   const checkGithub = useCallback(async () => {
-    try {
+    const MAX_RETRIES = 2;
+    setGhError(''); // Réinitialiser l'erreur au début de chaque vérification
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      // Sur retry, afficher un message dans l'UI que le backend démarre
+      if (attempt > 0) {
+        setGhError(`Démarrage du backend en cours… (tentative ${attempt + 1}/${MAX_RETRIES + 1}). Render peut prendre jusqu'à 60s au démarrage.`);
+      }
       const controller = new AbortController();
-      const t = setTimeout(() => controller.abort(), 10_000); // 10s timeout
+      // 45s timeout : couvre le cold start Render (25-60s en free tier)
+      const t = setTimeout(() => controller.abort(), 45_000);
       try {
         const res = await fetch(`${BACKEND}/auth/github-status`, {
           headers: authHeaders(),
           signal: controller.signal,
         });
         clearTimeout(t);
-        if (!res.ok) { setGithubConnected(false); return; }
+        if (!res.ok) {
+          // Réponse reçue mais erreur HTTP → backend réveillé mais erreur (401, 500...)
+          // On marque non-connecté mais on log pour diagnostic
+          console.warn(`[checkGithub] HTTP ${res.status} from github-status`);
+          setGhError('');
+          setGithubConnected(false);
+          return;
+        }
         const d = await res.json() as { data?: { connected?: boolean }; connected?: boolean };
+        setGhError('');
         setGithubConnected(d?.data?.connected ?? d?.connected ?? false);
+        return; // Succès → sortir
       } catch (err) {
         clearTimeout(t);
         const isAbort = err instanceof Error && err.name === 'AbortError';
+        if (isAbort && attempt < MAX_RETRIES) {
+          // Timeout → backend encore endormi → on retente
+          console.warn(`[checkGithub] attempt ${attempt + 1} timeout, retrying…`);
+          continue;
+        }
+        // Dernière tentative échouée ou erreur non-AbortError
+        const reason = isAbort
+          ? 'Délai dépassé (45s × 2). Le backend Render ne répond pas. Réessayez dans quelques secondes.'
+          : `Erreur réseau: ${(err as Error).message ?? String(err)}`;
+        setGhError(reason);
         setGithubConnected(false);
-        if (!isAbort) console.warn('[checkGithub] error:', err);
+        console.warn('[checkGithub] final error:', err);
+        return;
       }
-    } catch { setGithubConnected(false); }
+    }
   }, []);
 
   // ── Fetch GitHub repos ──────────────────────────────────
@@ -190,12 +226,21 @@ export default function NewProjectPage() {
       const body = await res.json() as Record<string, unknown>;
 
       if (!res.ok) {
+        // FIX PHASE 9 — BUG 2:
+        // Avant: AllExceptionsFilter écrasait le code métier → code='GEN_003' au lieu de 'GITHUB_NOT_CONNECTED'.
+        // La condition code === 'GITHUB_NOT_CONNECTED' ne se déclenchait jamais → setGhError(msg) générique.
+        // Maintenant que AllExceptionsFilter est corrigé, body['code'] = 'GITHUB_NOT_CONNECTED' correctement.
+        //
+        // On affiche aussi le code HTTP pour faciliter le diagnostic (401, 403, 404, 500...).
         const msg  = (body['message'] as string | undefined) ?? 'Failed to load repositories';
         const code = (body['code'] as string | undefined) ?? '';
         if (code === 'GITHUB_NOT_CONNECTED' || msg.includes('not connected') || msg.includes('GITHUB_NOT_CONNECTED')) {
+          // Token GitHub absent ou invalide → afficher le bouton "Connect GitHub"
           setGithubConnected(false);
         } else {
-          setGhError(msg);
+          // Autre erreur (401 token expiré, 403 scope manquant, 500 GitHub timeout, etc.)
+          const codeLabel = code ? ` [${code}]` : '';
+          setGhError(`HTTP ${res.status}${codeLabel}: ${msg}`);
         }
         return;
       }
@@ -208,10 +253,21 @@ export default function NewProjectPage() {
     } catch (e) {
       clearTimeout(t);
       const isAbort = e instanceof Error && e.name === 'AbortError';
-      setGhError(isAbort
-        ? 'Délai dépassé (30s). GitHub API ne répond pas. Vérifiez votre connexion et réessayez.'
-        : String(e)
-      );
+      // FIX PHASE 9 — BUG 2:
+      // Avant: String(e) = "TypeError: Failed to fetch" (Chrome) ou "Load failed" (Safari/WebKit).
+      // Ces messages sont générés par le navigateur quand la requête échoue AVANT toute réponse
+      // (connexion refusée, Render endormi, réseau coupé).
+      // Ils ne donnent aucune information actionnable à l'utilisateur.
+      //
+      // Fix: distinguer AbortError (timeout 30s) des autres erreurs réseau.
+      // Pour les erreurs non-abort: afficher le message natif de l'erreur JS
+      // plutôt que String(e) qui peut inclure "TypeError: " devant.
+      if (isAbort) {
+        setGhError('Délai dépassé (30s). Le backend ne répond pas — il est peut-être en cours de démarrage (Render free tier). Réessayez dans quelques secondes.');
+      } else {
+        const netMsg = (e instanceof Error ? e.message : String(e)) || 'Erreur réseau inconnue';
+        setGhError(`Erreur de connexion: ${netMsg}. Vérifiez votre connexion et réessayez.`);
+      }
     } finally {
       setGhLoading(false);
     }
@@ -515,10 +571,18 @@ export default function NewProjectPage() {
                   </div>
                 )}
 
-                {/* Loading state */}
+                {/* Loading state — avec message de démarrage backend si applicable */}
                 {githubConnected === null && (
-                  <div className="flex items-center justify-center py-8">
+                  <div className="flex flex-col items-center justify-center py-8 gap-3">
                     <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
+                    {ghError ? (
+                      // Message de démarrage Render (affiché pendant les retries de checkGithub)
+                      <p className="text-xs text-muted-foreground text-center max-w-xs px-2">
+                        ⏳ {ghError}
+                      </p>
+                    ) : (
+                      <p className="text-xs text-muted-foreground">Vérification GitHub…</p>
+                    )}
                   </div>
                 )}
 

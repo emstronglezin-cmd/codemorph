@@ -291,7 +291,19 @@ export class JobsService implements OnModuleInit {
     files:       Array<{ path: string; content: string }>,
     goalPrompt?: string,
   ): Promise<string> {
-    const apiUrl      = this.config.get<string>('API_URL', 'http://localhost:4000/api/v1');
+    // FIX PHASE 9 — CAUSE RACINE BUG 1 (callback localhost):
+    // Avant: config.get('API_URL', 'http://localhost:4000/api/v1')
+    // Sur Render sans API_URL défini → callbackUrl = 'http://localhost:4000/...'
+    // Le mock AI Engine envoyait le callback vers localhost → jamais reçu.
+    // Résultat: job restait CONVERTING indéfiniment → bloque les conversions suivantes.
+    //
+    // Fallback hiérarchique:
+    //   1. API_URL env var (défini manuellement sur Render)
+    //   2. RENDER_EXTERNAL_URL (injecté auto par Render) + /api/v1
+    //   3. localhost (dev local seulement)
+    const renderUrl = process.env['RENDER_EXTERNAL_URL'];
+    const apiUrl = this.config.get<string>('API_URL')
+      ?? (renderUrl ? `${renderUrl}/api/v1` : 'http://localhost:4000/api/v1');
     const callbackUrl = `${apiUrl}/jobs/${job.id}/callback`;
 
     this.logger.log(
