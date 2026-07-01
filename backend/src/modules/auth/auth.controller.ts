@@ -222,21 +222,35 @@ export class AuthController {
     const perPageNum = Math.min(100, Math.max(1, parseInt(perPage, 10) || 30));
 
     try {
+      // FIX PHASE 10 — CAUSE RACINE BUG 2A : fetch sans timeout
+      // Si GitHub API met >30s → le frontend AbortController (30s) se déclenche avant
+      // que le backend reçoive la réponse → frontend affiche "Load failed".
+      // Fix: AbortController de 20s sur tous les appels GitHub API.
+      const ghAbortController = new AbortController();
+      const ghTimeoutId = setTimeout(() => ghAbortController.abort(), 20_000);
+
       let apiUrl: URL;
       let isSearch = false;
 
       if (search && search.trim()) {
-        // GitHub Search API : retourne résultats sur tous les repos accessibles
-        // q=<search> user:<username> — on n'a pas le username, on utilise un endpoint différent
-        // Pour rechercher dans les repos de l'utilisateur, on utilise l'API search avec
-        // le scope user: qui couvre aussi les orgs si le token a le scope 'repo'
-        apiUrl = new URL('https://api.github.com/search/repositories');
-        apiUrl.searchParams.set('q', `${search.trim()} user:@me`);
+        // FIX PHASE 10 — CAUSE RACINE BUG 2B : user:@me invalide dans GitHub Search API
+        // L'API https://api.github.com/search/repositories ne supporte PAS user:@me.
+        // Elle retourne une erreur 422 "Validation Failed" → "Load failed" côté frontend.
+        //
+        // Fix: utiliser /user/repos pour tous les cas (listing + search).
+        // La recherche est faite côté serveur par filtrage JS sur le nom/description.
+        // Cela garantit que seuls les repos ACCESSIBLES par le token sont retournés.
+        //
+        // Note: on charge plus de résultats (per_page max 100) pour filtrer efficacement.
+        apiUrl = new URL('https://api.github.com/user/repos');
         apiUrl.searchParams.set('page', String(pageNum));
-        apiUrl.searchParams.set('per_page', String(perPageNum));
+        apiUrl.searchParams.set('per_page', '100');  // Max pour optimiser le filtrage
         apiUrl.searchParams.set('sort', 'updated');
-        apiUrl.searchParams.set('order', 'desc');
-        isSearch = true;
+        apiUrl.searchParams.set('direction', 'desc');
+        apiUrl.searchParams.set('affiliation', 'owner,collaborator,organization_member');
+        if (type === 'public')  apiUrl.searchParams.set('visibility', 'public');
+        if (type === 'private') apiUrl.searchParams.set('visibility', 'private');
+        isSearch = true;  // indique qu'on doit filtrer les résultats
       } else {
         // Listing complet : utilise /user/repos avec affiliation pour couvrir
         // repos personnels + orgs + collaborations (publics ET privés)
@@ -259,7 +273,9 @@ export class AuthController {
           Accept:        'application/vnd.github.v3+json',
           'User-Agent':  'CodeMorph/1.0',
         },
+        signal: ghAbortController.signal,
       });
+      clearTimeout(ghTimeoutId);
 
       if (!ghRes.ok) {
         const errBody = await ghRes.text().catch(() => '');
@@ -274,8 +290,8 @@ export class AuthController {
         throw new BadRequestException(`GitHub API error: ${ghRes.status} — ${errBody}`);
       }
 
-      // L'API search retourne { total_count, items: [...] }
-      // L'API /user/repos retourne directement un tableau
+      // FIX PHASE 10 : /user/repos retourne toujours un tableau direct
+      // (on n'utilise plus l'API search qui ne supportait pas user:@me)
       type GHRepo = {
         id: number; name: string; full_name: string; private: boolean;
         html_url: string; description: string | null; language: string | null;
@@ -283,15 +299,21 @@ export class AuthController {
         default_branch: string; topics?: string[];
       };
 
-      let repos: GHRepo[];
+      let repos: GHRepo[] = await ghRes.json() as GHRepo[];
       let totalCount: number;
 
-      if (isSearch) {
-        const searchResult = await ghRes.json() as { total_count: number; items: GHRepo[] };
-        repos = searchResult.items ?? [];
-        totalCount = searchResult.total_count ?? repos.length;
+      if (isSearch && search.trim()) {
+        // Filtrage serveur-side : nom ou description contient le terme de recherche
+        const q = search.trim().toLowerCase();
+        repos = repos.filter(r =>
+          r.name.toLowerCase().includes(q) ||
+          (r.description ?? '').toLowerCase().includes(q) ||
+          r.full_name.toLowerCase().includes(q),
+        );
+        totalCount = repos.length;
+        // Appliquer la pagination sur les résultats filtrés
+        repos = repos.slice((pageNum - 1) * perPageNum, pageNum * perPageNum);
       } else {
-        repos = await ghRes.json() as GHRepo[];
         // Extraire le total depuis le header Link si disponible
         const linkHeader = ghRes.headers.get('link') ?? '';
         const lastPageMatch = linkHeader.match(/page=(\d+)>; rel="last"/);
@@ -300,8 +322,8 @@ export class AuthController {
           : repos.length + (pageNum - 1) * perPageNum;
       }
 
-      // Filtre côté serveur par visibility si search + type
-      const filtered = (search && type !== 'all')
+      // Filtre côté serveur par visibility si type spécifié
+      const filtered = (type !== 'all')
         ? repos.filter(r => type === 'private' ? r.private : !r.private)
         : repos;
 
@@ -327,6 +349,14 @@ export class AuthController {
       };
     } catch (err) {
       if (err instanceof BadRequestException) throw err;
+      // FIX PHASE 10 : détecter le timeout AbortController (20s) et retourner un message clair
+      const errName = (err as { name?: string })?.name ?? '';
+      if (errName === 'AbortError') {
+        throw new BadRequestException({
+          code:    'GITHUB_API_TIMEOUT',
+          message: 'GitHub API did not respond within 20 seconds. Please try again in a moment.',
+        });
+      }
       throw new BadRequestException(`Failed to fetch GitHub repos: ${String(err)}`);
     }
   }

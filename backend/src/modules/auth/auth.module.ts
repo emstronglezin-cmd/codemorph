@@ -23,7 +23,11 @@ import { UsersModule }     from '../users/users.module';
       inject:     [ConfigService],
       useFactory: (config: ConfigService) => ({
         secret:      config.get<string>('jwt.secret'),
-        signOptions: { expiresIn: config.get<string>('jwt.expiresIn', '15m') },
+        // FIX PHASE 10 — CAUSE RACINE BUG 2C :
+        // Le fallback était '15m' → tokens expiraient en 15min si JWT_EXPIRES_IN absent de Render.
+        // JwtAuthGuard renvoyait 401 → checkGithub() frontend lisait AUTH_002 → setGithubConnected(false).
+        // Fix: fallback '7d' cohérent avec jwt.config.ts et .env.example.
+        signOptions: { expiresIn: config.get<string>('jwt.expiresIn', '7d') },
       }),
     }),
   ],

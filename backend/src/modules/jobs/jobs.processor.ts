@@ -73,15 +73,29 @@ export class JobsProcessor {
         // Premier attempt → passer en ANALYZING (normal)
         await this.jobsService.updateStatus(jobId, JobStatus.ANALYZING);
       } else {
-        // Retry → on remet en ANALYZING seulement si pas encore terminal
+        // FIX PHASE 10 — Retry : ne PAS remettre en ANALYZING si job déjà terminal
+        // CAUSE RACINE BUG 1 (Phase 9 incomplet) :
+        // L'ancien code loggait "skipping re-activation" PUIS appelait quand même
+        // updateStatus(ANALYZING), repassant le job en statut actif.
+        // countActiveJobsFromDb() le comptait → CONCURRENT_LIMIT au prochain createJob().
+        //
+        // Fix: si FAILED ou DONE → throw immédiatement pour que Bull enregistre l'échec
+        // sans toucher le statut DB. Le job reste terminal et ne bloque plus le quota.
         const currentJob = await this.jobsService.findById(jobId);
         if (currentJob.status === JobStatus.FAILED || currentJob.status === JobStatus.DONE) {
-          // Job déjà terminal (ex: reset-stale, reset-all) → ne pas ré-activer
-          this.logger.warn(`${tag} Retry ${job.attemptsMade + 1}: job already ${currentJob.status}, skipping re-activation`);
-          await this.jobsService.updateStatus(jobId, JobStatus.ANALYZING);
-        } else {
-          await this.jobsService.updateStatus(jobId, JobStatus.ANALYZING);
+          this.logger.warn(
+            `${tag} Retry ${job.attemptsMade + 1}: job already terminal (${currentJob.status}). ` +
+            `Aborting retry without touching DB status — job will NOT be reactivated.`,
+          );
+          // Ne pas appeler updateStatus → le job reste FAILED/DONE dans la DB
+          // Bull enregistre cet attempt comme échoué mais le statut DB est préservé
+          throw new Error(
+            `Job ${jobId} is already in terminal status (${currentJob.status}). ` +
+            `Retry aborted to prevent false-active quota count.`,
+          );
         }
+        // Retry sur un job encore en cours → reprendre normalement
+        await this.jobsService.updateStatus(jobId, JobStatus.ANALYZING);
       }
       await this.jobsService.appendLog(jobId, 'ast-analysis', 'running', `Fetching source files… (attempt ${job.attemptsMade + 1})`);
 

@@ -133,8 +133,10 @@ export class JobsService implements OnModuleInit {
     this.logger.log(`${tag} Quota: OK`);
 
     // 3. Enforce concurrent job limit (source de vérité = DB)
+    // LOG DIAGNOSTIC PHASE 10 : afficher TOUS les jobs actifs avant la vérification
     this.logger.log(`${tag} Step 3/6: Checking concurrent jobs (DB count)…`);
     const concurrent = await this.quotaService.checkConcurrentJobs(dto.userId, plan);
+    // checkConcurrentJobs loggue déjà les IDs/statuts/updatedAt dans QuotaService
     if (!concurrent.allowed) {
       this.logger.warn(
         `${tag} Concurrent limit: current=${concurrent.current} limit=${concurrent.limit}. ` +
@@ -375,6 +377,37 @@ export class JobsService implements OnModuleInit {
       await this.appendLog(id, 'failed', 'failed', `AI Engine error: ${errorMsg}`);
       this.logger.error(`[Job ${id}] ❌ FAILED by AI Engine: ${errorMsg}`);
     }
+  }
+
+  // ── Reset ALL active jobs for user (sans restriction de temps) ───
+  // FIX PHASE 10 — CAUSE RACINE BUG 1 (reset-stale inutilisable) :
+  // forceResetStaleJobsForUser() n'agit que sur les jobs updatedAt > 15min.
+  // Un job bloqué depuis 2min (ex: Bull retry) n'est pas stale → reset-stale retourne 0.
+  // Ce nouvel endpoint remet à FAILED TOUS les jobs actifs de l'utilisateur sans condition.
+  // Utilisé par le frontend quand l'utilisateur est bloqué par CONCURRENT_LIMIT.
+  async resetMyActiveJobs(userId: string): Promise<number> {
+    const activeJobs = await this.jobRepo.find({
+      where: {
+        userId,
+        status: In(ACTIVE_STATUSES),
+      },
+      select: ['id', 'status', 'updatedAt'],
+    });
+
+    for (const job of activeJobs) {
+      await this.jobRepo.update(job.id, {
+        status:       JobStatus.FAILED,
+        errorMessage: 'Manually reset by user: job was blocking new conversions.',
+        completedAt:  new Date(),
+      });
+      this.logger.warn(
+        `[reset-mine] Job ${job.id} (${job.status}, updatedAt=${job.updatedAt.toISOString()}) ` +
+        `force-reset to FAILED for userId=${userId}`,
+      );
+    }
+
+    this.logger.log(`[reset-mine] userId=${userId}: ${activeJobs.length} job(s) reset`);
+    return activeJobs.length;
   }
 
   // ── Manual reset stale (admin / user action) ──────────

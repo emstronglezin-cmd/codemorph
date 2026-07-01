@@ -116,6 +116,24 @@ export class JobsController {
     await this.jobsService.cancel(id, user.sub as string);
   }
 
+  // ── Reset ALL active jobs for user (sans restriction de temps) ──
+  // FIX PHASE 10: reset-stale ne gère que les jobs > 15min.
+  // Cette route remet à FAILED TOUS les jobs actifs de l'utilisateur, même récents.
+  // Utile quand l'utilisateur est bloqué par CONCURRENT_LIMIT après un crash ou retry Bull.
+  @Post('reset-mine')
+  @ApiOperation({ summary: 'Reset ALL active jobs for current user (no time restriction — frees concurrent quota immediately)' })
+  async resetMine(@CurrentUser() user: JwtPayload) {
+    const userId = user.sub as string;
+    this.logger.log(`[reset-mine] userId=${userId}`);
+    const count = await this.jobsService.resetMyActiveJobs(userId);
+    return {
+      message: count > 0
+        ? `${count} active job(s) have been reset. You can now start new conversions.`
+        : 'No active jobs found. Queue is already clean.',
+      cleared: count,
+    };
+  }
+
   // ── Reset stale jobs for user ──────────────────────────
   @Post('reset-stale')
   @ApiOperation({ summary: 'Reset stuck/stale jobs for current user (frees concurrent quota)' })

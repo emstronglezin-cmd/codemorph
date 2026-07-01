@@ -119,14 +119,40 @@ export class LeekPayService {
 
     this.logger.log(`Creating LeekPay checkout: ${params.amount} ${params.currency}`);
 
-    const response = await fetch(`${this.baseUrl}/checkout`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${this.secretKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(body),
-    });
+    // FIX PHASE 10 — CAUSE RACINE BUG 3 : fetch sans timeout
+    // Le frontend a un AbortController de 14s (billing/page.tsx handleUpgrade).
+    // Si LeekPay API met >14s → frontend déclenche abort → "Délai dépassé. Le serveur de paiement ne répond pas."
+    // Fix: timeout de 12s côté backend (< 14s frontend) pour retourner une erreur structurée
+    // avant que le frontend ne coupe la connexion.
+    const leekpayAbortCtrl = new AbortController();
+    const leekpayTimeoutId = setTimeout(() => leekpayAbortCtrl.abort(), 12_000);
+
+    let response: Response;
+    try {
+      response = await fetch(`${this.baseUrl}/checkout`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${this.secretKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(body),
+        signal: leekpayAbortCtrl.signal,
+      });
+    } catch (fetchErr: unknown) {
+      clearTimeout(leekpayTimeoutId);
+      const errName = (fetchErr as { name?: string })?.name ?? '';
+      if (errName === 'AbortError') {
+        this.logger.error('LeekPay createCheckout: timeout after 12s — API did not respond');
+        throw new BadRequestException(
+          'Le serveur de paiement LeekPay ne répond pas (timeout 12s). ' +
+          'Vérifiez que LEEKPAY_SECRET_KEY est correcte et que leekpay.fr est accessible. ' +
+          'Réessayez dans quelques instants.',
+        );
+      }
+      throw new BadRequestException(`LeekPay network error: ${String(fetchErr)}`);
+    } finally {
+      clearTimeout(leekpayTimeoutId);
+    }
 
     const json = (await response.json()) as {
       success: boolean;
@@ -147,9 +173,24 @@ export class LeekPayService {
 
   // ── Vérifier le statut d'un checkout ─────────────────
   async getCheckout(checkoutId: string): Promise<LeekPayCheckout> {
-    const response = await fetch(`${this.baseUrl}/checkout/${checkoutId}`, {
-      headers: { Authorization: `Bearer ${this.secretKey}` },
-    });
+    const abortCtrl = new AbortController();
+    const timeoutId = setTimeout(() => abortCtrl.abort(), 12_000);
+    let response: Response;
+    try {
+      response = await fetch(`${this.baseUrl}/checkout/${checkoutId}`, {
+        headers: { Authorization: `Bearer ${this.secretKey}` },
+        signal: abortCtrl.signal,
+      });
+    } catch (e: unknown) {
+      clearTimeout(timeoutId);
+      const errName = (e as { name?: string })?.name ?? '';
+      if (errName === 'AbortError') {
+        throw new BadRequestException('LeekPay API timeout (12s) on getCheckout');
+      }
+      throw new BadRequestException(`LeekPay network error: ${String(e)}`);
+    } finally {
+      clearTimeout(timeoutId);
+    }
 
     const json = (await response.json()) as {
       success: boolean;
