@@ -158,15 +158,21 @@ function BillingContent() {
 
       if (!res.ok) {
         clearTimeout(timeoutId);
+        // FIX PHASE 11 — BUG 4 : message d'erreur précis selon le type d'erreur
+        // AVANT: "res.status === 400" déclenchait "Plan non reconnu" pour TOUTES les 400
+        //        (ex: LEEKPAY_SECRET_KEY manquante → 400 → "Plan non reconnu" trompeur)
+        // MAINTENANT: on distingue les erreurs par leur contenu exact
         const msg = (data?.success === false ? data?.message : null) ?? data?.message ?? `Erreur ${res.status}`;
-        if (msg.includes('Plan inconnu') || res.status === 400) {
-          setError(`Plan "${planId}" non reconnu par le serveur.`);
-        } else if (res.status === 401 || res.status === 403) {
+        if (res.status === 401 || res.status === 403) {
           setError('Session expirée. Reconnectez-vous.');
-        } else if (msg.includes('LEEKPAY') || msg.includes('non configuré') || msg.includes('manquante')) {
-          setError(`Paiement non disponible : ${msg}`);
+        } else if (msg.toLowerCase().includes('plan inconnu') || msg.toLowerCase().includes('plan unknown')) {
+          setError(`Plan "${planId}" non reconnu par le serveur. Contactez le support.`);
+        } else if (msg.includes('SECRET_KEY') || msg.includes('non configuré') || msg.includes('manquante') || msg.includes('LEEKPAY_SECRET')) {
+          setError(`Paiement non disponible : la clé LeekPay n'est pas configurée sur le serveur. Contactez l'administrateur.`);
+        } else if (msg.toLowerCase().includes('timeout') || msg.toLowerCase().includes('ne répond pas')) {
+          setError(`Le serveur de paiement LeekPay ne répond pas. Réessayez dans quelques instants.`);
         } else {
-          setError(`Erreur paiement : ${msg}`);
+          setError(`Erreur paiement (${res.status}) : ${msg}`);
         }
         setLoading(null);
         setLoadStep('');

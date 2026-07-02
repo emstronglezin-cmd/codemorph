@@ -2,6 +2,14 @@
 // CodeMorph — AI Engine Client
 // Typed HTTP client with retry, circuit breaker, timeout
 // + Mock mode when AI_ENGINE_URL is not configured (no Docker)
+//
+// FIX PHASE 11 — CAUSE RACINE ZOMBIE JOBS :
+// En mode mock, setTimeout était utilisé pour fire le callback.
+// Si Render redémarre → setTimeout perdu → callback jamais déclenché
+// → job reste CONVERTING indéfiniment.
+//
+// Fix : le mock callback échec → marquer le job FAILED via callbackUrl
+// + le watchdog dans JobsService détecte les jobs CONVERTING > 5min
 // ============================================================
 import { Injectable, Logger, ServiceUnavailableException } from '@nestjs/common';
 import { HttpService } from '@nestjs/axios';
@@ -137,7 +145,15 @@ export class AiEngineClient {
   }
 
   // ── Mock conversion — fires callback after a delay ───────
-  private async mockConversion(req: AiConvertRequest): Promise<AiConvertResponse> {
+  // FIX PHASE 11 — CAUSE RACINE ZOMBIE JOBS :
+  // AVANT: setTimeout async sans retry, erreur silencieuse → job reste CONVERTING
+  // MAINTENANT:
+  //   1. Fire le callback avec retry (3 tentatives, backoff 2s)
+  //   2. Si toutes les tentatives échouent → fire un callback d'ÉCHEC
+  //      pour que le job passe en FAILED (pas en zombie CONVERTING)
+  //   3. Le watchdog dans cleanupStaleJobs (5min pour CONVERTING) rattrape
+  //      les cas où même le callback d'échec ne peut pas être envoyé
+  private mockConversion(req: AiConvertRequest): AiConvertResponse {
     const { jobId, sourceLanguage, targetLanguage, files, callbackUrl } = req;
 
     this.logger.log(`[Job ${jobId}] MOCK: simulating ${sourceLanguage}→${targetLanguage} conversion`);
@@ -154,16 +170,83 @@ export class AiEngineClient {
     }
 
     // Simulate async conversion (fires callback after 3-5s)
+    // NOTE: Sync return — le setTimeout est lancé de façon non-bloquante.
+    // FIX: on ne retourne plus une Promise ici pour éviter que le processeur
+    // attende. Le callback est géré de façon fire-and-forget avec récupération d'erreur.
     const delay = 3_000 + Math.random() * 2_000;
-    setTimeout(async () => {
-      try {
-        await this.fireMockCallback(jobId, sourceLanguage, targetLanguage, files, callbackUrl);
-      } catch (e) {
-        this.logger.error(`[Job ${jobId}] MOCK callback failed: ${(e as Error).message}`);
-      }
-    }, delay);
+    void this.scheduleMockCallback(jobId, sourceLanguage, targetLanguage, files, callbackUrl, delay);
 
     return { jobId, accepted: true, message: 'Mock conversion accepted' };
+  }
+
+  // ── Schedule mock callback with retry + failure fallback ─
+  private async scheduleMockCallback(
+    jobId:          string,
+    sourceLanguage: string,
+    targetLanguage: string,
+    files:          Array<{ path: string; content: string }>,
+    callbackUrl:    string,
+    delay:          number,
+  ): Promise<void> {
+    await new Promise<void>((resolve) => setTimeout(resolve, delay));
+
+    const MAX_ATTEMPTS = 3;
+    let lastError: Error | null = null;
+
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      try {
+        this.logger.log(`[Job ${jobId}] MOCK: firing SUCCESS callback (attempt ${attempt}/${MAX_ATTEMPTS}) → ${callbackUrl}`);
+        await this.fireMockCallback(jobId, sourceLanguage, targetLanguage, files, callbackUrl);
+        this.logger.log(`[Job ${jobId}] MOCK: ✅ callback fired successfully`);
+        return; // Success — exit
+      } catch (e) {
+        lastError = e as Error;
+        this.logger.warn(`[Job ${jobId}] MOCK: callback attempt ${attempt}/${MAX_ATTEMPTS} failed: ${lastError.message}`);
+        if (attempt < MAX_ATTEMPTS) {
+          // Backoff before retry
+          await new Promise<void>((resolve) => setTimeout(resolve, 2_000 * attempt));
+        }
+      }
+    }
+
+    // All success callback attempts failed → fire FAILURE callback
+    // This prevents the job from staying CONVERTING forever (zombie job)
+    this.logger.error(
+      `[Job ${jobId}] MOCK: ❌ ALL ${MAX_ATTEMPTS} callback attempts failed. ` +
+      `Firing FAILURE callback to prevent zombie job. Last error: ${lastError?.message}`,
+    );
+
+    try {
+      await this.fireMockFailureCallback(jobId, callbackUrl, lastError?.message ?? 'Mock callback failed after 3 attempts');
+      this.logger.log(`[Job ${jobId}] MOCK: failure callback sent — job will be marked FAILED`);
+    } catch (failErr) {
+      // Even failure callback failed — the watchdog in JobsService.cleanupStaleJobs()
+      // will catch this job after CONVERTING_STALE_MINUTES and mark it FAILED
+      this.logger.error(
+        `[Job ${jobId}] MOCK: ❌ CRITICAL — even failure callback failed: ${(failErr as Error).message}. ` +
+        `Job will be cleaned up by watchdog (CONVERTING jobs > 5min → FAILED).`,
+      );
+    }
+  }
+
+  // ── Fire mock failure callback → job becomes FAILED ──────
+  private async fireMockFailureCallback(
+    jobId:      string,
+    callbackUrl: string,
+    reason:     string,
+  ): Promise<void> {
+    const payload = {
+      success: false,
+      jobId,
+      error: `Mock conversion callback failed: ${reason}. This job was auto-failed to prevent zombie state.`,
+    };
+
+    await firstValueFrom(
+      this.http.post(callbackUrl, payload, {
+        headers: { 'Content-Type': 'application/json', 'X-Source': 'codemorph-ai-mock' },
+        timeout: 10_000,
+      }),
+    );
   }
 
   // ── Fire mock callback with realistic result ─────────────
@@ -207,18 +290,14 @@ export class AiEngineClient {
       },
     };
 
-    try {
-      await firstValueFrom(
-        this.http.post(callbackUrl, payload, {
-          headers: { 'Content-Type': 'application/json', 'X-Source': 'codemorph-ai-mock' },
-          timeout: 10_000,
-        }),
-      );
-      this.logger.log(`[Job ${jobId}] MOCK: callback fired successfully`);
-    } catch (e) {
-      this.logger.error(`[Job ${jobId}] MOCK: callback error: ${(e as Error).message}`);
-      // Don't rethrow — mock callback failure shouldn't crash the process
-    }
+    await firstValueFrom(
+      this.http.post(callbackUrl, payload, {
+        headers: { 'Content-Type': 'application/json', 'X-Source': 'codemorph-ai-mock' },
+        timeout: 10_000,
+      }),
+    );
+
+    this.logger.log(`[Job ${jobId}] MOCK: callback fired successfully`);
   }
 
   // ── Generate mock converted files ────────────────────────

@@ -6,6 +6,10 @@
 //   - jobRepo injecté dans QuotaService (source de vérité DB)
 //   - dispatchToAiEngine: correction retour AiConvertResponse
 //   - Logs détaillés à chaque étape
+// PHASE 11 FIX:
+//   - CONVERTING jobs watchdog séparé : seuil 5min (au lieu de 15min)
+//   - Un job CONVERTING zombie depuis >5min → FAILED automatiquement
+//   - Après crash Render : tous les CONVERTING → FAILED au démarrage
 // ============================================================
 import {
   Injectable,
@@ -24,6 +28,13 @@ import { Cron, CronExpression } from '@nestjs/schedule';
 import { JobEntity, JobStatus, JobType } from './jobs.entity';
 import { AiEngineClient }                from './ai-engine.client';
 import { QuotaService, STALE_JOB_MINUTES } from '../quota/quota.service';
+
+// FIX PHASE 11 — WATCHDOG CONVERTING
+// Un job PENDING/ANALYZING sans activité > 15min → FAILED (existant)
+// Un job CONVERTING sans activité > 5min → FAILED (nouveau)
+// Raison: CONVERTING = mock callback en transit (3-5s en théorie).
+// Si >5min → le callback a échoué silencieusement → zombie job.
+const CONVERTING_STALE_MINUTES = 5;
 import { SubscriptionService }           from '../subscription/subscription.service';
 import { PLAN_LIMITS }                   from '../subscription/plan-limits.config';
 
@@ -66,47 +77,136 @@ export class JobsService implements OnModuleInit {
     this.quotaService.setJobRepository(this.jobRepo as any);
     this.logger.log('JobsService: QuotaService jobRepo injected ✓');
 
-    // Nettoyer les stale jobs au démarrage
+    // FIX PHASE 11 — WATCHDOG DÉMARRAGE :
+    // Après un crash/restart Render, TOUS les jobs CONVERTING sont des zombies
+    // (leurs setTimeout mock ont été perdus). On les marque FAILED immédiatement.
+    void this.cleanupConvertingZombiesOnStartup();
+    // Nettoyage classique (PENDING/ANALYZING > 15min)
     void this.cleanupStaleJobs();
   }
 
+  // ── Startup cleanup: mark all CONVERTING as FAILED ───
+  // FIX PHASE 11 — CAUSE RACINE ZOMBIE JOBS :
+  // Après un restart Render/crash, les jobs CONVERTING ne recevront
+  // jamais leur callback (le setTimeout du mock a été perdu avec le process).
+  // On les marque FAILED immédiatement au démarrage pour éviter le blocage.
+  private async cleanupConvertingZombiesOnStartup(): Promise<void> {
+    try {
+      const convertingJobs = await this.jobRepo.find({
+        where: { status: JobStatus.CONVERTING },
+        select: ['id', 'userId', 'status', 'updatedAt'],
+      });
+
+      if (convertingJobs.length === 0) {
+        this.logger.log('[StartupCleanup] No CONVERTING zombie jobs found ✓');
+        return;
+      }
+
+      this.logger.warn(
+        `[StartupCleanup] Found ${convertingJobs.length} CONVERTING job(s) after restart — marking FAILED (zombie prevention): ` +
+        convertingJobs.map(j => j.id).join(', '),
+      );
+
+      for (const job of convertingJobs) {
+        await this.jobRepo.update(job.id, {
+          status:       JobStatus.FAILED,
+          errorMessage: `Job auto-failed on server restart: the conversion was in progress when the server crashed. ` +
+                        `The AI Engine callback was lost. Please retry your conversion.`,
+          errorDetails: {
+            reason:    'server_restart_zombie',
+            lastStatus: 'converting',
+            clearedAt: new Date().toISOString(),
+            hint:      'This happens when Render restarts the backend (free tier sleep). Retry the conversion.',
+          },
+          completedAt: new Date(),
+        });
+        this.logger.warn(`[StartupCleanup] Job ${job.id} (CONVERTING) → FAILED (zombie cleared)`);
+      }
+    } catch (e) {
+      this.logger.error(`[StartupCleanup] Error: ${(e as Error).message}`);
+    }
+  }
+
   // ── Stale job cleanup (scheduled every 5 minutes) ────
+  // FIX PHASE 11 — WATCHDOG AMÉLIORÉ :
+  // Deux seuils distincts :
+  //   1. CONVERTING jobs > 5min sans mise à jour → FAILED (zombie callback perdu)
+  //   2. PENDING/ANALYZING jobs > 15min sans mise à jour → FAILED (worker crashé)
   @Cron(CronExpression.EVERY_5_MINUTES)
   async cleanupStaleJobs(): Promise<void> {
-    const staleThreshold = new Date(Date.now() - STALE_JOB_MINUTES * 60 * 1000);
+    const now = Date.now();
+    const convertingStaleThreshold = new Date(now - CONVERTING_STALE_MINUTES * 60 * 1000);
+    const generalStaleThreshold    = new Date(now - STALE_JOB_MINUTES * 60 * 1000);
 
     try {
-      // Trouver les jobs bloqués (actifs mais pas mis à jour depuis STALE_JOB_MINUTES min)
-      const staleJobs = await this.jobRepo.find({
+      // ── 1. CONVERTING zombie watchdog (seuil court : 5min) ──
+      const convertingZombies = await this.jobRepo.find({
         where: {
-          status:    In(ACTIVE_STATUSES),
-          updatedAt: LessThan(staleThreshold),
+          status:    JobStatus.CONVERTING,
+          updatedAt: LessThan(convertingStaleThreshold),
         },
         select: ['id', 'userId', 'status', 'updatedAt', 'type'],
       });
 
-      if (staleJobs.length === 0) return;
+      if (convertingZombies.length > 0) {
+        this.logger.warn(
+          `[Watchdog] Found ${convertingZombies.length} CONVERTING zombie job(s) (inactive >${CONVERTING_STALE_MINUTES}min): ` +
+          convertingZombies.map(j => `${j.id}`).join(', '),
+        );
+        for (const job of convertingZombies) {
+          await this.jobRepo.update(job.id, {
+            status:       JobStatus.FAILED,
+            errorMessage: `Job automatically failed: stuck in CONVERTING state for more than ${CONVERTING_STALE_MINUTES} minutes. ` +
+                          `The AI Engine callback was never received. This typically means: ` +
+                          `(1) the server restarted and the mock callback setTimeout was lost, or ` +
+                          `(2) the callback URL was unreachable. Please retry your conversion.`,
+            errorDetails: {
+              reason:           'converting_zombie_watchdog',
+              lastStatus:       job.status,
+              staleThresholdMin: CONVERTING_STALE_MINUTES,
+              detectedAt:       new Date().toISOString(),
+            },
+            completedAt: new Date(),
+          });
+          this.logger.warn(`[Watchdog] Job ${job.id} (CONVERTING zombie) → FAILED ✓`);
+        }
+      }
 
-      this.logger.warn(
-        `[StaleCleanup] Found ${staleJobs.length} stale job(s) (inactive >${STALE_JOB_MINUTES}min): ` +
-        staleJobs.map(j => `${j.id}(${j.status})`).join(', '),
-      );
+      // ── 2. PENDING/ANALYZING stale cleanup (seuil standard : 15min) ──
+      const staleJobs = await this.jobRepo.find({
+        where: {
+          status:    In([JobStatus.PENDING, JobStatus.ANALYZING]),
+          updatedAt: LessThan(generalStaleThreshold),
+        },
+        select: ['id', 'userId', 'status', 'updatedAt', 'type'],
+      });
 
-      for (const job of staleJobs) {
-        await this.jobRepo.update(job.id, {
-          status:       JobStatus.FAILED,
-          errorMessage: `Job automatically failed: no activity for more than ${STALE_JOB_MINUTES} minutes. ` +
-                        `This typically means the AI Engine did not respond or the worker crashed. ` +
-                        `Please try again.`,
-          errorDetails: {
-            reason:          'stale_timeout',
-            lastStatus:      job.status,
-            staleThreshold:  staleThreshold.toISOString(),
-            detectedAt:      new Date().toISOString(),
-          },
-          completedAt: new Date(),
-        });
-        this.logger.warn(`[StaleCleanup] Job ${job.id} (${job.status}) marked FAILED (stale)`);
+      if (staleJobs.length === 0 && convertingZombies.length === 0) {
+        return; // Nothing to clean
+      }
+
+      if (staleJobs.length > 0) {
+        this.logger.warn(
+          `[StaleCleanup] Found ${staleJobs.length} stale job(s) (inactive >${STALE_JOB_MINUTES}min): ` +
+          staleJobs.map(j => `${j.id}(${j.status})`).join(', '),
+        );
+
+        for (const job of staleJobs) {
+          await this.jobRepo.update(job.id, {
+            status:       JobStatus.FAILED,
+            errorMessage: `Job automatically failed: no activity for more than ${STALE_JOB_MINUTES} minutes. ` +
+                          `This typically means the AI Engine did not respond or the worker crashed. ` +
+                          `Please try again.`,
+            errorDetails: {
+              reason:          'stale_timeout',
+              lastStatus:      job.status,
+              staleThreshold:  generalStaleThreshold.toISOString(),
+              detectedAt:      new Date().toISOString(),
+            },
+            completedAt: new Date(),
+          });
+          this.logger.warn(`[StaleCleanup] Job ${job.id} (${job.status}) marked FAILED (stale)`);
+        }
       }
     } catch (e) {
       this.logger.error(`[StaleCleanup] Error: ${(e as Error).message}`);
@@ -367,7 +467,7 @@ export class JobsService implements OnModuleInit {
         filesProcessed: payload.filesGenerated,
         linesProcessed: payload.linesGenerated,
       });
-      this.logger.log(`[Job ${id}] ✅ DONE — ${payload.filesGenerated ?? 0} files`);
+      this.logger.log(`━━━ [Job ${id}] STEP 10 ✅ ━━━ DONE — ${payload.filesGenerated ?? 0} files generated — conversion complete!`);
     } else {
       const errorMsg = payload.error ?? 'Unknown error from AI Engine';
       await this.updateStatus(id, JobStatus.FAILED, {
@@ -375,7 +475,7 @@ export class JobsService implements OnModuleInit {
         progress:     0,
       });
       await this.appendLog(id, 'failed', 'failed', `AI Engine error: ${errorMsg}`);
-      this.logger.error(`[Job ${id}] ❌ FAILED by AI Engine: ${errorMsg}`);
+      this.logger.error(`━━━ [Job ${id}] STEP 10 ❌ ━━━ FAILED by AI Engine: ${errorMsg}`);
     }
   }
 

@@ -191,6 +191,9 @@ export class JobsController {
   }
 
   // ── Quick-start: from GitHub repo ─────────────────────
+  // FIX PHASE 11 — BUG 2 (STEP logs) :
+  // Chaque étape du flux est maintenant loggée avec un numéro de STEP
+  // pour que les logs Render soient lisibles et diagnostiquables.
   @Post('start/github')
   @ApiOperation({ summary: 'Start conversion from GitHub repo' })
   async startFromGitHub(
@@ -206,17 +209,26 @@ export class JobsController {
     @CurrentUser() user: JwtPayload,
   ) {
     const userId = user.sub as string;
+    const reqId  = `gh-${Date.now().toString(36)}`;
 
+    this.logger.log(`━━━ [${reqId}] STEP 1 ━━━ POST /jobs/start/github received`);
+    this.logger.log(`[${reqId}] userId=${userId} repo=${body.repo} branch=${body.branch ?? 'main'} src=${body.sourceLanguage} tgt=${body.targetLanguage}`);
+
+    // STEP 2 — Validate request
+    this.logger.log(`[${reqId}] STEP 2 — Validating request parameters…`);
     if (!body.repo?.trim()) {
+      this.logger.warn(`[${reqId}] STEP 2 FAILED — repo missing`);
       throw new BadRequestException({ code: 'MISSING_REPO', message: 'GitHub repository is required (e.g. "owner/repo").' });
     }
     if (!body.sourceLanguage?.trim() || !body.targetLanguage?.trim()) {
+      this.logger.warn(`[${reqId}] STEP 2 FAILED — languages missing`);
       throw new BadRequestException({ code: 'MISSING_LANGUAGES', message: 'sourceLanguage and targetLanguage are required.' });
     }
+    this.logger.log(`[${reqId}] STEP 2 ✓ — Request valid: repo=${body.repo.trim()} branch=${body.branch?.trim() ?? 'main'}`);
 
-    this.logger.log(`[start/github] userId=${userId} repo=${body.repo} branch=${body.branch ?? 'main'}`);
-
-    return this.jobsService.createJob({
+    // STEP 3 — Create job (includes quota check + DB insert + Bull enqueue)
+    this.logger.log(`[${reqId}] STEP 3 — Calling JobsService.createJob (quota check → DB insert → Bull enqueue)…`);
+    const job = await this.jobsService.createJob({
       userId,
       type:           JobType.GITHUB_IMPORT,
       sourceLanguage: body.sourceLanguage,
@@ -226,6 +238,12 @@ export class JobsController {
       sourceBranch:   body.branch?.trim() ?? 'main',
       goalPrompt:     body.goalPrompt,
     });
+
+    this.logger.log(`[${reqId}] STEP 3 ✓ — Job created: id=${job.id} status=${job.status}`);
+    this.logger.log(`[${reqId}] STEP 4 ✓ — Job enqueued to Bull queue (worker will pick up shortly)`);
+    this.logger.log(`━━━ [${reqId}] STEP 4 END ━━━ Returning job to frontend → jobId=${job.id}`);
+
+    return job;
   }
 
   // ── Quick-start: from ZIP ──────────────────────────────

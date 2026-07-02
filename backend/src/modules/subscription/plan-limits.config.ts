@@ -1,10 +1,24 @@
 // ============================================================
 // CodeMorph — Plan Limits Configuration
 // Single source of truth for all plan restrictions
+//
+// FIX PHASE 11 — BUG 4 (Payment Plan Mismatch) :
+// AVANT : PLANS = ['free', 'pro', 'pro_max'] — 'starter' absent
+// MAINTENANT : 'starter' est un alias de 'pro' (plan payant niveau 1)
+//   - leekpay.service.ts getPlans() retourne 'starter' (4 900 XOF)
+//   - leekpay.service.ts mapPlanId('starter') → 'pro' (plan interne)
+//   - getPlanLimits('starter') → PLAN_LIMITS['pro'] (via alias dans getPlanLimits)
+//   - Une seule source de vérité : les limites de 'starter' = limites de 'pro'
 // ============================================================
 
 export const PLANS = ['free', 'pro', 'pro_max'] as const;
 export type Plan = (typeof PLANS)[number];
+
+// Alias de plan : 'starter' (nom LeekPay) → 'pro' (plan interne)
+// Utilisé dans getPlanLimits() pour que 'starter' retourne les limites 'pro'
+export const PLAN_ALIASES: Record<string, Plan> = {
+  starter: 'pro',
+};
 
 export interface PlanLimits {
   // Conversions
@@ -127,7 +141,11 @@ export const PLAN_DISPLAY: Record<Plan, { name: string; price: { monthly: number
 };
 
 export function getPlanLimits(plan: string): PlanLimits {
+  // Direct match
   if (plan in PLAN_LIMITS) return PLAN_LIMITS[plan as Plan];
+  // FIX PHASE 11 — BUG 4: alias support ('starter' → 'pro')
+  if (plan in PLAN_ALIASES) return PLAN_LIMITS[PLAN_ALIASES[plan]!];
+  // Fallback to free (never block users due to unknown plan)
   return PLAN_LIMITS.free;
 }
 

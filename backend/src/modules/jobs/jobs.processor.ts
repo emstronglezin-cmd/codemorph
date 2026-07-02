@@ -43,13 +43,17 @@ export class JobsProcessor {
   ) {}
 
   // ── Main processor ────────────────────────────────────
+  // FIX PHASE 11 — BUG 2 (STEP logs) :
+  // Chaque étape du worker est loggée avec un numéro STEP 5→10
+  // pour traçabilité complète dans les logs Render.
   @Process('run-conversion')
   async handleConversion(job: Job<ConversionJobPayload>): Promise<void> {
     const { jobId, dto } = job.data;
     const tag = `[Job ${jobId}]`;
 
+    this.logger.log(`━━━ ${tag} STEP 5 ━━━ Worker picked up job from Bull queue`);
     this.logger.log(
-      `${tag} ▶ START — type=${dto.type} src=${dto.sourceLanguage} tgt=${dto.targetLanguage} ` +
+      `${tag} type=${dto.type} src=${dto.sourceLanguage} tgt=${dto.targetLanguage} ` +
       `userId=${dto.userId} attempt=${job.attemptsMade + 1}`,
     );
 
@@ -68,7 +72,7 @@ export class JobsProcessor {
       //
       // Fix: ne pas écraser le statut si c'est un retry (attemptsMade > 0)
       // ET que le job est déjà FAILED (évite de le compter comme actif entre les attempts).
-      this.logger.log(`${tag} Phase 1/3: Fetching source files (type=${dto.type}) attempt=${job.attemptsMade + 1}…`);
+      this.logger.log(`━━━ ${tag} STEP 6 ━━━ Fetching source files (type=${dto.type}) attempt=${job.attemptsMade + 1}…`);
       if (job.attemptsMade === 0) {
         // Premier attempt → passer en ANALYZING (normal)
         await this.jobsService.updateStatus(jobId, JobStatus.ANALYZING);
@@ -113,13 +117,14 @@ export class JobsProcessor {
           `Fetching files from GitHub: ${dto.sourceRepo}@${dto.sourceBranch ?? 'main'}…`,
         );
 
+        this.logger.log(`━━━ ${tag} STEP 7 ━━━ Cloning/fetching GitHub repo: ${dto.sourceRepo}@${dto.sourceBranch ?? 'main'}…`);
         files = await this.githubApiService.fetchRepoFiles(
           dto.sourceRepo,
           dto.sourceBranch ?? 'main',
           dto.userId,
         );
 
-        this.logger.log(`${tag} GitHub: fetched ${files.length} files from ${dto.sourceRepo}`);
+        this.logger.log(`━━━ ${tag} STEP 7 ✓ ━━━ GitHub: fetched ${files.length} files from ${dto.sourceRepo}`);
 
         // Enforce per-plan file count limit
         if (limits.maxFilesPerProject > 0 && files.length > limits.maxFilesPerProject) {
@@ -172,7 +177,7 @@ export class JobsProcessor {
         );
       }
 
-      this.logger.log(`${tag} Files ready: ${files.length} files to convert`);
+      this.logger.log(`━━━ ${tag} STEP 8 ━━━ Source analysis ready: ${files.length} files to convert`);
 
       // ── Phase 2: Check AI rate limit ──────────────────────
       this.logger.log(`${tag} Phase 2/3: Checking AI rate limit (plan=${plan})…`);
@@ -187,7 +192,7 @@ export class JobsProcessor {
       this.logger.log(`${tag} AI rate limit: OK`);
 
       // ── Phase 3: Dispatch to AI Engine ────────────────────
-      this.logger.log(`${tag} Phase 3/3: Dispatching to AI Engine…`);
+      this.logger.log(`━━━ ${tag} STEP 9 ━━━ Dispatching to AI Engine (${dto.sourceLanguage} → ${dto.targetLanguage})…`);
       await this.jobsService.updateStatus(jobId, JobStatus.CONVERTING);
       await this.jobsService.appendLog(
         jobId, 'ir-generation', 'running',
@@ -203,7 +208,8 @@ export class JobsProcessor {
         `AI Engine job ${aiJobId} started — awaiting callback…`,
       );
 
-      this.logger.log(`${tag} ✅ Dispatched to AI Engine as ${aiJobId}`);
+      this.logger.log(`━━━ ${tag} STEP 9 ✓ ━━━ Dispatched to AI Engine as ${aiJobId} — awaiting callback…`);
+      this.logger.log(`━━━ ${tag} STEP 10 ━━━ Job is now CONVERTING — callback will update status to DONE or FAILED`);
 
       // Track AI usage quota
       await this.quotaService.incrementConversions(dto.userId, plan);
