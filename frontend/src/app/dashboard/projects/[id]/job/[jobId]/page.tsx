@@ -6,6 +6,7 @@ import Link from 'next/link';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { getAccessToken } from '@/lib/api/client';
 
 interface PhaseLog {
   phase: string;
@@ -63,17 +64,42 @@ export default function JobTrackingPage() {
   const logsEndRef = useRef<HTMLDivElement>(null);
   const pollRef = useRef<ReturnType<typeof setInterval>>();
 
+  // FIX PHASE 12 — BUG CRITIQUE 1 :
+  // AVANT: fetch sans Authorization header → 401 → res.ok = false → setJob() jamais appelé
+  //        → page vide indéfiniment, spinner infini, conversion jamais visible
+  // MAINTENANT: Bearer token injecté + gestion 401 explicite
   const fetchJob = async () => {
-    const res = await fetch(`${BACKEND}/jobs/${jobId}`, { credentials: 'include' });
-    if (res.ok) {
-      const data = await res.json();
-      const j = data.data ?? data;
-      setJob(j);
-      if (['done', 'failed'].includes(j.status)) {
+    const token = getAccessToken();
+    const headers: Record<string, string> = token
+      ? { Authorization: `Bearer ${token}` }
+      : {};
+
+    try {
+      const res = await fetch(`${BACKEND}/jobs/${jobId}`, {
+        headers,
+        credentials: 'include',
+      });
+
+      if (res.status === 401) {
+        // Token expiré → arrêter le polling, laisser le refresh interceptor gérer
         clearInterval(pollRef.current);
+        setLoading(false);
+        return;
       }
+
+      if (res.ok) {
+        const data = await res.json() as { data?: Job; success?: boolean } | Job;
+        const j = (data as { data?: Job }).data ?? (data as Job);
+        setJob(j);
+        if (['done', 'failed'].includes(j.status)) {
+          clearInterval(pollRef.current);
+        }
+      }
+    } catch {
+      // Erreur réseau transitoire → continuer le polling
+    } finally {
+      setLoading(false);
     }
-    setLoading(false);
   };
 
   useEffect(() => {

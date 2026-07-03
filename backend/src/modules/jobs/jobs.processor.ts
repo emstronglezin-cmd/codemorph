@@ -14,7 +14,10 @@ import { GitHubApiService }    from '../github/github-api.service';
 import { UploadsService }      from '../uploads/uploads.service';
 import { QuotaService }        from '../quota/quota.service';
 import { SubscriptionService } from '../subscription/subscription.service';
-import { PLAN_LIMITS }         from '../subscription/plan-limits.config';
+// FIX PHASE 12 — BUG CRITIQUE 2 : getPlanLimits() au lieu de PLAN_LIMITS[plan]
+// PLAN_LIMITS['starter'] = undefined → TypeError: Cannot read properties of undefined
+// getPlanLimits() gère starter→pro alias, retourne toujours PlanLimits valide
+import { getPlanLimits } from '../subscription/plan-limits.config';
 
 interface ConversionJobPayload {
   jobId: string;
@@ -58,9 +61,11 @@ export class JobsProcessor {
     );
 
     // Get user plan for limits
+    // FIX PHASE 12 : getPlanLimits() gère les aliases (starter→pro)
+    // PLAN_LIMITS[plan] retourne undefined si plan='starter' → TypeError crash
     const plan   = await this.subscriptionSvc.getUserPlan(dto.userId);
-    const limits = PLAN_LIMITS[plan];
-    this.logger.log(`${tag} Plan: ${plan} | maxFiles: ${limits.maxFilesPerProject} | priority: ${limits.queuePriority}`);
+    const limits = getPlanLimits(plan);
+    this.logger.log(`${tag} Plan: ${plan} | maxFiles: ${limits.maxFilesPerProject} | priority: ${limits.queuePriority} | advancedFrameworks: ${limits.advancedFrameworks}`);
 
     try {
       // ── Phase 1: Fetch source files ──────────────────────

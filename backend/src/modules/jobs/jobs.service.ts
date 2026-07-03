@@ -28,6 +28,9 @@ import { Cron, CronExpression } from '@nestjs/schedule';
 import { JobEntity, JobStatus, JobType } from './jobs.entity';
 import { AiEngineClient }                from './ai-engine.client';
 import { QuotaService, STALE_JOB_MINUTES } from '../quota/quota.service';
+// FIX PHASE 12 — BUG CRITIQUE 2 : utiliser getPlanLimits() au lieu de PLAN_LIMITS[plan]
+// PLAN_LIMITS[plan] retourne undefined si plan='starter' → TypeError → crash
+// getPlanLimits() gère les aliases et retourne toujours une valeur valide
 
 // FIX PHASE 11 — WATCHDOG CONVERTING
 // Un job PENDING/ANALYZING sans activité > 15min → FAILED (existant)
@@ -36,7 +39,7 @@ import { QuotaService, STALE_JOB_MINUTES } from '../quota/quota.service';
 // Si >5min → le callback a échoué silencieusement → zombie job.
 const CONVERTING_STALE_MINUTES = 5;
 import { SubscriptionService }           from '../subscription/subscription.service';
-import { PLAN_LIMITS }                   from '../subscription/plan-limits.config';
+import { getPlanLimits }                 from '../subscription/plan-limits.config';
 
 export interface StartConversionDto {
   projectId?:     string;
@@ -222,10 +225,13 @@ export class JobsService implements OnModuleInit {
     );
 
     // 1. Fetch user plan
+    // FIX PHASE 12 — BUG CRITIQUE 2 : getPlanLimits() au lieu de PLAN_LIMITS[plan]
+    // PLAN_LIMITS['starter'] = undefined → TypeError si plan='starter'
+    // getPlanLimits() résout les aliases (starter→pro) et ne retourne jamais undefined
     this.logger.log(`${tag} Step 1/6: Fetching user plan…`);
     const plan   = await this.subscriptionSvc.getUserPlan(dto.userId);
-    const limits = PLAN_LIMITS[plan];
-    this.logger.log(`${tag} Plan: ${plan}`);
+    const limits = getPlanLimits(plan);
+    this.logger.log(`${tag} Plan: ${plan} → limits.advancedFrameworks=${limits.advancedFrameworks}`);
 
     // 2. Enforce monthly quota
     this.logger.log(`${tag} Step 2/6: Enforcing monthly quota…`);

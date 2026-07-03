@@ -80,15 +80,31 @@ export class LeekPayService {
     @Inject(forwardRef(() => SubscriptionService))
     private readonly subscriptionService: SubscriptionService,
   ) {
+    // FIX PHASE 12 — BUG CRITIQUE 3 : logs de diagnostic au démarrage
+    // Permet de vérifier exactement quelle valeur est lue depuis Render
+    // sans exposer la clé complète (seulement préfixe/longueur)
+
     // Clés LeekPay depuis les variables d'environnement Render
     // LEEKPAY_SECRET_KEY et LEEKPAY_PUBLIC_KEY doivent être configurées dans Render
-    this.secretKey  = this.config.get<string>('LEEKPAY_SECRET_KEY') ?? '';
-    this.publicKey  = this.config.get<string>('LEEKPAY_PUBLIC_KEY') ?? '';
+    this.secretKey  = (this.config.get<string>('LEEKPAY_SECRET_KEY') ?? '').trim();
+    this.publicKey  = (this.config.get<string>('LEEKPAY_PUBLIC_KEY') ?? '').trim();
     this.frontendUrl = this.config.get<string>('FRONTEND_URL')
                       ?? 'https://codemorph-coral.vercel.app';
 
+    // Diagnostic précis pour identifier pourquoi la clé est considérée absente
+    // Affiche le préfixe (6 premiers chars) et la longueur — jamais la clé complète
+    const skPrefix = this.secretKey ? `${this.secretKey.slice(0, 6)}... (len=${this.secretKey.length})` : 'EMPTY';
+    const pkPrefix = this.publicKey ? `${this.publicKey.slice(0, 6)}... (len=${this.publicKey.length})` : 'EMPTY';
+    this.logger.log(`LeekPay keys at startup: SK=${skPrefix}, PK=${pkPrefix}`);
+
     if (!this.secretKey) {
-      this.logger.warn('⚠️  LEEKPAY_SECRET_KEY non configurée — les paiements échoueront');
+      this.logger.error(
+        '❌ LEEKPAY_SECRET_KEY is EMPTY after trim(). ' +
+        'Verify in Render: env var name is exactly "LEEKPAY_SECRET_KEY" (no spaces, no quotes). ' +
+        'The value must not be empty. Payments will fail.',
+      );
+    } else {
+      this.logger.log('✅ LEEKPAY_SECRET_KEY configured — LeekPay payments enabled');
     }
     if (!this.publicKey) {
       this.logger.warn('⚠️  LEEKPAY_PUBLIC_KEY non configurée — la vérification webhook échouera');
@@ -100,9 +116,14 @@ export class LeekPayService {
     params: LeekPayCheckoutRequest,
   ): Promise<LeekPayCheckout> {
     if (!this.secretKey) {
+      // FIX PHASE 12 : message d'erreur plus actionnable
+      // Le frontend billing/page.tsx détecte 'LEEKPAY_SECRET_KEY' dans le message
+      // pour afficher "Paiement non disponible : la clé LeekPay n'est pas configurée"
       throw new BadRequestException(
-        'Paiement non configuré : LEEKPAY_SECRET_KEY manquante. ' +
-        'Contactez l\'administrateur pour configurer les clés LeekPay dans Render.',
+        'Paiement non configuré : LEEKPAY_SECRET_KEY manquante ou vide. ' +
+        'Vérifiez dans Render que la variable "LEEKPAY_SECRET_KEY" est définie ' +
+        '(sans guillemets, sans espaces). ' +
+        'Contactez l\'administrateur pour configurer les clés LeekPay.',
       );
     }
 
