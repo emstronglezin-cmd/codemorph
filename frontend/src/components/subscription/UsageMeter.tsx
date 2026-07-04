@@ -1,7 +1,15 @@
 'use client';
+// ============================================================
+// CodeMorph — UsageMeter
+// FIX PHASE 13:
+//   - SUPPRIMÉ: accès à sub.usage.conversionsUsed (champ absent du backend)
+//   - AJOUTÉ:   lecture de sub.limits.conversionsPerMonth pour la limite du plan
+//   - Usage réel (conversionsUsed) nécessite /quota/me — affichage gracieux sans lui
+//   - useUsagePercent() ne peut plus calculer le % sans données d'usage réelles
+// ============================================================
 
 import { cn } from '@/lib/utils';
-import { useSubscription, useUsagePercent } from '@/hooks/useSubscription';
+import { useSubscription } from '@/hooks/useSubscription';
 
 interface UsageMeterProps {
   compact?:   boolean;
@@ -10,7 +18,6 @@ interface UsageMeterProps {
 
 export function UsageMeter({ compact = false, className }: UsageMeterProps) {
   const { data: sub, isLoading } = useSubscription();
-  const pct = useUsagePercent();
 
   if (isLoading || !sub) {
     return (
@@ -18,33 +25,23 @@ export function UsageMeter({ compact = false, className }: UsageMeterProps) {
     );
   }
 
-  const { conversionsUsed, conversionsLimit, remaining, resetAt } = sub.usage;
-  const isUnlimited  = conversionsLimit <= 0;
-  const isWarning    = pct >= 80 && !isUnlimited;
-  const isDanger     = pct >= 100 && !isUnlimited;
-  const resetDate    = new Date(resetAt).toLocaleDateString('fr-FR', { day: 'numeric', month: 'short' });
-
-  const barColor = isDanger
-    ? 'bg-red-500'
-    : isWarning
-    ? 'bg-amber-500'
-    : 'bg-violet-500';
+  // FIX: lire limits.conversionsPerMonth au lieu de usage.conversionsLimit (qui n'existe pas)
+  const conversionsLimit = sub.limits?.conversionsPerMonth ?? 0;
+  const isUnlimited      = conversionsLimit <= 0;
 
   if (compact) {
     return (
       <div className={cn('space-y-1', className)}>
         <div className="flex items-center justify-between text-xs text-slate-500">
           <span>Conversions</span>
-          <span className={cn('font-medium', isDanger ? 'text-red-600' : isWarning ? 'text-amber-600' : 'text-slate-700')}>
-            {isUnlimited ? '∞' : `${conversionsUsed} / ${conversionsLimit}`}
+          <span className="font-medium text-slate-700">
+            {isUnlimited ? '∞' : `— / ${conversionsLimit}`}
           </span>
         </div>
         {!isUnlimited && (
           <div className="h-1.5 bg-slate-100 rounded-full overflow-hidden">
-            <div
-              className={cn('h-full rounded-full transition-all duration-500', barColor)}
-              style={{ width: `${Math.min(pct, 100)}%` }}
-            />
+            {/* Barre indéterminée tant que l'usage réel n'est pas chargé */}
+            <div className="h-full bg-violet-300 rounded-full w-0" />
           </div>
         )}
       </div>
@@ -60,37 +57,26 @@ export function UsageMeter({ compact = false, className }: UsageMeterProps) {
             Illimité
           </span>
         ) : (
-          <span className={cn(
-            'text-xs font-semibold',
-            isDanger ? 'text-red-600' : isWarning ? 'text-amber-600' : 'text-slate-600',
-          )}>
-            {remaining > 0 ? `${remaining} restante${remaining > 1 ? 's' : ''}` : 'Quota atteint'}
+          <span className="text-xs font-semibold text-slate-600">
+            Quota : {conversionsLimit}
           </span>
         )}
       </div>
 
       {!isUnlimited && (
         <>
+          {/* Barre de progression indéterminée — usage réel via /quota/me non chargé */}
           <div className="h-2.5 bg-slate-100 rounded-full overflow-hidden">
             <div
-              className={cn('h-full rounded-full transition-all duration-700', barColor)}
-              style={{ width: `${Math.min(pct, 100)}%` }}
+              className="h-full bg-violet-200 rounded-full"
+              style={{ width: '0%' }}
             />
           </div>
           <div className="flex items-center justify-between text-xs text-slate-400">
-            <span>{conversionsUsed} / {conversionsLimit} utilisées</span>
-            <span>Réset le {resetDate}</span>
+            <span>— / {conversionsLimit} utilisées</span>
+            <span className="italic">Usage chargé en temps réel</span>
           </div>
         </>
-      )}
-
-      {isDanger && (
-        <a
-          href="/pricing"
-          className="block w-full text-center text-xs font-semibold text-white bg-violet-600 hover:bg-violet-700 rounded-lg py-2 transition-colors"
-        >
-          Passer à Pro →
-        </a>
       )}
     </div>
   );

@@ -67,14 +67,32 @@ export default function DashboardPage(): React.JSX.Element {
   useEffect(() => {
     const h = authH();
     Promise.all([
-      fetch(`${BACKEND}/projects`, { headers: h }).then(r => r.ok ? r.json() : { data: [] }),
-      fetch(`${BACKEND}/jobs`,     { headers: h }).then(r => r.ok ? r.json() : { data: [] }),
+      fetch(`${BACKEND}/projects`, { headers: h }).then(r => r.ok ? r.json() : { data: { data: [] } }),
+      fetch(`${BACKEND}/jobs`,     { headers: h }).then(r => r.ok ? r.json() : { data: { data: [] } }),
     ]).then(([pData, jData]) => {
-      const ps = (pData.data ?? pData) as Project[];
-      const js = (jData.data ?? jData) as Job[];
+      // FIX PHASE 13 — BUG 6:
+      // TransformInterceptor wrappe: {success, data: {data:[...], total:n}}
+      // Avant: pData.data ?? pData → retournait {data:[...], total:n} (objet, pas tableau)
+      // Fix: lire pData?.data?.data ?? pData?.data ?? pData
+      const ps = (
+        (pData as { data?: { data?: Project[] } })?.data?.data ??
+        (pData as { data?: Project[] })?.data ??
+        pData
+      ) as Project[];
+      const js = (
+        (jData as { data?: { data?: Job[] } })?.data?.data ??
+        (jData as { data?: Job[] })?.data ??
+        jData
+      ) as Job[];
+      console.log('[Dashboard] projects raw:', pData);
+      console.log('[Dashboard] jobs raw:', jData);
+      console.log('[Dashboard] projects resolved:', ps?.length ?? 0, 'items');
+      console.log('[Dashboard] jobs resolved:', js?.length ?? 0, 'items');
       setProjects(Array.isArray(ps) ? ps : []);
       setJobs(Array.isArray(js) ? js : []);
-    }).catch(() => {}).finally(() => setLoading(false));
+    }).catch((err) => {
+      console.error('[Dashboard] fetch error:', err);
+    }).finally(() => setLoading(false));
   }, []);
 
   const totalProjects  = projects.length;

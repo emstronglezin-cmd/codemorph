@@ -341,26 +341,38 @@ export default function NewProjectPage() {
     const steps = getProgressSteps(method);
     setProgressSteps(steps);
 
+    console.log('[NewProject] handleStart BEGIN', {
+      method,
+      framework,
+      projectName: projectName.trim(),
+      selectedRepo: selectedRepo?.fullName ?? null,
+      backend: BACKEND,
+    });
+
     try {
       const fw = FRAMEWORKS.find(f => f.id === framework)!;
 
       // Step 0: Create project
       updateProgress(0, 'running');
+      const projectPayload = {
+        name:           projectName.trim(),
+        description:    description.trim() || undefined,
+        sourceLanguage: fw.sourceLang,
+        targetLanguage: fw.targetLang,
+      };
+      console.log(`[NewProject] STEP 0 POST ${BACKEND}/projects`, projectPayload);
       const projRes = await fetch(`${BACKEND}/projects`, {
         method: 'POST',
         headers: authHeaders(),
-        body: JSON.stringify({
-          name:           projectName.trim(),
-          description:    description.trim() || undefined,
-          sourceLanguage: fw.sourceLang,
-          targetLanguage: fw.targetLang,
-        }),
+        body: JSON.stringify(projectPayload),
       });
       const projRaw = await projRes.json() as Record<string, unknown>;
+      console.log(`[NewProject] STEP 0 response ${projRes.status}:`, projRaw);
       if (!projRes.ok) throw new Error(extractError(projRaw, projRes.status, 'Project creation failed'));
       const projData  = (projRaw['data'] as Record<string, unknown> | undefined) ?? projRaw;
       const projectId = (projData['id'] as string | undefined) ?? '';
       if (!projectId) throw new Error('Project created but server returned no ID');
+      console.log('[NewProject] STEP 0 projectId:', projectId);
       updateProgress(0, 'done');
 
       // Step 1: Import source
@@ -369,46 +381,52 @@ export default function NewProjectPage() {
 
       if (method === 'github') {
         if (!selectedRepo) throw new Error('No repository selected');
+        const ghPayload = {
+          projectId,
+          sourceLanguage: fw.sourceLang,
+          targetLanguage: fw.targetLang,
+          repo:           selectedRepo.fullName,
+          branch:         selectedBranch,
+          goalPrompt:     goalPrompt.trim() || undefined,
+        };
+        console.log(`[NewProject] STEP 1 POST ${BACKEND}/jobs/start/github`, ghPayload);
         jobRes = await fetch(`${BACKEND}/jobs/start/github`, {
           method: 'POST',
           headers: authHeaders(),
-          body: JSON.stringify({
-            projectId,
-            sourceLanguage: fw.sourceLang,
-            targetLanguage: fw.targetLang,
-            repo:           selectedRepo.fullName,
-            branch:         selectedBranch,
-            goalPrompt:     goalPrompt.trim() || undefined,
-          }),
+          body: JSON.stringify(ghPayload),
         });
 
       } else if (method === 'zip') {
         const zPath = zipPath || await uploadZip();
         updateProgress(1, 'done');
         updateProgress(2, 'running');
+        const zipPayload = {
+          projectId,
+          sourceLanguage: fw.sourceLang,
+          targetLanguage: fw.targetLang,
+          zipPath:        zPath,
+          goalPrompt:     goalPrompt.trim() || undefined,
+        };
+        console.log(`[NewProject] STEP 1 POST ${BACKEND}/jobs/start/zip`, zipPayload);
         jobRes = await fetch(`${BACKEND}/jobs/start/zip`, {
           method: 'POST',
           headers: authHeaders(),
-          body: JSON.stringify({
-            projectId,
-            sourceLanguage: fw.sourceLang,
-            targetLanguage: fw.targetLang,
-            zipPath:        zPath,
-            goalPrompt:     goalPrompt.trim() || undefined,
-          }),
+          body: JSON.stringify(zipPayload),
         });
 
       } else {
+        const urlPayload = {
+          projectId,
+          sourceLanguage: fw.sourceLang,
+          targetLanguage: fw.targetLang,
+          sourceUrl:      sourceUrl.trim(),
+          goalPrompt:     goalPrompt.trim() || undefined,
+        };
+        console.log(`[NewProject] STEP 1 POST ${BACKEND}/jobs/start/url`, urlPayload);
         jobRes = await fetch(`${BACKEND}/jobs/start/url`, {
           method: 'POST',
           headers: authHeaders(),
-          body: JSON.stringify({
-            projectId,
-            sourceLanguage: fw.sourceLang,
-            targetLanguage: fw.targetLang,
-            sourceUrl:      sourceUrl.trim(),
-            goalPrompt:     goalPrompt.trim() || undefined,
-          }),
+          body: JSON.stringify(urlPayload),
         });
       }
 
@@ -417,10 +435,12 @@ export default function NewProjectPage() {
       // Step 2: Read job response
       updateProgress(2, 'running');
       const jobRaw = await jobRes.json() as Record<string, unknown>;
+      console.log(`[NewProject] STEP 2 job response ${jobRes.status}:`, jobRaw);
       if (!jobRes.ok) throw new Error(extractError(jobRaw, jobRes.status, 'Job creation failed'));
       const jobData = (jobRaw['data'] as Record<string, unknown> | undefined) ?? jobRaw;
       const jobId   = (jobData['id'] as string | undefined) ?? '';
       if (!jobId) throw new Error('Job created but server returned no ID');
+      console.log('[NewProject] STEP 2 jobId:', jobId, 'status:', jobData['status']);
 
       // Job immediately FAILED (Redis unavailable etc.)
       if ((jobData['status'] as string) === 'failed') {
@@ -429,10 +449,17 @@ export default function NewProjectPage() {
       updateProgress(2, 'done');
       updateProgress(3, 'done');
 
+      console.log(`[NewProject] handleStart SUCCESS → /dashboard/projects/${projectId}/job/${jobId}`);
       router.push(`/dashboard/projects/${projectId}/job/${jobId}`);
 
     } catch (err) {
-      setError((err as Error).message);
+      const errMsg = (err as Error).message;
+      console.error('[NewProject] handleStart ERROR:', {
+        message: errMsg,
+        stack:   err instanceof Error ? err.stack : undefined,
+        raw:     err,
+      });
+      setError(errMsg);
       setProgressSteps(prev => {
         const idx = prev.findIndex(s => s.status === 'running');
         if (idx < 0) return prev;

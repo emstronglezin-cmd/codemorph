@@ -100,8 +100,11 @@ function BillingContent() {
     setLoadStep('Création du paiement…');
     setError('');
 
+    console.log(`[Billing] handleUpgrade START — planId="${planId}", API_URL="${API_URL}"`);
+
     // Timeout global 15 secondes
     const timeoutId = setTimeout(() => {
+      console.error('[Billing] handleUpgrade TIMEOUT (15s)');
       setError('Délai dépassé (15s). Vérifiez votre connexion et réessayez.');
       setLoading(null);
       setLoadStep('');
@@ -109,6 +112,7 @@ function BillingContent() {
 
     try {
       const token = getAccessToken();
+      console.log(`[Billing] token present: ${!!token}, token prefix: ${token ? token.substring(0, 20) + '…' : 'none'}`);
       if (!token) {
         clearTimeout(timeoutId);
         setError('Session expirée. Reconnectez-vous.');
@@ -119,24 +123,34 @@ function BillingContent() {
 
       setLoadStep('Connexion au serveur de paiement…');
 
+      const requestUrl  = `${API_URL}/payments/checkout`;
+      const requestBody = JSON.stringify({ planId });
+      console.log(`[Billing] POST ${requestUrl}`, { planId });
+
       const controller = new AbortController();
       const abortTimeout = setTimeout(() => controller.abort(), 14_000);
 
       let res: Response;
       try {
-        res = await fetch(`${API_URL}/payments/checkout`, {
+        res = await fetch(requestUrl, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
             Authorization: `Bearer ${token}`,
           },
-          body: JSON.stringify({ planId }),
+          body: requestBody,
           signal: controller.signal,
         });
       } catch (fetchErr: unknown) {
         clearTimeout(abortTimeout);
         clearTimeout(timeoutId);
         const isAbort = fetchErr instanceof Error && fetchErr.name === 'AbortError';
+        console.error('[Billing] fetch error:', {
+          isAbort,
+          name:    fetchErr instanceof Error ? fetchErr.name    : 'unknown',
+          message: fetchErr instanceof Error ? fetchErr.message : String(fetchErr),
+          stack:   fetchErr instanceof Error ? fetchErr.stack   : undefined,
+        });
         setError(isAbort
           ? 'Délai dépassé. Le serveur de paiement ne répond pas. Réessayez dans quelques instants.'
           : 'Erreur réseau. Vérifiez votre connexion et réessayez.'
@@ -147,6 +161,8 @@ function BillingContent() {
       }
       clearTimeout(abortTimeout);
 
+      console.log(`[Billing] response status: ${res.status} ${res.statusText}`);
+
       const data = await res.json() as {
         data?: { payment_url?: string; checkoutUrl?: string; url?: string };
         payment_url?: string;
@@ -156,6 +172,8 @@ function BillingContent() {
         success?: boolean;
       };
 
+      console.log('[Billing] response body:', JSON.stringify(data, null, 2));
+
       if (!res.ok) {
         clearTimeout(timeoutId);
         // FIX PHASE 11 — BUG 4 : message d'erreur précis selon le type d'erreur
@@ -163,6 +181,7 @@ function BillingContent() {
         //        (ex: LEEKPAY_SECRET_KEY manquante → 400 → "Plan non reconnu" trompeur)
         // MAINTENANT: on distingue les erreurs par leur contenu exact
         const msg = (data?.success === false ? data?.message : null) ?? data?.message ?? `Erreur ${res.status}`;
+        console.error(`[Billing] HTTP error ${res.status}: "${msg}"`);
         if (res.status === 401 || res.status === 403) {
           setError('Session expirée. Reconnectez-vous.');
         } else if (msg.toLowerCase().includes('plan inconnu') || msg.toLowerCase().includes('plan unknown')) {
@@ -188,8 +207,11 @@ function BillingContent() {
         data?.checkoutUrl ??
         data?.url;
 
+      console.log('[Billing] paymentUrl resolved:', paymentUrl);
+
       if (!paymentUrl) {
         clearTimeout(timeoutId);
+        console.error('[Billing] No payment URL in response. Full response:', data);
         setError('URL de paiement manquante dans la réponse. Vérifiez la configuration LeekPay sur Render.');
         setLoading(null);
         setLoadStep('');
@@ -199,6 +221,7 @@ function BillingContent() {
       // Afficher l'étape finale avant redirection
       clearTimeout(timeoutId);
       setLoadStep('Redirection vers LeekPay…');
+      console.log(`[Billing] redirecting to: ${paymentUrl}`);
       // Redirection vers la page de paiement LeekPay
       window.location.href = paymentUrl;
       // Note: loading reste true intentionnellement pendant la redirection
@@ -206,6 +229,11 @@ function BillingContent() {
     } catch (err: unknown) {
       clearTimeout(timeoutId);
       const msg = err instanceof Error ? err.message : 'Erreur inconnue';
+      console.error('[Billing] unexpected error:', {
+        message: msg,
+        stack:   err instanceof Error ? err.stack : undefined,
+        raw:     err,
+      });
       setError(`Erreur : ${msg}`);
       setLoading(null);
       setLoadStep('');

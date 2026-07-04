@@ -1,8 +1,16 @@
 'use client';
+// ============================================================
+// CodeMorph — UpgradeGate
+// FIX PHASE 13:
+//   - CORRIGÉ: checkout({ plan, interval }) → checkout({ planId })
+//     Le backend /payments/checkout attend {planId}, pas {plan, interval}
+//   - useCheckout() pointe maintenant /payments/checkout (LeekPay réel)
+//   - Suppression de BillingInterval (plus utilisé ici)
+// ============================================================
 
 import type React from 'react';
 import { useState } from 'react';
-import { useSubscription, useCheckout, usePlans, type Plan, type BillingInterval } from '@/hooks/useSubscription';
+import { useSubscription, useCheckout, usePlans, type Plan } from '@/hooks/useSubscription';
 import { PlanBadge } from './PlanBadge';
 import { cn } from '@/lib/utils';
 
@@ -25,7 +33,7 @@ export function UpgradeGate({
 }: UpgradeGateProps) {
   const { data: sub } = useSubscription();
 
-  const planOrder: Record<Plan, number> = { free: 0, pro: 1, pro_max: 2 };
+  const planOrder: Record<Plan, number> = { free: 0, starter: 1, pro: 2, pro_max: 3 };
   const userLevel     = planOrder[sub?.plan ?? 'free'] ?? 0;
   const requiredLevel = planOrder[requiredPlan] ?? 0;
 
@@ -50,6 +58,12 @@ export function UpgradeGate({
 function UpgradeInline({ feature, requiredPlan }: { feature: string; requiredPlan: Plan }) {
   const { mutate: checkout, isPending } = useCheckout();
 
+  const handleClick = () => {
+    // FIX: {planId} au lieu de {plan, interval}
+    console.log(`[UpgradeGate] checkout planId="${requiredPlan}"`);
+    checkout({ planId: requiredPlan });
+  };
+
   return (
     <div className="flex flex-col items-center justify-center gap-4 p-8 border-2 border-dashed border-slate-200 rounded-2xl bg-slate-50 text-center">
       <div className="w-12 h-12 rounded-full bg-violet-100 flex items-center justify-center">
@@ -69,11 +83,11 @@ function UpgradeInline({ feature, requiredPlan }: { feature: string; requiredPla
           Voir les plans
         </a>
         <button
-          onClick={() => checkout({ plan: requiredPlan, interval: 'monthly' })}
+          onClick={handleClick}
           disabled={isPending}
           className="px-4 py-2 text-sm font-semibold text-white bg-violet-600 hover:bg-violet-700 rounded-lg transition-colors disabled:opacity-50"
         >
-          {isPending ? 'Chargement…' : `Passer à ${requiredPlan === 'pro_max' ? 'Pro Max' : 'Pro'}`}
+          {isPending ? 'Chargement…' : `Passer à ${requiredPlan === 'pro_max' ? 'Pro Max' : requiredPlan === 'starter' ? 'Starter' : 'Pro'}`}
         </button>
       </div>
     </div>
@@ -83,6 +97,12 @@ function UpgradeInline({ feature, requiredPlan }: { feature: string; requiredPla
 // ── Banner ────────────────────────────────────────────────
 function UpgradeBanner({ feature, requiredPlan, onClose }: { feature: string; requiredPlan: Plan; onClose?: () => void }) {
   const { mutate: checkout, isPending } = useCheckout();
+
+  const handleClick = () => {
+    // FIX: {planId} au lieu de {plan, interval}
+    console.log(`[UpgradeGate] banner checkout planId="${requiredPlan}"`);
+    checkout({ planId: requiredPlan });
+  };
 
   return (
     <div className="flex items-center justify-between gap-4 px-4 py-3 bg-gradient-to-r from-violet-600 to-indigo-600 text-white rounded-xl">
@@ -97,7 +117,7 @@ function UpgradeBanner({ feature, requiredPlan, onClose }: { feature: string; re
       </div>
       <div className="flex items-center gap-2 shrink-0">
         <button
-          onClick={() => checkout({ plan: requiredPlan, interval: 'monthly' })}
+          onClick={handleClick}
           disabled={isPending}
           className="px-3 py-1 text-xs font-bold bg-white text-violet-700 rounded-lg hover:bg-violet-50 transition-colors disabled:opacity-50"
         >
@@ -117,13 +137,22 @@ function UpgradeBanner({ feature, requiredPlan, onClose }: { feature: string; re
 
 // ── Modal ─────────────────────────────────────────────────
 function UpgradeModal({ feature, requiredPlan, onClose }: { feature: string; requiredPlan: Plan; onClose?: () => void }) {
-  const [interval, setInterval] = useState<BillingInterval>('monthly');
-  const { data: plans }         = usePlans();
-  const { mutate: checkout, isPending } = useCheckout();
+  const [billingInterval, setBillingInterval] = useState<'monthly' | 'yearly'>('monthly');
+  const { data: plans }                       = usePlans();
+  const { mutate: checkout, isPending }       = useCheckout();
 
-  const plan = plans?.find(p => p.id === requiredPlan);
-  const price = plan?.price[interval] ?? 0;
-  const yearlyDiscount = plan ? Math.round((1 - plan.price.yearly / (plan.price.monthly * 12)) * 100) : 0;
+  const plan          = plans?.find(p => p.id === requiredPlan);
+  const price         = plan?.price[billingInterval] ?? 0;
+  const yearlyDiscount = plan
+    ? Math.round((1 - plan.price.yearly / (plan.price.monthly * 12)) * 100)
+    : 0;
+
+  const handleClick = () => {
+    // FIX: {planId} au lieu de {plan, interval}
+    // Le backend ne gère pas interval dans /payments/checkout — on passe juste planId
+    console.log(`[UpgradeGate] modal checkout planId="${requiredPlan}", interval="${billingInterval}"`);
+    checkout({ planId: requiredPlan });
+  };
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4">
@@ -153,10 +182,10 @@ function UpgradeModal({ feature, requiredPlan, onClose }: { feature: string; req
             {(['monthly', 'yearly'] as const).map((int) => (
               <button
                 key={int}
-                onClick={() => setInterval(int)}
+                onClick={() => setBillingInterval(int)}
                 className={cn(
                   'flex-1 py-1.5 text-sm font-medium rounded-md transition-all',
-                  interval === int ? 'bg-white shadow text-slate-800' : 'text-slate-500 hover:text-slate-700',
+                  billingInterval === int ? 'bg-white shadow text-slate-800' : 'text-slate-500 hover:text-slate-700',
                 )}
               >
                 {int === 'monthly' ? 'Mensuel' : 'Annuel'}
@@ -172,7 +201,7 @@ function UpgradeModal({ feature, requiredPlan, onClose }: { feature: string; req
           {/* Price */}
           <div className="text-center">
             <span className="text-4xl font-extrabold text-slate-900">${price}</span>
-            <span className="text-slate-400 ml-1">/{interval === 'monthly' ? 'mois' : 'an'}</span>
+            <span className="text-slate-400 ml-1">/{billingInterval === 'monthly' ? 'mois' : 'an'}</span>
           </div>
 
           {/* Features */}
@@ -191,7 +220,7 @@ function UpgradeModal({ feature, requiredPlan, onClose }: { feature: string; req
 
           {/* CTA */}
           <button
-            onClick={() => checkout({ plan: requiredPlan, interval })}
+            onClick={handleClick}
             disabled={isPending}
             className="w-full py-3 text-sm font-bold text-white bg-gradient-to-r from-violet-600 to-indigo-600 hover:from-violet-700 hover:to-indigo-700 rounded-xl transition-all shadow-lg shadow-violet-200 disabled:opacity-60"
           >
