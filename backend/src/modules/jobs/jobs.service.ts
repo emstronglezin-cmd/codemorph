@@ -409,10 +409,31 @@ export class JobsService implements OnModuleInit {
     //   1. API_URL env var (défini manuellement sur Render)
     //   2. RENDER_EXTERNAL_URL (injecté auto par Render) + /api/v1
     //   3. localhost (dev local seulement)
-    const renderUrl = process.env['RENDER_EXTERNAL_URL'];
-    const apiUrl = this.config.get<string>('API_URL')
+    const apiUrlEnv  = this.config.get<string>('API_URL');
+    const renderUrl  = process.env['RENDER_EXTERNAL_URL'];
+
+    // ── DIAG ENV resolution ──
+    const usedSource =
+      apiUrlEnv   ? 'API_URL'              :
+      renderUrl   ? 'RENDER_EXTERNAL_URL'  :
+                    'localhost (fallback)';
+    const apiUrl = apiUrlEnv
       ?? (renderUrl ? `${renderUrl}/api/v1` : 'http://localhost:4000/api/v1');
     const callbackUrl = `${apiUrl}/jobs/${job.id}/callback`;
+
+    this.logger.log(
+      `[DIAG dispatchToAiEngine] [Job ${job.id}] ENV resolution:\n` +
+      `  API_URL env          : ${apiUrlEnv ?? '(non défini)'}\n` +
+      `  RENDER_EXTERNAL_URL  : ${renderUrl ?? '(non défini)'}\n` +
+      `  source utilisé       : ${usedSource}\n` +
+      `  apiUrl résolu        : ${apiUrl}\n` +
+      `  callbackUrl          : ${callbackUrl}\n` +
+      `  files count          : ${files.length}\n` +
+      `  sourceLanguage       : ${job.sourceLanguage}\n` +
+      `  targetLanguage       : ${job.targetLanguage}\n` +
+      `  goalPrompt           : ${goalPrompt ? `"${goalPrompt.slice(0, 80)}…"` : '(none)'}\n` +
+      `  mockMode             : ${this.aiEngineClient.isMockMode}`,
+    );
 
     this.logger.log(
       `[Job ${job.id}] dispatchToAiEngine: ${files.length} files ` +
@@ -420,18 +441,34 @@ export class JobsService implements OnModuleInit {
       `mockMode=${this.aiEngineClient.isMockMode}`,
     );
 
-    const response = await this.aiEngineClient.submitConversion({
-      jobId:          job.id,
-      sourceLanguage: job.sourceLanguage,
-      targetLanguage: job.targetLanguage,
-      files,
-      goalPrompt:     goalPrompt ?? '',
-      callbackUrl,
-    });
+    let response: Awaited<ReturnType<typeof this.aiEngineClient.submitConversion>>;
+    try {
+      response = await this.aiEngineClient.submitConversion({
+        jobId:          job.id,
+        sourceLanguage: job.sourceLanguage,
+        targetLanguage: job.targetLanguage,
+        files,
+        goalPrompt:     goalPrompt ?? '',
+        callbackUrl,
+      });
+    } catch (err) {
+      this.logger.error(
+        `[DIAG dispatchToAiEngine] [Job ${job.id}] EXCEPTION in submitConversion:\n` +
+        `  message  : ${(err as Error)?.message ?? String(err)}\n` +
+        `  stack    : ${(err as Error)?.stack ?? '(no stack)'}`,
+      );
+      throw err;
+    }
 
     // FIX: response est AiConvertResponse { jobId, accepted, message? }
     // On retourne response.jobId (qui est string), pas l'objet entier
     const aiJobId = response.jobId ?? job.id;
+    this.logger.log(
+      `[DIAG dispatchToAiEngine] [Job ${job.id}] submitConversion OK:\n` +
+      `  aiJobId  : ${aiJobId}\n` +
+      `  accepted : ${response.accepted}\n` +
+      `  message  : ${response.message ?? '(none)'}`,
+    );
     this.logger.log(
       `[Job ${job.id}] AI Engine accepted: aiJobId=${aiJobId} accepted=${response.accepted}`,
     );

@@ -115,6 +115,24 @@ export class LeekPayService {
   async createCheckout(
     params: LeekPayCheckoutRequest,
   ): Promise<LeekPayCheckout> {
+
+    // ── DIAG: état des variables d'environnement utilisées ──
+    // On n'affiche jamais les clés en clair — seulement présence + longueur
+    const skLen    = this.secretKey.length;
+    const pkLen    = this.publicKey.length;
+    const skPrefix = skLen > 0 ? `${this.secretKey.slice(0, 6)}… (len=${skLen})` : 'ABSENT';
+    const pkPrefix = pkLen > 0 ? `${this.publicKey.slice(0, 6)}… (len=${pkLen})` : 'ABSENT';
+    const backendUrlEnv  = this.config.get<string>('BACKEND_URL') ?? '(non défini → fallback)';
+    const frontendUrlVal = this.frontendUrl;
+    this.logger.log(
+      `[DIAG createCheckout] ENV vars:\n` +
+      `  LEEKPAY_SECRET_KEY : ${skPrefix}\n` +
+      `  LEEKPAY_PUBLIC_KEY : ${pkPrefix}\n` +
+      `  BACKEND_URL        : ${backendUrlEnv}\n` +
+      `  FRONTEND_URL       : ${frontendUrlVal}\n` +
+      `  baseUrl (LeekPay)  : ${this.baseUrl}`,
+    );
+
     if (!this.secretKey) {
       // FIX PHASE 12 : message d'erreur plus actionnable
       // Le frontend billing/page.tsx détecte 'LEEKPAY_SECRET_KEY' dans le message
@@ -138,6 +156,26 @@ export class LeekPayService {
         `${backendUrl}/api/v1/payments/webhook`,
     };
 
+    // ── DIAG: payload exact envoyé à LeekPay ──
+    const targetUrl = `${this.baseUrl}/checkout`;
+    this.logger.log(
+      `[DIAG createCheckout] REQUEST:\n` +
+      `  METHOD  : POST\n` +
+      `  URL     : ${targetUrl}\n` +
+      `  TIMEOUT : 12000ms\n` +
+      `  PAYLOAD : ${JSON.stringify({
+        amount:         body.amount,
+        currency:       body.currency,
+        description:    body.description,
+        return_url:     body.return_url,
+        cancel_url:     body.cancel_url,
+        webhook_url:    body.webhook_url,
+        customer_email: body.customer_email ? `${body.customer_email.slice(0, 3)}…` : undefined,
+        customer_name:  body.customer_name  ? '[present]'                            : undefined,
+        metadata:       body.metadata,
+      })}`,
+    );
+
     this.logger.log(`Creating LeekPay checkout: ${params.amount} ${params.currency}`);
 
     // FIX PHASE 10 — CAUSE RACINE BUG 3 : fetch sans timeout
@@ -150,7 +188,7 @@ export class LeekPayService {
 
     let response: Response;
     try {
-      response = await fetch(`${this.baseUrl}/checkout`, {
+      response = await fetch(targetUrl, {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${this.secretKey}`,
@@ -161,7 +199,20 @@ export class LeekPayService {
       });
     } catch (fetchErr: unknown) {
       clearTimeout(leekpayTimeoutId);
-      const errName = (fetchErr as { name?: string })?.name ?? '';
+      const errName    = (fetchErr as { name?: string })?.name ?? '';
+      const errMessage = (fetchErr as Error)?.message ?? String(fetchErr);
+      const errStack   = (fetchErr as Error)?.stack ?? '(no stack)';
+
+      // ── DIAG: erreur réseau / timeout ──
+      this.logger.error(
+        `[DIAG createCheckout] FETCH ERROR:\n` +
+        `  URL     : ${targetUrl}\n` +
+        `  type    : ${errName || 'unknown'}\n` +
+        `  message : ${errMessage}\n` +
+        `  isAbort : ${errName === 'AbortError'}\n` +
+        `  stack   : ${errStack}`,
+      );
+
       if (errName === 'AbortError') {
         this.logger.error('LeekPay createCheckout: timeout after 12s — API did not respond');
         throw new BadRequestException(
@@ -175,36 +226,75 @@ export class LeekPayService {
       clearTimeout(leekpayTimeoutId);
     }
 
-    const json = (await response.json()) as {
-      success: boolean;
-      data: LeekPayCheckout;
-      message?: string;
-    };
+    // ── DIAG: lire le body brut avant de le parser ──
+    let rawBody = '';
+    let json: { success: boolean; data: LeekPayCheckout; message?: string };
+    try {
+      rawBody = await response.text();
+      this.logger.log(
+        `[DIAG createCheckout] RESPONSE:\n` +
+        `  STATUS : ${response.status} ${response.statusText}\n` +
+        `  BODY   : ${rawBody.slice(0, 2000)}`,
+      );
+      json = JSON.parse(rawBody) as { success: boolean; data: LeekPayCheckout; message?: string };
+    } catch (parseErr: unknown) {
+      this.logger.error(
+        `[DIAG createCheckout] JSON parse error:\n` +
+        `  STATUS   : ${response.status}\n` +
+        `  RAW BODY : ${rawBody.slice(0, 500)}\n` +
+        `  ERROR    : ${(parseErr as Error)?.message ?? String(parseErr)}`,
+      );
+      throw new BadRequestException(`LeekPay returned non-JSON response (HTTP ${response.status}): ${rawBody.slice(0, 200)}`);
+    }
 
     if (!response.ok || !json.success) {
-      this.logger.error(`LeekPay createCheckout error: ${JSON.stringify(json)}`);
+      this.logger.error(
+        `[DIAG createCheckout] LeekPay error response:\n` +
+        `  STATUS  : ${response.status}\n` +
+        `  success : ${json.success}\n` +
+        `  message : ${json.message ?? '(none)'}\n` +
+        `  body    : ${JSON.stringify(json)}`,
+      );
       throw new BadRequestException(
         json.message ?? `LeekPay error (${response.status})`,
       );
     }
 
+    this.logger.log(
+      `[DIAG createCheckout] SUCCESS:\n` +
+      `  checkout.id          : ${json.data?.id ?? '(none)'}\n` +
+      `  checkout.payment_url : ${json.data?.payment_url ?? '(none)'}\n` +
+      `  checkout.status      : ${json.data?.status ?? '(none)'}\n` +
+      `  checkout.amount      : ${json.data?.amount ?? '(none)'} ${json.data?.currency ?? ''}`,
+    );
     this.logger.log(`Checkout created: ${json.data.id} → ${json.data.payment_url}`);
     return json.data;
   }
 
   // ── Vérifier le statut d'un checkout ─────────────────
   async getCheckout(checkoutId: string): Promise<LeekPayCheckout> {
+    const targetUrl = `${this.baseUrl}/checkout/${checkoutId}`;
+    this.logger.log(`[DIAG getCheckout] GET ${targetUrl}`);
+
     const abortCtrl = new AbortController();
     const timeoutId = setTimeout(() => abortCtrl.abort(), 12_000);
     let response: Response;
     try {
-      response = await fetch(`${this.baseUrl}/checkout/${checkoutId}`, {
+      response = await fetch(targetUrl, {
         headers: { Authorization: `Bearer ${this.secretKey}` },
         signal: abortCtrl.signal,
       });
     } catch (e: unknown) {
       clearTimeout(timeoutId);
-      const errName = (e as { name?: string })?.name ?? '';
+      const errName    = (e as { name?: string })?.name ?? '';
+      const errMessage = (e as Error)?.message ?? String(e);
+      this.logger.error(
+        `[DIAG getCheckout] FETCH ERROR:\n` +
+        `  URL     : ${targetUrl}\n` +
+        `  type    : ${errName || 'unknown'}\n` +
+        `  message : ${errMessage}\n` +
+        `  stack   : ${(e as Error)?.stack ?? '(no stack)'}`,
+      );
       if (errName === 'AbortError') {
         throw new BadRequestException('LeekPay API timeout (12s) on getCheckout');
       }
@@ -213,13 +303,30 @@ export class LeekPayService {
       clearTimeout(timeoutId);
     }
 
-    const json = (await response.json()) as {
-      success: boolean;
-      data: LeekPayCheckout;
-      message?: string;
-    };
+    let rawBody = '';
+    let json: { success: boolean; data: LeekPayCheckout; message?: string };
+    try {
+      rawBody = await response.text();
+      this.logger.log(
+        `[DIAG getCheckout] RESPONSE:\n` +
+        `  STATUS : ${response.status} ${response.statusText}\n` +
+        `  BODY   : ${rawBody.slice(0, 1000)}`,
+      );
+      json = JSON.parse(rawBody) as { success: boolean; data: LeekPayCheckout; message?: string };
+    } catch (parseErr: unknown) {
+      this.logger.error(
+        `[DIAG getCheckout] JSON parse error:\n` +
+        `  STATUS   : ${response.status}\n` +
+        `  RAW BODY : ${rawBody.slice(0, 300)}\n` +
+        `  ERROR    : ${(parseErr as Error)?.message ?? String(parseErr)}`,
+      );
+      throw new BadRequestException(`LeekPay returned non-JSON (HTTP ${response.status}): ${rawBody.slice(0, 200)}`);
+    }
 
     if (!response.ok || !json.success) {
+      this.logger.error(
+        `[DIAG getCheckout] Error response: status=${response.status}, message=${json.message ?? '(none)'}`,
+      );
       throw new BadRequestException(
         json.message ?? `LeekPay error (${response.status})`,
       );
@@ -311,14 +418,27 @@ export class LeekPayService {
     const plans = this.getPlans();
     const plan  = plans.find(p => p.id === planId);
 
+    // ── DIAG: entrée createPlanCheckout ──
+    this.logger.log(
+      `[DIAG createPlanCheckout] ENTRY:\n` +
+      `  planId    : ${planId}\n` +
+      `  plan found: ${plan ? `${plan.name} — ${plan.price} ${plan.currency}` : 'NOT FOUND'}\n` +
+      `  userId    : ${userId}\n` +
+      `  userEmail : ${userEmail ? `${userEmail.slice(0, 3)}…` : '(empty)'}\n` +
+      `  userName  : ${userName ? '[present]' : '(empty)'}`,
+    );
+
     if (!plan) {
+      this.logger.error(
+        `[DIAG createPlanCheckout] Plan "${planId}" not found. Available: ${plans.map(p => p.id).join(', ')}`,
+      );
       throw new BadRequestException(`Plan inconnu: ${planId}`);
     }
 
     const backendUrl = this.config.get<string>('BACKEND_URL')
       ?? 'https://codemorph-hp00.onrender.com';
 
-    return this.createCheckout({
+    const checkoutParams = {
       amount:         plan.price,
       currency:       plan.currency,
       description:    `CodeMorph ${plan.name} — abonnement mensuel`,
@@ -328,7 +448,30 @@ export class LeekPayService {
       customer_email: userEmail,
       customer_name:  userName || userEmail,
       metadata:       { userId, planId, source: 'codemorph' },
-    });
+    };
+
+    this.logger.log(
+      `[DIAG createPlanCheckout] Calling createCheckout with:\n` +
+      `  amount      : ${checkoutParams.amount}\n` +
+      `  currency    : ${checkoutParams.currency}\n` +
+      `  return_url  : ${checkoutParams.return_url}\n` +
+      `  webhook_url : ${checkoutParams.webhook_url}`,
+    );
+
+    try {
+      const result = await this.createCheckout(checkoutParams);
+      this.logger.log(
+        `[DIAG createPlanCheckout] SUCCESS → checkout.id=${result.id}, payment_url=${result.payment_url}`,
+      );
+      return result;
+    } catch (err: unknown) {
+      this.logger.error(
+        `[DIAG createPlanCheckout] EXCEPTION:\n` +
+        `  message : ${(err as Error)?.message ?? String(err)}\n` +
+        `  stack   : ${(err as Error)?.stack ?? '(no stack)'}`,
+      );
+      throw err;
+    }
   }
 
   // ── Vérifier la signature webhook ────────────────────

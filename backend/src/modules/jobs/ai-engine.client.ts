@@ -85,6 +85,81 @@ export class AiEngineClient {
     this.mockMode = !configured || configured === 'http://ai-engine:5000';
     this.baseUrl  = configured || 'http://ai-engine:5000';
 
+    // ── DIAG startup ──
+    this.logger.log(
+      `[DIAG AiEngineClient] STARTUP:\n` +
+      `  AI_ENGINE_URL (raw)  : "${configured || '(non défini)'}"\n` +
+      `  baseUrl (effectif)   : ${this.baseUrl}\n` +
+      `  mockMode             : ${this.mockMode}\n` +
+      `  circuitThreshold     : ${this.CIRCUIT_THRESHOLD} failures\n` +
+      `  circuitTimeout       : ${this.CIRCUIT_TIMEOUT_MS}ms`,
+    );
+
+    // ── DIAG axios interceptors ──────────────────────────────
+    // Intercepte tous les appels HTTP sortants via HttpService (nestjs/axios)
+    this.http.axiosRef.interceptors.request.use(
+      (config) => {
+        const method  = (config.method ?? 'UNKNOWN').toUpperCase();
+        const url     = `${config.baseURL ?? ''}${config.url ?? ''}`;
+        const body    = config.data !== undefined
+          ? (typeof config.data === 'string' ? config.data : JSON.stringify(config.data))
+          : '(no body)';
+        this.logger.log(
+          `[DIAG axios] ▶ REQUEST:\n` +
+          `  METHOD  : ${method}\n` +
+          `  URL     : ${url}\n` +
+          `  BODY    : ${body.slice(0, 500)}`,
+        );
+        return config;
+      },
+      (error: unknown) => {
+        this.logger.error(
+          `[DIAG axios] ✖ REQUEST ERROR:\n` +
+          `  message : ${(error as Error)?.message ?? String(error)}\n` +
+          `  stack   : ${(error as Error)?.stack ?? '(no stack)'}`,
+        );
+        return Promise.reject(error);
+      },
+    );
+
+    this.http.axiosRef.interceptors.response.use(
+      (response) => {
+        const method = (response.config?.method ?? 'UNKNOWN').toUpperCase();
+        const url    = `${response.config?.baseURL ?? ''}${response.config?.url ?? ''}`;
+        const body   = response.data !== undefined
+          ? (typeof response.data === 'string' ? response.data : JSON.stringify(response.data))
+          : '(no body)';
+        this.logger.log(
+          `[DIAG axios] ◀ RESPONSE:\n` +
+          `  STATUS  : ${response.status}\n` +
+          `  METHOD  : ${method}\n` +
+          `  URL     : ${url}\n` +
+          `  BODY    : ${body.slice(0, 500)}`,
+        );
+        return response;
+      },
+      (error: unknown) => {
+        const axErr = error as import('axios').AxiosError;
+        const method  = (axErr.config?.method ?? 'UNKNOWN').toUpperCase();
+        const url     = `${axErr.config?.baseURL ?? ''}${axErr.config?.url ?? ''}`;
+        const status  = axErr.response?.status ?? 'no response';
+        const resBody = axErr.response?.data !== undefined
+          ? (typeof axErr.response.data === 'string'
+              ? axErr.response.data
+              : JSON.stringify(axErr.response.data))
+          : '(no body)';
+        this.logger.error(
+          `[DIAG axios] ✖ ERROR:\n` +
+          `  STATUS  : ${status}\n` +
+          `  METHOD  : ${method}\n` +
+          `  URL     : ${url}\n` +
+          `  BODY    : ${resBody.slice(0, 500)}\n` +
+          `  STACK   : ${axErr.stack ?? '(no stack)'}`,
+        );
+        return Promise.reject(error);
+      },
+    );
+
     if (this.mockMode) {
       this.logger.warn(
         'AI_ENGINE_URL not configured or points to Docker-internal host. ' +
@@ -97,21 +172,41 @@ export class AiEngineClient {
 
   // ── Submit async conversion job ──────────────────────────
   async submitConversion(req: AiConvertRequest): Promise<AiConvertResponse> {
+    // ── DIAG: entrée submitConversion ──
+    const targetUrl = `${this.baseUrl}/api/convert`;
+    this.logger.log(
+      `[DIAG submitConversion] [Job ${req.jobId}] ENTRY:\n` +
+      `  METHOD         : POST\n` +
+      `  URL            : ${targetUrl}\n` +
+      `  sourceLanguage : ${req.sourceLanguage}\n` +
+      `  targetLanguage : ${req.targetLanguage}\n` +
+      `  files count    : ${req.files.length}\n` +
+      `  callbackUrl    : ${req.callbackUrl}\n` +
+      `  goalPrompt     : ${req.goalPrompt ? `"${req.goalPrompt.slice(0, 80)}…"` : '(none)'}\n` +
+      `  options        : ${JSON.stringify(req.options ?? {})}\n` +
+      `  mockMode       : ${this.mockMode}\n` +
+      `  circuitOpen    : ${this.circuitOpen}\n` +
+      `  timeout        : 30000ms (axios) / 35000ms (rxjs)\n` +
+      `  headers        : Content-Type=application/json, X-Source=codemorph-backend`,
+    );
+
     this.logger.log(
       `[Job ${req.jobId}] submitConversion: ${req.sourceLanguage} → ${req.targetLanguage}, ` +
       `${req.files.length} files, mock=${this.mockMode}`,
     );
 
     if (this.mockMode) {
+      this.logger.log(`[DIAG submitConversion] [Job ${req.jobId}] → routing to mockConversion()`);
       return this.mockConversion(req);
     }
 
     this.assertCircuitClosed();
 
     try {
+      this.logger.log(`[DIAG submitConversion] [Job ${req.jobId}] → sending HTTP POST to AI Engine…`);
       const res = await firstValueFrom(
         this.http
-          .post<AiConvertResponse>(`${this.baseUrl}/api/convert`, req, {
+          .post<AiConvertResponse>(targetUrl, req, {
             headers:         { 'Content-Type': 'application/json', 'X-Source': 'codemorph-backend' },
             timeout:         30_000,
             validateStatus:  (s) => s < 500,
@@ -122,12 +217,24 @@ export class AiEngineClient {
               count:    3,
               delay:    (err, attempt) => {
                 const wait = Math.pow(2, attempt) * 1_000;
-                this.logger.warn(`AI Engine retry ${attempt}/3 after ${wait}ms: ${(err as Error).message}`);
+                this.logger.warn(
+                  `[DIAG submitConversion] [Job ${req.jobId}] RETRY ${attempt}/3 after ${wait}ms:\n` +
+                  `  error: ${(err as Error).message}`,
+                );
                 return new Promise((r) => setTimeout(r, wait)) as any;
               },
               resetOnSuccess: true,
             }),
             catchError((err: AxiosError) => {
+              this.logger.error(
+                `[DIAG submitConversion] [Job ${req.jobId}] AXIOS ERROR:\n` +
+                `  URL      : ${targetUrl}\n` +
+                `  status   : ${err.response?.status ?? 'no response'}\n` +
+                `  message  : ${err.message}\n` +
+                `  code     : ${err.code ?? '(none)'}\n` +
+                `  response : ${JSON.stringify(err.response?.data ?? {})}\n` +
+                `  stack    : ${err.stack ?? '(no stack)'}`,
+              );
               this.recordFailure();
               return throwError(() => new ServiceUnavailableException(
                 `AI Engine unavailable: ${err.message}`,
@@ -136,9 +243,19 @@ export class AiEngineClient {
           ),
       );
 
+      this.logger.log(
+        `[DIAG submitConversion] [Job ${req.jobId}] RESPONSE:\n` +
+        `  status  : ${res.status}\n` +
+        `  body    : ${JSON.stringify(res.data)}`,
+      );
       this.recordSuccess();
       return res.data;
     } catch (err) {
+      this.logger.error(
+        `[DIAG submitConversion] [Job ${req.jobId}] EXCEPTION:\n` +
+        `  message : ${(err as Error)?.message ?? String(err)}\n` +
+        `  stack   : ${(err as Error)?.stack ?? '(no stack)'}`,
+      );
       this.recordFailure();
       throw err;
     }
