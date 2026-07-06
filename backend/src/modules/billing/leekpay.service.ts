@@ -247,28 +247,53 @@ export class LeekPayService {
       throw new BadRequestException(`LeekPay returned non-JSON response (HTTP ${response.status}): ${rawBody.slice(0, 200)}`);
     }
 
-    if (!response.ok || !json.success) {
+    // FIX: LeekPay peut retourner { success, data: {...} } OU { id, payment_url, ... } directement
+    // On supporte les deux formats pour robustesse
+    const parsed = json as unknown as Record<string, unknown>;
+
+    // Format 1 : { success: true, data: { id, payment_url, ... } }
+    // Format 2 : { id, payment_url, ... } (directement)
+    const hasWrapper = parsed['success'] !== undefined && parsed['data'] !== undefined;
+    const checkoutPayload = hasWrapper
+      ? (parsed['data'] as Record<string, unknown>)
+      : parsed;
+
+    // Sur erreur HTTP ou success explicitement false
+    if (!response.ok || parsed['success'] === false) {
+      const errMsg = (parsed['message'] as string | undefined) ?? `LeekPay error (${response.status})`;
       this.logger.error(
         `[DIAG createCheckout] LeekPay error response:\n` +
         `  STATUS  : ${response.status}\n` +
-        `  success : ${json.success}\n` +
-        `  message : ${json.message ?? '(none)'}\n` +
-        `  body    : ${JSON.stringify(json)}`,
+        `  success : ${parsed['success'] ?? '(absent)'}\n` +
+        `  message : ${errMsg}\n` +
+        `  body    : ${JSON.stringify(parsed)}`,
+      );
+      throw new BadRequestException(errMsg);
+    }
+
+    // Valider que le checkout contient bien un payment_url
+    const paymentUrl = checkoutPayload['payment_url'] as string | undefined;
+    if (!paymentUrl) {
+      this.logger.error(
+        `[DIAG createCheckout] MISSING payment_url in response:\n` +
+        `  hasWrapper : ${hasWrapper}\n` +
+        `  checkout   : ${JSON.stringify(checkoutPayload)}`,
       );
       throw new BadRequestException(
-        json.message ?? `LeekPay error (${response.status})`,
+        `LeekPay response missing payment_url. Response: ${JSON.stringify(checkoutPayload).slice(0, 200)}`,
       );
     }
 
+    const checkout = checkoutPayload as unknown as LeekPayCheckout;
     this.logger.log(
       `[DIAG createCheckout] SUCCESS:\n` +
-      `  checkout.id          : ${json.data?.id ?? '(none)'}\n` +
-      `  checkout.payment_url : ${json.data?.payment_url ?? '(none)'}\n` +
-      `  checkout.status      : ${json.data?.status ?? '(none)'}\n` +
-      `  checkout.amount      : ${json.data?.amount ?? '(none)'} ${json.data?.currency ?? ''}`,
+      `  checkout.id          : ${checkout.id ?? '(none)'}\n` +
+      `  checkout.payment_url : ${checkout.payment_url ?? '(none)'}\n` +
+      `  checkout.status      : ${checkout.status ?? '(none)'}\n` +
+      `  checkout.amount      : ${checkout.amount ?? '(none)'} ${checkout.currency ?? ''}`,
     );
-    this.logger.log(`Checkout created: ${json.data.id} → ${json.data.payment_url}`);
-    return json.data;
+    this.logger.log(`Checkout created: ${checkout.id} → ${checkout.payment_url}`);
+    return checkout;
   }
 
   // ── Vérifier le statut d'un checkout ─────────────────

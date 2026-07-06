@@ -31,6 +31,9 @@ import { Public } from '../../common/decorators/public.decorator';
 import type { JwtPayload } from '@codemorph/shared';
 import { JobType } from './jobs.entity';
 import { UploadsService } from '../uploads/uploads.service';
+import { StartFromGithubDto } from './dto/start-github.dto';
+import { StartFromZipDto }    from './dto/start-zip.dto';
+import { StartFromUrlDto }    from './dto/start-url.dto';
 
 @ApiTags('jobs')
 @ApiBearerAuth()
@@ -197,15 +200,7 @@ export class JobsController {
   @Post('start/github')
   @ApiOperation({ summary: 'Start conversion from GitHub repo' })
   async startFromGitHub(
-    @Body()
-    body: {
-      projectId?:     string;
-      sourceLanguage: string;
-      targetLanguage: string;
-      repo:           string;
-      branch?:        string;
-      goalPrompt?:    string;
-    },
+    @Body() body: StartFromGithubDto,
     @CurrentUser() user: JwtPayload,
   ) {
     const userId = user.sub as string;
@@ -250,14 +245,7 @@ export class JobsController {
   @Post('start/zip')
   @ApiOperation({ summary: 'Start conversion from uploaded ZIP' })
   async startFromZip(
-    @Body()
-    body: {
-      projectId?:     string;
-      sourceLanguage: string;
-      targetLanguage: string;
-      zipPath:        string;
-      goalPrompt?:    string;
-    },
+    @Body() body: StartFromZipDto,
     @CurrentUser() user: JwtPayload,
   ) {
     const userId = user.sub as string;
@@ -286,14 +274,7 @@ export class JobsController {
   @Post('start/url')
   @ApiOperation({ summary: 'Start conversion from public ZIP URL' })
   async startFromUrl(
-    @Body()
-    body: {
-      projectId?:     string;
-      sourceLanguage: string;
-      targetLanguage: string;
-      sourceUrl:      string;
-      goalPrompt?:    string;
-    },
+    @Body() body: StartFromUrlDto,
     @CurrentUser() user: JwtPayload,
   ) {
     const userId = user.sub as string;

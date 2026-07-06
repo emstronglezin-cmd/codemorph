@@ -352,6 +352,37 @@ export default function NewProjectPage() {
     try {
       const fw = FRAMEWORKS.find(f => f.id === framework)!;
 
+      // ── Helper: fetch avec timeout (Render cold start peut prendre 25-60s) ──
+      // ROOT CAUSE FIX: sans AbortController les fetch bloquent indéfiniment
+      // sur Render free tier → UI figée sur "Connecting GitHub…"
+      const fetchWithTimeout = async (
+        url: string,
+        opts: RequestInit,
+        timeoutMs: number,
+        label: string,
+      ): Promise<Response> => {
+        const ctrl = new AbortController();
+        const tid  = setTimeout(() => ctrl.abort(), timeoutMs);
+        console.log(`[NewProject] ${label} → ${url} (timeout=${timeoutMs}ms)`);
+        try {
+          const res = await fetch(url, { ...opts, signal: ctrl.signal });
+          clearTimeout(tid);
+          return res;
+        } catch (err) {
+          clearTimeout(tid);
+          const isAbort = err instanceof Error && err.name === 'AbortError';
+          if (isAbort) {
+            throw new Error(
+              `[${label}] Délai dépassé (${timeoutMs / 1000}s). ` +
+              `Le backend Render ne répond pas. ` +
+              `C'est normal au démarrage (cold start 25-60s) — réessayez dans quelques secondes.`,
+            );
+          }
+          const netMsg = err instanceof Error ? err.message : String(err);
+          throw new Error(`[${label}] Erreur réseau: ${netMsg}`);
+        }
+      };
+
       // Step 0: Create project
       updateProgress(0, 'running');
       const projectPayload = {
@@ -361,11 +392,12 @@ export default function NewProjectPage() {
         targetLanguage: fw.targetLang,
       };
       console.log(`[NewProject] STEP 0 POST ${BACKEND}/projects`, projectPayload);
-      const projRes = await fetch(`${BACKEND}/projects`, {
-        method: 'POST',
-        headers: authHeaders(),
-        body: JSON.stringify(projectPayload),
-      });
+      const projRes = await fetchWithTimeout(
+        `${BACKEND}/projects`,
+        { method: 'POST', headers: authHeaders(), body: JSON.stringify(projectPayload) },
+        60_000,  // 60s — couvre Render cold start
+        'STEP 0 /projects',
+      );
       const projRaw = await projRes.json() as Record<string, unknown>;
       console.log(`[NewProject] STEP 0 response ${projRes.status}:`, projRaw);
       if (!projRes.ok) throw new Error(extractError(projRaw, projRes.status, 'Project creation failed'));
@@ -390,11 +422,12 @@ export default function NewProjectPage() {
           goalPrompt:     goalPrompt.trim() || undefined,
         };
         console.log(`[NewProject] STEP 1 POST ${BACKEND}/jobs/start/github`, ghPayload);
-        jobRes = await fetch(`${BACKEND}/jobs/start/github`, {
-          method: 'POST',
-          headers: authHeaders(),
-          body: JSON.stringify(ghPayload),
-        });
+        jobRes = await fetchWithTimeout(
+          `${BACKEND}/jobs/start/github`,
+          { method: 'POST', headers: authHeaders(), body: JSON.stringify(ghPayload) },
+          60_000,
+          'STEP 1 /jobs/start/github',
+        );
 
       } else if (method === 'zip') {
         const zPath = zipPath || await uploadZip();
@@ -408,11 +441,12 @@ export default function NewProjectPage() {
           goalPrompt:     goalPrompt.trim() || undefined,
         };
         console.log(`[NewProject] STEP 1 POST ${BACKEND}/jobs/start/zip`, zipPayload);
-        jobRes = await fetch(`${BACKEND}/jobs/start/zip`, {
-          method: 'POST',
-          headers: authHeaders(),
-          body: JSON.stringify(zipPayload),
-        });
+        jobRes = await fetchWithTimeout(
+          `${BACKEND}/jobs/start/zip`,
+          { method: 'POST', headers: authHeaders(), body: JSON.stringify(zipPayload) },
+          60_000,
+          'STEP 1 /jobs/start/zip',
+        );
 
       } else {
         const urlPayload = {
@@ -423,11 +457,12 @@ export default function NewProjectPage() {
           goalPrompt:     goalPrompt.trim() || undefined,
         };
         console.log(`[NewProject] STEP 1 POST ${BACKEND}/jobs/start/url`, urlPayload);
-        jobRes = await fetch(`${BACKEND}/jobs/start/url`, {
-          method: 'POST',
-          headers: authHeaders(),
-          body: JSON.stringify(urlPayload),
-        });
+        jobRes = await fetchWithTimeout(
+          `${BACKEND}/jobs/start/url`,
+          { method: 'POST', headers: authHeaders(), body: JSON.stringify(urlPayload) },
+          60_000,
+          'STEP 1 /jobs/start/url',
+        );
       }
 
       updateProgress(1, 'done');

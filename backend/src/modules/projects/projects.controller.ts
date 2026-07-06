@@ -23,7 +23,7 @@ import { ProjectsService }    from './projects.service';
 import { JwtAuthGuard }       from '../../common/guards/jwt-auth.guard';
 import { CurrentUser }        from '../../common/decorators/current-user.decorator';
 import type { JwtPayload, ProjectId } from '@codemorph/shared';
-import type { SourceLanguage, TargetLanguage } from './entities/project.entity';
+import { CreateProjectDto }   from './dto/create-project.dto';
 
 @ApiTags('projects')
 @UseGuards(JwtAuthGuard)
@@ -37,13 +37,7 @@ export class ProjectsController {
   @ApiOperation({ summary: 'Create a new project' })
   async create(
     @CurrentUser() user: JwtPayload,
-    @Body() body: {
-      name:            string;
-      description?:    string;
-      sourceLanguage:  SourceLanguage;
-      targetLanguage:  TargetLanguage;
-      orgId?:          string;
-    },
+    @Body() body: CreateProjectDto,
   ): Promise<unknown> {
     return this.projectsService.create({ ...body, ownerId: user.sub });
   }
