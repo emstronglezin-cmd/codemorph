@@ -33,6 +33,20 @@ async function bootstrap(): Promise<void> {
     contentSecurityPolicy: nodeEnv === 'production' ? undefined : false,
   }));
 
+  // ── DIAG: middleware brut pour logger TOUTES les requêtes jobs/start/* ──
+  // Ce log apparaît AVANT NestJS, AVANT ValidationPipe, AVANT tout guard
+  // Si ce log n'apparaît PAS dans Render → la requête n'arrive pas au backend
+  // Si ce log apparaît → le problème est dans le handler ou la connexion est coupée après
+  app.use('/api/v1/jobs/start', (req: import('express').Request, _res: import('express').Response, next: import('express').NextFunction) => {
+    logger.log(
+      `[RAW MIDDLEWARE] ${req.method} ${req.path} ` +
+      `origin="${req.headers['origin'] ?? 'none'}" ` +
+      `content-type="${req.headers['content-type'] ?? 'none'}" ` +
+      `auth="${req.headers['authorization'] ? 'Bearer ***' : 'ABSENT'}"`,
+    );
+    next();
+  });
+
   // ── CORS ─────────────────────────────────────────────────
   // Support Vercel (*.vercel.app), custom domain, localhost dev
   const allowedOrigins = [
@@ -49,15 +63,16 @@ async function bootstrap(): Promise<void> {
       if (!origin) return callback(null, true);
       // Exact match (FRONTEND_URL etc.)
       if (allowedOrigins.includes(origin)) return callback(null, true);
-      // Allow any *.vercel.app subdomain (preview deployments + production)
-      if (/^https:\/\/[a-z0-9-]+(\.vercel\.app)$/.test(origin)) return callback(null, true);
+      // Allow any *.vercel.app subdomain — preview slugs can contain underscores, dots, uppercase
+      // FIX: [a-z0-9-] ne couvre pas les underscores des preview URLs Vercel
+      if (/^https:\/\/[\w.-]+\.vercel\.app$/.test(origin)) return callback(null, true);
       // Allow any *.onrender.com (services inter-Render)
-      if (/^https:\/\/[a-z0-9-]+(\.onrender\.com)$/.test(origin)) return callback(null, true);
+      if (/^https:\/\/[\w.-]+\.onrender\.com$/.test(origin)) return callback(null, true);
       // In development, allow all localhost origins
       if (nodeEnv !== 'production' && /^https?:\/\/localhost(:\d+)?$/.test(origin)) {
         return callback(null, true);
       }
-      logger.warn(`CORS blocked: ${origin}`);
+      logger.warn(`CORS blocked: origin="${origin}" | allowedOrigins=[${allowedOrigins.join(', ')}]`);
       callback(new Error(`CORS: origin '${origin}' not allowed`));
     },
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
@@ -137,5 +152,30 @@ async function bootstrap(): Promise<void> {
   logger.log(`🚀 CodeMorph API running on http://localhost:${port}/${apiPrefix}`);
   logger.log(`🌍 Environment: ${nodeEnv}`);
 }
+
+// ── Global process error handlers ──────────────────────────────────
+// Empêche Node.js de crasher silencieusement sur les UnhandledPromiseRejection
+// (ex: Bull queue disconnected, Redis timeout, DB connection drop)
+// Sans ces handlers, Render reçoit un SIGTERM, ferme toutes les connexions actives
+// → les clients reçoivent "Load failed" sans aucune réponse HTTP
+process.on('unhandledRejection', (reason: unknown, _promise: Promise<unknown>) => {
+  logger.error(
+    `[FATAL] UnhandledPromiseRejection — this would crash the process without this handler\n` +
+    `  reason: ${reason instanceof Error ? reason.message : String(reason)}\n` +
+    `  stack:  ${reason instanceof Error ? (reason.stack ?? '(no stack)') : '(not an Error)'}`,
+  );
+  // NE PAS process.exit() — on laisse Render gérer le restart si nécessaire
+  // Un crash silencieux est pire qu'un process qui continue
+});
+
+process.on('uncaughtException', (error: Error) => {
+  logger.error(
+    `[FATAL] UncaughtException — logging and continuing\n` +
+    `  message: ${error.message}\n` +
+    `  stack:   ${error.stack ?? '(no stack)'}`,
+  );
+  // NE PAS crasher sur les exceptions récupérables
+  // Le process Render sera restarté automatiquement si le health check échoue
+});
 
 void bootstrap();

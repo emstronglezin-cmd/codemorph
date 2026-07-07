@@ -308,21 +308,47 @@ export default function NewProjectPage() {
   };
 
   // ── Upload ZIP ──────────────────────────────────────────
+  // FIX: AbortController 90s — l'upload peut prendre longtemps sur Render cold start
+  // Sans timeout, le fetch bloque indéfiniment et la connexion Render (30s max) se coupe
+  // → le fetch suivant (/jobs/start/zip) reçoit "Load failed" car le socket est mort
   const uploadZip = async (): Promise<string> => {
     if (!zipFile) throw new Error('No ZIP file selected');
     const token = getAccessToken();
     const fd = new FormData();
     fd.append('file', zipFile);
-    const res  = await fetch(`${BACKEND}/uploads/zip`, {
-      method: 'POST',
-      headers: token ? { Authorization: `Bearer ${token}` } : {},
-      body: fd,
-    });
+
+    const ctrl = new AbortController();
+    const tid  = setTimeout(() => ctrl.abort(), 90_000); // 90s — couvre upload + cold start
+    console.log(`[NewProject] uploadZip → ${BACKEND}/uploads/zip (timeout=90s, size=${zipFile.size})`);
+
+    let res: Response;
+    try {
+      res = await fetch(`${BACKEND}/uploads/zip`, {
+        method:  'POST',
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+        body:    fd,
+        signal:  ctrl.signal,
+      });
+      clearTimeout(tid);
+    } catch (err) {
+      clearTimeout(tid);
+      const isAbort = err instanceof Error && err.name === 'AbortError';
+      if (isAbort) {
+        throw new Error(
+          '[uploadZip] Délai dépassé (90s) lors de l\'upload. ' +
+          'Vérifiez votre connexion ou réessayez avec un fichier plus petit.',
+        );
+      }
+      const netMsg = err instanceof Error ? err.message : String(err);
+      throw new Error(`[uploadZip] Erreur réseau: ${netMsg}`);
+    }
+
     const raw = await res.json() as Record<string, unknown>;
     if (!res.ok) throw new Error(extractError(raw, res.status, 'Upload failed'));
     const inner = (raw['data'] as Record<string, unknown> | undefined) ?? raw;
     const p     = (inner['zipPath'] as string | undefined) ?? '';
     if (!p) throw new Error('ZIP uploaded but server returned no zipPath');
+    console.log(`[NewProject] uploadZip ✓ zipPath=${p}`);
     setZipPath(p);
     return p;
   };
@@ -352,35 +378,59 @@ export default function NewProjectPage() {
     try {
       const fw = FRAMEWORKS.find(f => f.id === framework)!;
 
-      // ── Helper: fetch avec timeout (Render cold start peut prendre 25-60s) ──
+      // ── Helper: fetch avec timeout + retry sur erreur réseau ──────────────
       // ROOT CAUSE FIX: sans AbortController les fetch bloquent indéfiniment
       // sur Render free tier → UI figée sur "Connecting GitHub…"
+      //
+      // RETRY: "Load failed" = connexion TCP fermée sans réponse HTTP
+      // (Render cold start, connexion instable, process crash backend)
+      // On retente UNE FOIS après 2s avant d'afficher l'erreur finale
       const fetchWithTimeout = async (
         url: string,
         opts: RequestInit,
         timeoutMs: number,
         label: string,
+        maxRetries = 1,  // 1 retry sur erreur réseau (pas sur erreur HTTP)
       ): Promise<Response> => {
-        const ctrl = new AbortController();
-        const tid  = setTimeout(() => ctrl.abort(), timeoutMs);
-        console.log(`[NewProject] ${label} → ${url} (timeout=${timeoutMs}ms)`);
-        try {
-          const res = await fetch(url, { ...opts, signal: ctrl.signal });
-          clearTimeout(tid);
-          return res;
-        } catch (err) {
-          clearTimeout(tid);
-          const isAbort = err instanceof Error && err.name === 'AbortError';
-          if (isAbort) {
-            throw new Error(
-              `[${label}] Délai dépassé (${timeoutMs / 1000}s). ` +
-              `Le backend Render ne répond pas. ` +
-              `C'est normal au démarrage (cold start 25-60s) — réessayez dans quelques secondes.`,
-            );
+        let lastNetErr: Error | null = null;
+
+        for (let attempt = 0; attempt <= maxRetries; attempt++) {
+          if (attempt > 0) {
+            // Délai avant retry (2s) — laisse le temps à Render de récupérer
+            console.warn(`[NewProject] ${label} → retry attempt ${attempt}/${maxRetries} after network error: ${lastNetErr?.message}`);
+            await new Promise<void>((r) => setTimeout(r, 2_000));
           }
-          const netMsg = err instanceof Error ? err.message : String(err);
-          throw new Error(`[${label}] Erreur réseau: ${netMsg}`);
+
+          const ctrl = new AbortController();
+          const tid  = setTimeout(() => ctrl.abort(), timeoutMs);
+          console.log(`[NewProject] ${label} → ${url} (timeout=${timeoutMs}ms, attempt=${attempt + 1}/${maxRetries + 1})`);
+          try {
+            const res = await fetch(url, { ...opts, signal: ctrl.signal });
+            clearTimeout(tid);
+            return res;  // succès — pas de retry sur réponse HTTP (même 4xx/5xx)
+          } catch (err) {
+            clearTimeout(tid);
+            const isAbort = err instanceof Error && err.name === 'AbortError';
+            if (isAbort) {
+              // Timeout → pas de retry (le backend est lent, pas un crash réseau)
+              throw new Error(
+                `[${label}] Délai dépassé (${timeoutMs / 1000}s). ` +
+                `Le backend Render ne répond pas. ` +
+                `C'est normal au démarrage (cold start 25-60s) — réessayez dans quelques secondes.`,
+              );
+            }
+            // Erreur réseau (Load failed, connection reset, etc.)
+            lastNetErr = err instanceof Error ? err : new Error(String(err));
+            console.error(`[NewProject] ${label} network error (attempt ${attempt + 1}):`, lastNetErr.message);
+            // Si c'est la dernière tentative → on throw
+            if (attempt >= maxRetries) {
+              throw new Error(`[${label}] Erreur réseau: ${lastNetErr.message}`);
+            }
+            // Sinon → continuer la boucle pour retry
+          }
         }
+        // Jamais atteint (la boucle throw toujours)
+        throw lastNetErr ?? new Error(`[${label}] Unknown fetch error`);
       };
 
       // Step 0: Create project

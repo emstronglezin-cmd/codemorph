@@ -249,17 +249,34 @@ export class JobsController {
     @CurrentUser() user: JwtPayload,
   ) {
     const userId = user.sub as string;
+    const reqId  = `zip-${Date.now().toString(36)}`;
+
+    // ── DIAG: log immédiat dès réception ──────────────────
+    // Si ce log n'apparaît PAS dans Render → la requête n'arrive pas au backend
+    // (CORS, réseau, Render qui kill la connexion avant d'atteindre le handler)
+    this.logger.log(
+      `━━━ [${reqId}] POST /jobs/start/zip received ━━━\n` +
+      `  userId         : ${userId}\n` +
+      `  body.zipPath   : ${body.zipPath ?? '(ABSENT — ValidationPipe a peut-être strippé)'}\n` +
+      `  body.sourceLang: ${body.sourceLanguage ?? '(ABSENT)'}\n` +
+      `  body.targetLang: ${body.targetLanguage ?? '(ABSENT)'}\n` +
+      `  body.projectId : ${body.projectId ?? '(absent — optional)'}\n` +
+      `  body.goalPrompt: ${body.goalPrompt ? `"${body.goalPrompt.slice(0, 50)}…"` : '(absent)'}\n` +
+      `  body keys total: ${Object.keys(body as object).join(', ')}`,
+    );
 
     if (!body.zipPath?.trim()) {
+      this.logger.warn(`[${reqId}] FAILED — zipPath missing or empty`);
       throw new BadRequestException({ code: 'MISSING_ZIP_PATH', message: 'zipPath is required. Upload your ZIP first via POST /uploads/zip.' });
     }
     if (!body.sourceLanguage?.trim() || !body.targetLanguage?.trim()) {
+      this.logger.warn(`[${reqId}] FAILED — languages missing`);
       throw new BadRequestException({ code: 'MISSING_LANGUAGES', message: 'sourceLanguage and targetLanguage are required.' });
     }
 
-    this.logger.log(`[start/zip] userId=${userId} zipPath=${body.zipPath}`);
+    this.logger.log(`[${reqId}] Validation OK → calling createJob…`);
 
-    return this.jobsService.createJob({
+    const job = await this.jobsService.createJob({
       userId,
       type:           JobType.ZIP_IMPORT,
       sourceLanguage: body.sourceLanguage,
@@ -268,6 +285,9 @@ export class JobsController {
       zipPath:        body.zipPath.trim(),
       goalPrompt:     body.goalPrompt,
     });
+
+    this.logger.log(`[${reqId}] ✅ Job created → id=${job.id} status=${job.status}`);
+    return job;
   }
 
   // ── Quick-start: from public URL ───────────────────────
