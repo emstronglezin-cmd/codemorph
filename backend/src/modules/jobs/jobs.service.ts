@@ -217,6 +217,10 @@ export class JobsService implements OnModuleInit {
   }
 
   // ── Create + Enqueue ──────────────────────────────────
+  // PHASE 15 — FIRE-AND-FORGET
+  // La réponse HTTP est renvoyée immédiatement après le save() en DB (étape 5).
+  // L'enqueue Bull (étape 6) est lancé SANS await via enqueueJobFireAndForget().
+  // Aucun appel Redis, AI Engine ou externe ne bloque la réponse HTTP.
   async createJob(dto: StartConversionDto): Promise<JobEntity> {
     const tag = `[createJob userId=${dto.userId}]`;
     this.logger.log(
@@ -228,21 +232,19 @@ export class JobsService implements OnModuleInit {
     // FIX PHASE 12 — BUG CRITIQUE 2 : getPlanLimits() au lieu de PLAN_LIMITS[plan]
     // PLAN_LIMITS['starter'] = undefined → TypeError si plan='starter'
     // getPlanLimits() résout les aliases (starter→pro) et ne retourne jamais undefined
-    this.logger.log(`${tag} Step 1/6: Fetching user plan…`);
+    this.logger.log(`${tag} Step 1/5: Fetching user plan…`);
     const plan   = await this.subscriptionSvc.getUserPlan(dto.userId);
     const limits = getPlanLimits(plan);
     this.logger.log(`${tag} Plan: ${plan} → limits.advancedFrameworks=${limits.advancedFrameworks}`);
 
     // 2. Enforce monthly quota
-    this.logger.log(`${tag} Step 2/6: Enforcing monthly quota…`);
+    this.logger.log(`${tag} Step 2/5: Enforcing monthly quota…`);
     await this.quotaService.enforceConversionQuota(dto.userId, plan);
     this.logger.log(`${tag} Quota: OK`);
 
     // 3. Enforce concurrent job limit (source de vérité = DB)
-    // LOG DIAGNOSTIC PHASE 10 : afficher TOUS les jobs actifs avant la vérification
-    this.logger.log(`${tag} Step 3/6: Checking concurrent jobs (DB count)…`);
+    this.logger.log(`${tag} Step 3/5: Checking concurrent jobs (DB count)…`);
     const concurrent = await this.quotaService.checkConcurrentJobs(dto.userId, plan);
-    // checkConcurrentJobs loggue déjà les IDs/statuts/updatedAt dans QuotaService
     if (!concurrent.allowed) {
       this.logger.warn(
         `${tag} Concurrent limit: current=${concurrent.current} limit=${concurrent.limit}. ` +
@@ -260,7 +262,7 @@ export class JobsService implements OnModuleInit {
     this.logger.log(`${tag} Concurrent: OK (${concurrent.current}/${limits.concurrentJobs} active)`);
 
     // 4. Validate framework access
-    this.logger.log(`${tag} Step 4/6: Validating framework access…`);
+    this.logger.log(`${tag} Step 4/5: Validating framework access…`);
     if (!limits.advancedFrameworks) {
       const srcNorm = dto.sourceLanguage.toLowerCase().replace(/[^a-z]/g, '');
       const tgtNorm = dto.targetLanguage.toLowerCase().replace(/[^a-z]/g, '');
@@ -279,7 +281,7 @@ export class JobsService implements OnModuleInit {
     this.logger.log(`${tag} Framework: OK`);
 
     // 5. Create DB record
-    this.logger.log(`${tag} Step 5/6: Creating job in DB…`);
+    this.logger.log(`${tag} Step 5/5: Creating job in DB…`);
     const job = this.jobRepo.create({
       type:           dto.type,
       status:         JobStatus.PENDING,
@@ -293,45 +295,72 @@ export class JobsService implements OnModuleInit {
       phaseLogs:      [],
     });
     const saved = await this.jobRepo.save(job);
-    this.logger.log(`${tag} Job created: id=${saved.id}`);
+    this.logger.log(`${tag} Step 5/5 ✅ Job created in DB: id=${saved.id} — retour HTTP immédiat`);
 
-    // 6. Enqueue with plan priority
-    this.logger.log(`${tag} Step 6/6: Enqueueing (priority=${limits.queuePriority})…`);
-    try {
-      await this.conversionQueue.add(
-        'run-conversion',
-        { jobId: saved.id, dto },
-        {
-          priority:         limits.queuePriority,
-          attempts:         3,
-          backoff:          { type: 'exponential', delay: 2_000 },
-          removeOnComplete: 100,
-          removeOnFail:     200,
-        },
-      );
-      this.logger.log(`${tag} Job ${saved.id} enqueued ✅ plan=${plan}`);
-    } catch (queueErr: unknown) {
-      const qMsg = queueErr instanceof Error ? queueErr.message : String(queueErr);
-      this.logger.error(`${tag} Queue unavailable (Redis?): ${qMsg}`);
+    // 6. FIRE-AND-FORGET — enqueue Bull SANS await
+    // Le worker Bull (JobsProcessor) traitera le job en arrière-plan.
+    // La réponse HTTP est déjà envoyée avant que cet appel ne complète.
+    this.enqueueJobFireAndForget(saved.id, dto, limits, plan);
 
-      // Mark job as failed — concurrent count is DB-based so no need to decrement
-      await this.jobRepo.update(saved.id, {
-        status:       JobStatus.FAILED,
-        errorMessage: `Conversion queue unavailable: ${qMsg}. ` +
-                      `Redis may not be configured. Contact support.`,
-        errorDetails: {
-          cause:     qMsg,
-          hint:      'Set REDIS_URL environment variable or contact support.',
-          timestamp: new Date().toISOString(),
-        },
-        completedAt: new Date(),
-      });
-
-      const failedJob = await this.jobRepo.findOne({ where: { id: saved.id } });
-      return failedJob ?? saved;
-    }
-
+    // ← HTTP 200 renvoyé ICI, avant tout appel Redis/AI Engine
     return saved;
+  }
+
+  // ── Enqueue Bull (fire-and-forget, jamais awaité par createJob) ──
+  // PHASE 15 — cette méthode est appelée sans await.
+  // Toute erreur est capturée ici et marque le job FAILED en DB,
+  // sans jamais bloquer la réponse HTTP ni crasher le process.
+  private enqueueJobFireAndForget(
+    jobId:  string,
+    dto:    StartConversionDto,
+    limits: ReturnType<typeof getPlanLimits>,
+    plan:   string,
+  ): void {
+    const tag = `[enqueue jobId=${jobId}]`;
+
+    // setImmediate garantit que l'enqueue se lance APRÈS le return de createJob
+    // (donc après que NestJS ait sérialisé et envoyé la réponse HTTP)
+    setImmediate(() => {
+      void (async () => {
+        this.logger.log(`${tag} Fire-and-forget: adding to Bull queue (priority=${limits.queuePriority}) plan=${plan}…`);
+        try {
+          await this.conversionQueue.add(
+            'run-conversion',
+            { jobId, dto },
+            {
+              priority:         limits.queuePriority,
+              attempts:         3,
+              backoff:          { type: 'exponential', delay: 2_000 },
+              removeOnComplete: 100,
+              removeOnFail:     200,
+            },
+          );
+          this.logger.log(`${tag} ✅ Job enqueued to Bull — worker will pick up shortly`);
+        } catch (queueErr: unknown) {
+          const qMsg = queueErr instanceof Error ? queueErr.message : String(queueErr);
+          this.logger.error(`${tag} ❌ Queue unavailable (Redis?): ${qMsg} — marking job FAILED`);
+
+          // Marquer le job FAILED en DB — le frontend verra l'erreur via polling
+          try {
+            await this.jobRepo.update(jobId, {
+              status:       JobStatus.FAILED,
+              errorMessage: `Conversion queue unavailable: ${qMsg}. ` +
+                            `Redis may not be configured. Contact support.`,
+              errorDetails: {
+                cause:     qMsg,
+                hint:      'Set REDIS_URL environment variable or contact support.',
+                timestamp: new Date().toISOString(),
+              },
+              completedAt: new Date(),
+            });
+            this.logger.log(`${tag} Job marked FAILED in DB after queue error`);
+          } catch (dbErr: unknown) {
+            const dbMsg = dbErr instanceof Error ? dbErr.message : String(dbErr);
+            this.logger.error(`${tag} Also failed to update DB after queue error: ${dbMsg}`);
+          }
+        }
+      })();
+    });
   }
 
   // ── Find by ID ────────────────────────────────────────
