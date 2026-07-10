@@ -2,6 +2,14 @@
 // CodeMorph AI Engine — Convert Router
 // Supports: Free (Groq), Platform (OpenAI), Pro (user keys)
 // User keys passed via headers: X-OpenAI-Key, X-Anthropic-Key
+//
+// FIX PHASE 16 — INCOMPATIBILITÉ CALLBACK :
+// Le backend (jobs.service.ts handleCallback) attend :
+//   { success, filesGenerated, linesGenerated, result, irDocument, error }
+// L'AI Engine envoyait :
+//   { jobId, status, output: { files, summary, irDocument } }
+//
+// Fix: le callback est maintenant envoyé au format attendu par le backend.
 // ============================================================
 import { Router, type Request, type Response, type NextFunction } from 'express';
 import { v4 as uuidv4 } from 'uuid';
@@ -23,7 +31,17 @@ function extractAIKeys(req: Request): { userOpenAIKey?: string; userAnthropicKey
 // ── POST /api/convert — async (fire and forget + callback) ─
 convertRouter.post('/', async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
-    const { jobId, projectId, sourceCode, sourceLanguage, sourceFramework, targetFramework, userGoal, callbackUrl } = req.body as {
+    const {
+      jobId,
+      projectId,
+      sourceCode,
+      sourceLanguage,
+      sourceFramework,
+      targetFramework,
+      userGoal,
+      callbackUrl,
+      options,
+    } = req.body as {
       jobId?:          string;
       projectId:       string;
       sourceCode?:     string;
@@ -32,51 +50,72 @@ convertRouter.post('/', async (req: Request, res: Response, next: NextFunction):
       targetFramework: string;
       userGoal?:       string;
       callbackUrl?:    string;
+      options?:        Record<string, unknown>;
     };
 
     const ctx: ConversionContext = {
       jobId:           jobId ?? uuidv4(),
-      projectId,
+      projectId:       projectId ?? jobId ?? uuidv4(),
       sourceCode:      sourceCode ?? '',
-      sourceLanguage:  sourceLanguage ?? 'typescript',
-      sourceFramework,
-      targetFramework,
+      sourceLanguage:  sourceLanguage ?? sourceFramework ?? 'typescript',
+      sourceFramework: sourceFramework ?? sourceLanguage ?? 'typescript',
+      targetFramework: targetFramework,
       ...(userGoal !== undefined ? { userGoal } : {}),
       options: {
-        preserveComments:   true,
-        generateTests:      true,
-        strictMode:         true,
-        addTypeAnnotations: true,
+        preserveComments:   (options?.preserveComments as boolean) ?? true,
+        generateTests:      (options?.generateTests as boolean) ?? true,
+        strictMode:         (options?.strictMode as boolean) ?? true,
+        addTypeAnnotations: (options?.addTypeAnnotations as boolean) ?? true,
       },
     };
 
     const aiOpts = extractAIKeys(req);
 
-    // Respond immediately with jobId
-    res.status(202).json({ jobId: ctx.jobId, status: 'processing', message: 'Conversion pipeline started' });
+    // Respond immediately with jobId — backend marks job as accepted
+    res.status(202).json({ jobId: ctx.jobId, accepted: true, message: 'Conversion pipeline started' });
 
-    // Run pipeline + optional callback
+    // Run pipeline + callback in background
     pipeline.run(ctx, aiOpts)
       .then(async (result) => {
         if (callbackUrl) {
           const { default: axios } = await import('axios');
+          // FIX: format de callback attendu par le backend handleCallback()
+          // Backend attend: { success, filesGenerated, linesGenerated, result, irDocument }
+          const filesGenerated  = result.files?.length ?? 0;
+          const linesGenerated  = result.files?.reduce(
+            (acc: number, f: { content: string }) => acc + (f.content?.split('\n').length ?? 0), 0
+          ) ?? 0;
           await axios.post(callbackUrl, {
-            jobId:       result.jobId,
-            status:      'completed',
-            output:      { files: result.files, summary: result.summary, irDocument: result.ir },
-            tokensUsed:  result.tokensUsed,
-            durationMs:  result.durationMs,
-          }).catch(() => null);
+            success:        true,
+            jobId:          result.jobId,
+            filesGenerated,
+            linesGenerated,
+            result: {
+              files:           result.files,
+              summary:         result.summary,
+              sourceLanguage:  ctx.sourceLanguage,
+              targetLanguage:  ctx.targetFramework,
+              conversionType:  'ai',
+              generatedAt:     new Date().toISOString(),
+            },
+            irDocument:     result.ir,
+          }, { timeout: 15_000 }).catch((cbErr: Error) => {
+            console.error(`[AI Engine] Callback POST failed: ${cbErr.message}`);
+          });
         }
       })
       .catch(async (err: Error) => {
         if (callbackUrl) {
           const { default: axios } = await import('axios');
+          // FIX: format d'erreur attendu par le backend handleCallback()
+          // Backend attend: { success: false, error }
           await axios.post(callbackUrl, {
-            jobId:        ctx.jobId,
-            status:       'failed',
-            errorMessage: err.message,
-          }).catch(() => null);
+            success: false,
+            jobId:   ctx.jobId,
+            error:   err.message,
+          }, { timeout: 15_000 }).catch((cbErr: Error) => {
+            console.error(`[AI Engine] Failure callback POST failed: ${cbErr.message}`);
+          });
         }
       });
   } catch (err) {

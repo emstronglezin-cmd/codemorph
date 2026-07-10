@@ -171,42 +171,54 @@ export class AiEngineClient {
   }
 
   // ── Submit async conversion job ──────────────────────────
+  // FIX PHASE 16 — INCOMPATIBILITÉ PAYLOAD :
+  // Le backend envoyait { files: [{path,content}], sourceLanguage, targetLanguage }
+  // L'AI Engine attend   { sourceCode: string, sourceFramework, targetFramework, projectId }
+  //
+  // Fix:
+  //   - files[] → concaténés en sourceCode string (séparés par header de fichier)
+  //   - sourceLanguage → sourceFramework  (ex: "flutter" → "flutter")
+  //   - targetLanguage → targetFramework  (ex: "react"   → "react")
+  //   - goalPrompt     → userGoal
+  //   - jobId transmis tel quel (attendu par l'AI Engine)
   async submitConversion(req: AiConvertRequest): Promise<AiConvertResponse> {
-    // ── DIAG: entrée submitConversion ──
     const targetUrl = `${this.baseUrl}/api/convert`;
-    this.logger.log(
-      `[DIAG submitConversion] [Job ${req.jobId}] ENTRY:\n` +
-      `  METHOD         : POST\n` +
-      `  URL            : ${targetUrl}\n` +
-      `  sourceLanguage : ${req.sourceLanguage}\n` +
-      `  targetLanguage : ${req.targetLanguage}\n` +
-      `  files count    : ${req.files.length}\n` +
-      `  callbackUrl    : ${req.callbackUrl}\n` +
-      `  goalPrompt     : ${req.goalPrompt ? `"${req.goalPrompt.slice(0, 80)}…"` : '(none)'}\n` +
-      `  options        : ${JSON.stringify(req.options ?? {})}\n` +
-      `  mockMode       : ${this.mockMode}\n` +
-      `  circuitOpen    : ${this.circuitOpen}\n` +
-      `  timeout        : 30000ms (axios) / 35000ms (rxjs)\n` +
-      `  headers        : Content-Type=application/json, X-Source=codemorph-backend`,
-    );
 
     this.logger.log(
-      `[Job ${req.jobId}] submitConversion: ${req.sourceLanguage} → ${req.targetLanguage}, ` +
-      `${req.files.length} files, mock=${this.mockMode}`,
+      `[submitConversion] [Job ${req.jobId}] ${req.sourceLanguage} → ${req.targetLanguage}, ` +
+      `${req.files.length} files, mock=${this.mockMode}, url=${targetUrl}`,
     );
 
     if (this.mockMode) {
-      this.logger.log(`[DIAG submitConversion] [Job ${req.jobId}] → routing to mockConversion()`);
       return this.mockConversion(req);
     }
 
     this.assertCircuitClosed();
 
+    // ── Convertir files[] → sourceCode string (format attendu par l'AI Engine) ──
+    // L'AI Engine attend un seul champ `sourceCode` (string), pas un tableau de fichiers.
+    // On concatène tous les fichiers avec un header indiquant le chemin.
+    const sourceCode = req.files
+      .map((f) => `// === FILE: ${f.path} ===\n${f.content}`)
+      .join('\n\n');
+
+    // L'AI Engine utilise sourceFramework/targetFramework (pas sourceLanguage/targetLanguage)
+    const payload = {
+      jobId:           req.jobId,
+      projectId:       req.jobId,          // requis par l'AI Engine
+      sourceCode,
+      sourceLanguage:  req.sourceLanguage,
+      sourceFramework: req.sourceLanguage,  // alias: language = framework pour l'AI Engine
+      targetFramework: req.targetLanguage,  // alias: language = framework pour l'AI Engine
+      userGoal:        req.goalPrompt ?? '',
+      callbackUrl:     req.callbackUrl,
+      options:         req.options,
+    };
+
     try {
-      this.logger.log(`[DIAG submitConversion] [Job ${req.jobId}] → sending HTTP POST to AI Engine…`);
       const res = await firstValueFrom(
         this.http
-          .post<AiConvertResponse>(targetUrl, req, {
+          .post<AiConvertResponse>(targetUrl, payload, {
             headers:         { 'Content-Type': 'application/json', 'X-Source': 'codemorph-backend' },
             timeout:         30_000,
             validateStatus:  (s) => s < 500,
@@ -214,26 +226,18 @@ export class AiEngineClient {
           .pipe(
             timeout(35_000),
             retry({
-              count:    3,
+              count:    2,
               delay:    (err, attempt) => {
                 const wait = Math.pow(2, attempt) * 1_000;
-                this.logger.warn(
-                  `[DIAG submitConversion] [Job ${req.jobId}] RETRY ${attempt}/3 after ${wait}ms:\n` +
-                  `  error: ${(err as Error).message}`,
-                );
+                this.logger.warn(`[submitConversion] [Job ${req.jobId}] retry ${attempt}/2 after ${wait}ms: ${(err as Error).message}`);
                 return new Promise((r) => setTimeout(r, wait)) as any;
               },
               resetOnSuccess: true,
             }),
             catchError((err: AxiosError) => {
               this.logger.error(
-                `[DIAG submitConversion] [Job ${req.jobId}] AXIOS ERROR:\n` +
-                `  URL      : ${targetUrl}\n` +
-                `  status   : ${err.response?.status ?? 'no response'}\n` +
-                `  message  : ${err.message}\n` +
-                `  code     : ${err.code ?? '(none)'}\n` +
-                `  response : ${JSON.stringify(err.response?.data ?? {})}\n` +
-                `  stack    : ${err.stack ?? '(no stack)'}`,
+                `[submitConversion] [Job ${req.jobId}] HTTP error: ${err.message} ` +
+                `status=${err.response?.status ?? 'no response'} body=${JSON.stringify(err.response?.data ?? {})}`,
               );
               this.recordFailure();
               return throwError(() => new ServiceUnavailableException(
@@ -243,19 +247,19 @@ export class AiEngineClient {
           ),
       );
 
-      this.logger.log(
-        `[DIAG submitConversion] [Job ${req.jobId}] RESPONSE:\n` +
-        `  status  : ${res.status}\n` +
-        `  body    : ${JSON.stringify(res.data)}`,
-      );
+      this.logger.log(`[submitConversion] [Job ${req.jobId}] AI Engine accepted: status=${res.status} body=${JSON.stringify(res.data)}`);
       this.recordSuccess();
-      return res.data;
+
+      // L'AI Engine répond { jobId, status: 'processing', message }
+      // On normalise vers AiConvertResponse { jobId, accepted, message }
+      const data = res.data as any;
+      return {
+        jobId:    data.jobId ?? req.jobId,
+        accepted: data.status === 'processing' || data.accepted === true,
+        message:  data.message,
+      };
     } catch (err) {
-      this.logger.error(
-        `[DIAG submitConversion] [Job ${req.jobId}] EXCEPTION:\n` +
-        `  message : ${(err as Error)?.message ?? String(err)}\n` +
-        `  stack   : ${(err as Error)?.stack ?? '(no stack)'}`,
-      );
+      this.logger.error(`[submitConversion] [Job ${req.jobId}] exception: ${(err as Error)?.message}`);
       this.recordFailure();
       throw err;
     }
