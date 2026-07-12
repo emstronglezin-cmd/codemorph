@@ -85,88 +85,17 @@ export class AiEngineClient {
     this.mockMode = !configured || configured === 'http://ai-engine:5000';
     this.baseUrl  = configured || 'http://ai-engine:5000';
 
-    // ── DIAG startup ──
     this.logger.log(
-      `[DIAG AiEngineClient] STARTUP:\n` +
-      `  AI_ENGINE_URL (raw)  : "${configured || '(non défini)'}"\n` +
-      `  baseUrl (effectif)   : ${this.baseUrl}\n` +
-      `  mockMode             : ${this.mockMode}\n` +
-      `  circuitThreshold     : ${this.CIRCUIT_THRESHOLD} failures\n` +
-      `  circuitTimeout       : ${this.CIRCUIT_TIMEOUT_MS}ms`,
+      `[AiEngineClient] AI_ENGINE_URL="${configured || '(not set)'}" ` +
+      `baseUrl=${this.baseUrl} mockMode=${this.mockMode}`,
     );
 
     // ── DIAG axios interceptors ──────────────────────────────
     // Intercepte tous les appels HTTP sortants via HttpService (nestjs/axios)
-    this.http.axiosRef.interceptors.request.use(
-      (config) => {
-        const method  = (config.method ?? 'UNKNOWN').toUpperCase();
-        const url     = `${config.baseURL ?? ''}${config.url ?? ''}`;
-        const body    = config.data !== undefined
-          ? (typeof config.data === 'string' ? config.data : JSON.stringify(config.data))
-          : '(no body)';
-        this.logger.log(
-          `[DIAG axios] ▶ REQUEST:\n` +
-          `  METHOD  : ${method}\n` +
-          `  URL     : ${url}\n` +
-          `  BODY    : ${body.slice(0, 500)}`,
-        );
-        return config;
-      },
-      (error: unknown) => {
-        this.logger.error(
-          `[DIAG axios] ✖ REQUEST ERROR:\n` +
-          `  message : ${(error as Error)?.message ?? String(error)}\n` +
-          `  stack   : ${(error as Error)?.stack ?? '(no stack)'}`,
-        );
-        return Promise.reject(error);
-      },
-    );
-
-    this.http.axiosRef.interceptors.response.use(
-      (response) => {
-        const method = (response.config?.method ?? 'UNKNOWN').toUpperCase();
-        const url    = `${response.config?.baseURL ?? ''}${response.config?.url ?? ''}`;
-        const body   = response.data !== undefined
-          ? (typeof response.data === 'string' ? response.data : JSON.stringify(response.data))
-          : '(no body)';
-        this.logger.log(
-          `[DIAG axios] ◀ RESPONSE:\n` +
-          `  STATUS  : ${response.status}\n` +
-          `  METHOD  : ${method}\n` +
-          `  URL     : ${url}\n` +
-          `  BODY    : ${body.slice(0, 500)}`,
-        );
-        return response;
-      },
-      (error: unknown) => {
-        const axErr = error as import('axios').AxiosError;
-        const method  = (axErr.config?.method ?? 'UNKNOWN').toUpperCase();
-        const url     = `${axErr.config?.baseURL ?? ''}${axErr.config?.url ?? ''}`;
-        const status  = axErr.response?.status ?? 'no response';
-        const resBody = axErr.response?.data !== undefined
-          ? (typeof axErr.response.data === 'string'
-              ? axErr.response.data
-              : JSON.stringify(axErr.response.data))
-          : '(no body)';
-        this.logger.error(
-          `[DIAG axios] ✖ ERROR:\n` +
-          `  STATUS  : ${status}\n` +
-          `  METHOD  : ${method}\n` +
-          `  URL     : ${url}\n` +
-          `  BODY    : ${resBody.slice(0, 500)}\n` +
-          `  STACK   : ${axErr.stack ?? '(no stack)'}`,
-        );
-        return Promise.reject(error);
-      },
-    );
-
     if (this.mockMode) {
-      this.logger.warn(
-        'AI_ENGINE_URL not configured or points to Docker-internal host. ' +
-        'Running in MOCK mode — conversions will be simulated.',
-      );
+      this.logger.warn('[PIPELINE] mockMode=true — AI_ENGINE_URL not set, using mock conversion');
     } else {
-      this.logger.log(`AI Engine configured at: ${this.baseUrl}`);
+      this.logger.log(`[PIPELINE] AI Engine real mode — baseUrl=${this.baseUrl}`);
     }
   }
 

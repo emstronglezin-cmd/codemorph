@@ -303,6 +303,7 @@ export class JobsService implements OnModuleInit {
     this.enqueueJobFireAndForget(saved.id, dto, limits, plan);
 
     // ← HTTP 200 renvoyé ICI, avant tout appel Redis/AI Engine
+    this.logger.log(`[PIPELINE] Job created — jobId=${saved.id} status=pending`);
     return saved;
   }
 
@@ -335,7 +336,7 @@ export class JobsService implements OnModuleInit {
               removeOnFail:     200,
             },
           );
-          this.logger.log(`${tag} ✅ Job enqueued to Bull — worker will pick up shortly`);
+          this.logger.log(`[PIPELINE] Queue add OK — jobId=${jobId} plan=${plan}`);
         } catch (queueErr: unknown) {
           const qMsg = queueErr instanceof Error ? queueErr.message : String(queueErr);
           this.logger.error(`${tag} ❌ Queue unavailable (Redis?): ${qMsg} — marking job FAILED`);
@@ -440,34 +441,13 @@ export class JobsService implements OnModuleInit {
     //   3. localhost (dev local seulement)
     const apiUrlEnv  = this.config.get<string>('API_URL');
     const renderUrl  = process.env['RENDER_EXTERNAL_URL'];
-
-    // ── DIAG ENV resolution ──
-    const usedSource =
-      apiUrlEnv   ? 'API_URL'              :
-      renderUrl   ? 'RENDER_EXTERNAL_URL'  :
-                    'localhost (fallback)';
     const apiUrl = apiUrlEnv
       ?? (renderUrl ? `${renderUrl}/api/v1` : 'http://localhost:4000/api/v1');
     const callbackUrl = `${apiUrl}/jobs/${job.id}/callback`;
 
     this.logger.log(
-      `[DIAG dispatchToAiEngine] [Job ${job.id}] ENV resolution:\n` +
-      `  API_URL env          : ${apiUrlEnv ?? '(non défini)'}\n` +
-      `  RENDER_EXTERNAL_URL  : ${renderUrl ?? '(non défini)'}\n` +
-      `  source utilisé       : ${usedSource}\n` +
-      `  apiUrl résolu        : ${apiUrl}\n` +
-      `  callbackUrl          : ${callbackUrl}\n` +
-      `  files count          : ${files.length}\n` +
-      `  sourceLanguage       : ${job.sourceLanguage}\n` +
-      `  targetLanguage       : ${job.targetLanguage}\n` +
-      `  goalPrompt           : ${goalPrompt ? `"${goalPrompt.slice(0, 80)}…"` : '(none)'}\n` +
-      `  mockMode             : ${this.aiEngineClient.isMockMode}`,
-    );
-
-    this.logger.log(
-      `[Job ${job.id}] dispatchToAiEngine: ${files.length} files ` +
-      `${job.sourceLanguage}→${job.targetLanguage}, callback=${callbackUrl}, ` +
-      `mockMode=${this.aiEngineClient.isMockMode}`,
+      `[PIPELINE] AI request sent — jobId=${job.id} files=${files.length} ` +
+      `${job.sourceLanguage}→${job.targetLanguage} callbackUrl=${callbackUrl} mockMode=${this.aiEngineClient.isMockMode}`,
     );
 
     let response: Awaited<ReturnType<typeof this.aiEngineClient.submitConversion>>;
@@ -482,24 +462,14 @@ export class JobsService implements OnModuleInit {
       });
     } catch (err) {
       this.logger.error(
-        `[DIAG dispatchToAiEngine] [Job ${job.id}] EXCEPTION in submitConversion:\n` +
-        `  message  : ${(err as Error)?.message ?? String(err)}\n` +
-        `  stack    : ${(err as Error)?.stack ?? '(no stack)'}`,
+        `[PIPELINE] AI Engine call FAILED — jobId=${job.id}: ${(err as Error)?.message ?? String(err)}`,
       );
       throw err;
     }
 
-    // FIX: response est AiConvertResponse { jobId, accepted, message? }
-    // On retourne response.jobId (qui est string), pas l'objet entier
     const aiJobId = response.jobId ?? job.id;
     this.logger.log(
-      `[DIAG dispatchToAiEngine] [Job ${job.id}] submitConversion OK:\n` +
-      `  aiJobId  : ${aiJobId}\n` +
-      `  accepted : ${response.accepted}\n` +
-      `  message  : ${response.message ?? '(none)'}`,
-    );
-    this.logger.log(
-      `[Job ${job.id}] AI Engine accepted: aiJobId=${aiJobId} accepted=${response.accepted}`,
+      `[PIPELINE] AI response received — jobId=${job.id} aiJobId=${aiJobId} accepted=${response.accepted}`,
     );
 
     return String(aiJobId);
@@ -518,7 +488,7 @@ export class JobsService implements OnModuleInit {
     },
   ): Promise<void> {
     const job = await this.findById(id);
-    this.logger.log(`[Job ${id}] Callback received: success=${payload.success}`);
+    this.logger.log(`[PIPELINE] Callback received — jobId=${id} success=${payload.success}`);
 
     // Get user plan for quota tracking
     const plan = await this.subscriptionSvc.getUserPlan(job.userId);
@@ -534,12 +504,11 @@ export class JobsService implements OnModuleInit {
       await this.appendLog(id, 'done', 'done',
         `Conversion complete: ${payload.filesGenerated ?? 0} files generated`,
       );
-      // Track successful conversion (monthly quota)
       await this.quotaService.incrementConversions(job.userId, plan, {
         filesProcessed: payload.filesGenerated,
         linesProcessed: payload.linesGenerated,
       });
-      this.logger.log(`━━━ [Job ${id}] STEP 10 ✅ ━━━ DONE — ${payload.filesGenerated ?? 0} files generated — conversion complete!`);
+      this.logger.log(`[PIPELINE] Job completed — jobId=${id} files=${payload.filesGenerated ?? 0}`);
     } else {
       const errorMsg = payload.error ?? 'Unknown error from AI Engine';
       await this.updateStatus(id, JobStatus.FAILED, {
@@ -547,7 +516,7 @@ export class JobsService implements OnModuleInit {
         progress:     0,
       });
       await this.appendLog(id, 'failed', 'failed', `AI Engine error: ${errorMsg}`);
-      this.logger.error(`━━━ [Job ${id}] STEP 10 ❌ ━━━ FAILED by AI Engine: ${errorMsg}`);
+      this.logger.error(`[PIPELINE] Job failed by AI Engine — jobId=${id} error=${errorMsg}`);
     }
   }
 

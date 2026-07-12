@@ -53,6 +53,20 @@ convertRouter.post('/', async (req: Request, res: Response, next: NextFunction):
       options?:        Record<string, unknown>;
     };
 
+    // Guard: champs obligatoires
+    if (!sourceFramework && !sourceLanguage) {
+      res.status(400).json({ error: 'sourceFramework or sourceLanguage is required' });
+      return;
+    }
+    if (!targetFramework) {
+      res.status(400).json({ error: 'targetFramework is required' });
+      return;
+    }
+    if (!sourceCode || sourceCode.trim().length === 0) {
+      res.status(400).json({ error: 'sourceCode is required and must not be empty' });
+      return;
+    }
+
     const ctx: ConversionContext = {
       jobId:           jobId ?? uuidv4(),
       projectId:       projectId ?? jobId ?? uuidv4(),
@@ -72,11 +86,13 @@ convertRouter.post('/', async (req: Request, res: Response, next: NextFunction):
     const aiOpts = extractAIKeys(req);
 
     // Respond immediately with jobId — backend marks job as accepted
+    console.log(`[PIPELINE] AI Engine received job=${ctx.jobId} src=${ctx.sourceFramework} tgt=${ctx.targetFramework} codeLen=${sourceCode.length} callbackUrl=${callbackUrl ?? '(none)'}`);
     res.status(202).json({ jobId: ctx.jobId, accepted: true, message: 'Conversion pipeline started' });
 
     // Run pipeline + callback in background
     pipeline.run(ctx, aiOpts)
       .then(async (result) => {
+        console.log(`[PIPELINE] Pipeline completed — job=${ctx.jobId} files=${result.files?.length ?? 0} duration=${result.durationMs}ms`);
         if (callbackUrl) {
           const { default: axios } = await import('axios');
           // FIX: format de callback attendu par le backend handleCallback()
@@ -100,11 +116,13 @@ convertRouter.post('/', async (req: Request, res: Response, next: NextFunction):
             },
             irDocument:     result.ir,
           }, { timeout: 15_000 }).catch((cbErr: Error) => {
-            console.error(`[AI Engine] Callback POST failed: ${cbErr.message}`);
+            console.error(`[PIPELINE] Callback POST FAILED: ${cbErr.message} → ${callbackUrl}`);
           });
+          console.log(`[PIPELINE] Callback sent — job=${ctx.jobId} files=${filesGenerated}`);
         }
       })
       .catch(async (err: Error) => {
+        console.error(`[PIPELINE] Pipeline FAILED — job=${ctx.jobId} error=${err.message}`);
         if (callbackUrl) {
           const { default: axios } = await import('axios');
           // FIX: format d'erreur attendu par le backend handleCallback()
@@ -114,7 +132,7 @@ convertRouter.post('/', async (req: Request, res: Response, next: NextFunction):
             jobId:   ctx.jobId,
             error:   err.message,
           }, { timeout: 15_000 }).catch((cbErr: Error) => {
-            console.error(`[AI Engine] Failure callback POST failed: ${cbErr.message}`);
+            console.error(`[PIPELINE] Failure callback POST FAILED: ${cbErr.message}`);
           });
         }
       });

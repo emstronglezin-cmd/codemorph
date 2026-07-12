@@ -25,12 +25,14 @@ export class CodePlanner {
   }
 
   private getFrameworkPlanner(target: string): (ctx: ConversionContext, ir: IRDocument) => Promise<CodePlan> {
-    const planners: Record<string, (ctx: ConversionContext, ir: IRDocument) => Promise<CodePlan>> = {
-      'React':         this.planReact.bind(this),
-      'React Native':  this.planReactNative.bind(this),
-      'NestJS':        this.planNestJS.bind(this),
-    };
-    return planners[target] ?? this.planGeneric.bind(this);
+    // FIX PHASE 16 — normaliser la cible pour matcher les variations d'entrée
+    // Backend envoie: "react", "react-native", "reactnative", "nestjs"
+    // Les clés étaient: "React", "React Native", "NestJS" → jamais de match → planGeneric
+    const norm = target.toLowerCase().replace(/[\s_-]/g, '');
+    if (norm === 'react')                          return this.planReact.bind(this);
+    if (norm === 'reactnative' || norm === 'rn')  return this.planReactNative.bind(this);
+    if (norm === 'nestjs')                         return this.planNestJS.bind(this);
+    return this.planGeneric.bind(this);
   }
 
   // ── React planner ─────────────────────────────────────
