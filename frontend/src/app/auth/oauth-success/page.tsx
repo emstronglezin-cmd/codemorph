@@ -2,23 +2,26 @@
 
 // ============================================================
 // CodeMorph — OAuth Success Page
-// FIX 14: setAuth() compatible avec AuthUser (id, email, name, role, plan)
-//         Normalise la réponse /auth/me (sub → id, name fallback)
-//         setAccessToken() appelé immédiatement pour que apiGet /auth/me fonctionne
+// FIX PHASE 3 — SEC-02 : token via cookie httpOnly uniquement
+// Le token n'est PLUS dans l'URL (?token=) — il est dans le
+// cookie cm_refresh_token httpOnly (posé par le backend).
+// Cette page appelle POST /auth/refresh via withCredentials
+// pour échanger le cookie contre un access token.
 // ============================================================
 
 import type React from 'react';
 import { useEffect, Suspense } from 'react';
-import { useSearchParams, useRouter } from 'next/navigation';
+import { useRouter } from 'next/navigation';
 import { useAuthStore } from '@/stores/auth.store';
 import { setAccessToken, apiGet } from '@/lib/api/client';
 import type { AuthUser } from '@/stores/auth.store';
 
+const BACKEND = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:4000/api/v1';
+
 // Réponse brute possible de /auth/me selon TransformInterceptor
 interface MeRaw {
-  // JwtPayload fields (via getMe qui retourne l'user entity)
   id?:        string;
-  sub?:       string;   // JwtPayload utilise sub
+  sub?:       string;
   email?:     string;
   name?:      string;
   firstName?: string;
@@ -28,6 +31,12 @@ interface MeRaw {
   role?:      string;
   plan?:      string;
   status?:    string;
+}
+
+interface RefreshResponse {
+  data?: { tokens?: { accessToken?: string }; accessToken?: string };
+  tokens?: { accessToken?: string };
+  accessToken?: string;
 }
 
 /** Normalise la réponse brute de /auth/me en AuthUser */
@@ -50,45 +59,64 @@ function normalizeMeResponse(raw: MeRaw): AuthUser {
 }
 
 function OAuthSuccessInner(): React.JSX.Element {
-  const searchParams = useSearchParams();
-  const router       = useRouter();
-  const setAuth      = useAuthStore((s) => s.setAuth);
+  const router  = useRouter();
+  const setAuth = useAuthStore((s) => s.setAuth);
 
   useEffect(() => {
-    const token = searchParams.get('token');
+    let cancelled = false;
 
-    if (!token) {
-      router.replace('/auth/sign-in?error=oauth_failed');
-      return;
+    async function handleOAuthSuccess() {
+      try {
+        // FIX PHASE 3 — SEC-02 : utiliser le cookie httpOnly pour obtenir l'access token
+        // Le backend a posé cm_refresh_token en cookie httpOnly lors du callback OAuth.
+        // On appelle POST /auth/refresh avec withCredentials pour échanger le cookie.
+        const refreshRes = await fetch(`${BACKEND}/auth/refresh`, {
+          method:      'POST',
+          credentials: 'include',
+          headers:     { 'Content-Type': 'application/json' },
+          body:        '{}',
+        });
+
+        if (!refreshRes.ok) {
+          if (!cancelled) router.replace('/auth/sign-in?error=oauth_failed');
+          return;
+        }
+
+        const refreshData = await refreshRes.json() as RefreshResponse;
+        const token =
+          refreshData?.data?.tokens?.accessToken ??
+          refreshData?.data?.accessToken ??
+          refreshData?.tokens?.accessToken ??
+          refreshData?.accessToken;
+
+        if (!token) {
+          if (!cancelled) router.replace('/auth/sign-in?error=oauth_failed');
+          return;
+        }
+
+        // Injecter le token dans tous les stockages
+        setAccessToken(token);
+
+        // Récupérer le profil complet
+        const raw = await apiGet<MeRaw>('/auth/me');
+        const user = normalizeMeResponse(raw);
+
+        if (!cancelled) {
+          setAuth(user, token);
+          router.replace('/dashboard');
+        }
+      } catch {
+        if (!cancelled) {
+          router.replace('/auth/sign-in?error=oauth_failed');
+        }
+      }
     }
 
-    // 1. Injecter le token immédiatement dans tous les stockages
-    //    pour que apiGet('/auth/me') puisse l'utiliser via l'intercepteur Axios
-    setAccessToken(token);
+    void handleOAuthSuccess();
 
-    // 2. Récupérer le profil complet de l'utilisateur
-    apiGet<MeRaw>('/auth/me')
-      .then((raw) => {
-        const user = normalizeMeResponse(raw);
-        setAuth(user, token);
-        // Utiliser replace (pas push) pour éviter un retour en arrière vers oauth-success
-        router.replace('/dashboard');
-      })
-      .catch(() => {
-        // Fallback : le token est valide (backend l'a émis) mais /auth/me a échoué
-        // → on stock quand même et on redirige
-        const fallbackUser: AuthUser = {
-          id:    '',
-          email: '',
-          name:  'User',
-          role:  'member',
-          plan:  'free',
-        };
-        setAuth(fallbackUser, token);
-        router.replace('/dashboard');
-      });
+    return () => { cancelled = true; };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);   // Intentionnellement vide : s'exécute une seule fois au montage
+  }, []);
 
   return (
     <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-slate-900 to-slate-800">
@@ -98,7 +126,7 @@ function OAuthSuccessInner(): React.JSX.Element {
         </div>
         <div>
           <h2 className="text-xl font-bold text-white">Connexion réussie</h2>
-          <p className="text-sm text-slate-400 mt-1">Redirection vers le dashboard…</p>
+          <p className="text-sm text-slate-400 mt-1">Finalisation de la session…</p>
         </div>
       </div>
     </div>

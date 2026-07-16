@@ -90,6 +90,27 @@ export class AuthController {
     return { message: 'Signed out successfully' };
   }
 
+  // ── POST /auth/change-password ────────────────────────
+  // FIX PHASE 6 : route manquante — settings/page.tsx l'appelle mais elle n'existait pas
+  @Post('change-password')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth('JWT')
+  @ApiOperation({ summary: 'Change password (requires current password)' })
+  async changePassword(
+    @CurrentUser() user: JwtPayload,
+    @Body() body: { currentPassword: string; newPassword: string },
+  ): Promise<{ message: string }> {
+    if (!body.currentPassword?.trim() || !body.newPassword?.trim()) {
+      throw new BadRequestException('currentPassword and newPassword are required');
+    }
+    if (body.newPassword.length < 8) {
+      throw new BadRequestException('newPassword must be at least 8 characters');
+    }
+    await this.authService.changePassword(user.sub, body.currentPassword, body.newPassword);
+    return { message: 'Password changed successfully' };
+  }
+
   // ── POST /auth/refresh ───────────────────────────────
   // Supporte : cookie httpOnly OU body.refreshToken
   @Public()
@@ -167,7 +188,11 @@ export class AuthController {
     const tokens = await this.authService.loginOAuthUser(req.user);
     this.setRefreshTokenCookie(res, tokens.refreshToken);
     const frontendUrl = process.env['FRONTEND_URL'] ?? 'https://codemorph-coral.vercel.app';
-    res.redirect(`${frontendUrl}/auth/oauth-success?token=${tokens.accessToken}`);
+    // FIX PHASE 3 — SEC-02 : token via cookie (httpOnly) uniquement
+    // Avant : ?token= dans l'URL → exposé dans les logs Vercel/Render/Referer
+    // Fix : le token est déjà dans le cookie httpOnly — on redirige sans token dans l'URL
+    // La page oauth-success lira le token depuis un second appel sécurisé /auth/me via cookie
+    res.redirect(`${frontendUrl}/auth/oauth-success`);
   }
 
   // ── GitHub OAuth ──────────────────────────────────────
@@ -190,7 +215,10 @@ export class AuthController {
     const tokens = await this.authService.loginOAuthUser(req.user);
     this.setRefreshTokenCookie(res, tokens.refreshToken);
     const frontendUrl = process.env['FRONTEND_URL'] ?? 'https://codemorph-coral.vercel.app';
-    res.redirect(`${frontendUrl}/auth/oauth-success?token=${tokens.accessToken}`);
+    // FIX PHASE 3 — SEC-02 : token transmis via cookie httpOnly uniquement
+    // Plus de token dans l'URL → plus d'exposition dans les logs/Referer
+    // La page oauth-success appelle POST /auth/refresh via cookie pour obtenir l'access token
+    res.redirect(`${frontendUrl}/auth/oauth-success`);
   }
 
   // ── GET /auth/github-repos ────────────────────────────

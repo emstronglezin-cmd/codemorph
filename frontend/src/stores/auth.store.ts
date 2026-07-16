@@ -70,6 +70,8 @@ export const useAuthStore = create<AuthState>()(
       setUser: (user) => set({ user }),
 
       clearAuth: () => {
+        // FIX PHASE 2 — ISO-03 : nettoyage complet de tous les stockages
+        // clearAccessToken() supprime maintenant aussi codemorph-auth + sessionStorage
         clearAccessToken();
         set({ user: null, accessToken: null, isAuthenticated: false, isLoading: false });
       },

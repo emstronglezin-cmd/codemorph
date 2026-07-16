@@ -2,6 +2,7 @@ import { useCallback } from 'react';
 import { useRouter } from 'next/navigation';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useAuthStore } from '@/stores/auth.store';
+import { useProjectStore } from '@/stores/project.store';
 import { apiGet, apiPost } from '@/lib/api/client';
 
 interface MeResponse {
@@ -17,6 +18,7 @@ export function useAuth() {
   const router = useRouter();
   const queryClient = useQueryClient();
   const { user, isAuthenticated, isLoading, setAuth, clearAuth } = useAuthStore();
+  const resetProjectStore = useProjectStore((s) => s.resetStore);
 
   // Fetch current user
   const { data: me, isLoading: isMeLoading } = useQuery({
@@ -49,16 +51,22 @@ export function useAuth() {
     },
   });
 
-  // Sign out
+  // Sign out — FIX PHASE 2 : nettoyage complet multi-couche
+  // 1. clearAuth() → supprime localStorage (codemorph-auth, cm_access_token) + sessionStorage
+  // 2. resetProjectStore() → réinitialise Zustand project store
+  // 3. queryClient.clear() → réinitialise React Query cache
+  // 4. queryClient.removeQueries() → supprime toutes les queries (double sécurité ISO-01)
   const signOut = useCallback(async () => {
     try {
       await apiPost('/auth/sign-out');
     } finally {
       clearAuth();
+      resetProjectStore();
       queryClient.clear();
+      queryClient.removeQueries();
       router.push('/auth/sign-in');
     }
-  }, [clearAuth, queryClient, router]);
+  }, [clearAuth, resetProjectStore, queryClient, router]);
 
   return {
     user: me ?? user,

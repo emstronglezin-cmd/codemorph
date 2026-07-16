@@ -93,6 +93,27 @@ export class UploadsService {
     return filePath;
   }
 
+  // ── FIX PHASE 5 — SEC-05 : blocklist IPs privées pour SSRF ──
+  // Avant : downloadFromUrl acceptait toute URL y compris metadata AWS 169.254.169.254
+  private isPrivateIp(hostname: string): boolean {
+    // Regex couvrant: 10.x.x.x, 172.16-31.x.x, 192.168.x.x, 127.x.x.x, 169.254.x.x,
+    // ::1, fc00::/7, fd00::/8, localhost
+    const privatePatterns = [
+      /^10\./,
+      /^172\.(1[6-9]|2\d|3[01])\./,
+      /^192\.168\./,
+      /^127\./,
+      /^169\.254\./,
+      /^0\.0\.0\.0$/,
+      /^::1$/,
+      /^fc[0-9a-f]{2}:/i,
+      /^fd[0-9a-f]{2}:/i,
+      /^localhost$/i,
+      /^metadata\.google\.internal$/i,
+    ];
+    return privatePatterns.some((p) => p.test(hostname));
+  }
+
   // ── HTTP fetch with redirect follow ───────────────────
   private fetchUrl(url: string, redirectCount: number): Promise<Buffer> {
     return new Promise((resolve, reject) => {
@@ -104,6 +125,15 @@ export class UploadsService {
       }
 
       const parsedUrl = new URL(url);
+
+      // FIX PHASE 5 — SEC-05 : bloquer les IPs privées
+      if (this.isPrivateIp(parsedUrl.hostname)) {
+        return reject(new BadRequestException({
+          code:    'URL_SSRF_BLOCKED',
+          message: `URL hostname "${parsedUrl.hostname}" is not allowed (private/internal IP blocked for security).`,
+        }));
+      }
+
       const proto     = parsedUrl.protocol === 'https:' ? https : http;
       const chunks: Buffer[] = [];
       let totalSize = 0;
@@ -206,6 +236,14 @@ export class UploadsService {
       }
 
       const entryPath = entry.entryName;
+
+      // FIX PHASE 5 — SEC-06 : protection Zip Slip
+      // entryName peut contenir '../' → path traversal vers fichiers système
+      // Ex: "../../etc/passwd" dans un ZIP malveillant
+      if (entryPath.includes('..') || entryPath.startsWith('/') || entryPath.includes('\x00')) {
+        this.logger.warn(`[ZipSlip] Blocked path traversal attempt: entryName="${entryPath}"`);
+        continue;
+      }
 
       // Skip ignored paths
       if (IGNORED_PATHS.some((p) => entryPath.includes(p))) continue;

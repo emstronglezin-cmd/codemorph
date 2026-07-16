@@ -1,23 +1,23 @@
 'use client';
 // ============================================================
-// CodeMorph — Dashboard Page (client-side, vraies stats API)
+// CodeMorph — Dashboard Page
+// PHASE 7 FIX : Source de vérité unique via React Query
+//   - Suppression des fetch() bruts → useProjects + useJobs
+//   - Suppression des console.log verbeux
+//   - Données synchronisées cross-pages (cache React Query partagé)
+//   - Polling auto si jobs actifs (refetchInterval dans useJobs)
 // ============================================================
 import type React from 'react';
-import { useEffect, useState } from 'react';
+import Link from 'next/link';
 import {
   FolderGit2, Zap, CheckCircle2, TrendingUp, ArrowUpRight,
   Plus, Code2, GitBranch, Upload,
 } from 'lucide-react';
-import Link from 'next/link';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
-import { getAccessToken } from '@/lib/api/client';
-
-const BACKEND = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:4000/api/v1';
-
-interface Project { id: string; name: string; sourceLanguage: string; targetLanguage: string; status: string; createdAt: string; }
-interface Job     { id: string; status: string; sourceLanguage: string; targetLanguage: string; progress: number; createdAt: string; filesGenerated?: number; projectId?: string; }
+import { useProjects } from '@/hooks/useProjects';
+import { useJobs } from '@/hooks/useJobs';
 
 const STATUS_CFG: Record<string, { label: string; variant: 'success'|'warning'|'error'|'default'|'info' }> = {
   completed:  { label: 'Completed',  variant: 'success' },
@@ -28,11 +28,6 @@ const STATUS_CFG: Record<string, { label: string; variant: 'success'|'warning'|'
   failed:     { label: 'Failed',     variant: 'error'   },
   active:     { label: 'Active',     variant: 'success' },
 };
-
-function authH() {
-  const t = getAccessToken();
-  return { 'Content-Type': 'application/json', ...(t ? { Authorization: `Bearer ${t}` } : {}) };
-}
 
 function StatCard({ label, value, delta, trend, icon: Icon, color, bg }: {
   label: string; value: string; delta: string; trend: string;
@@ -60,42 +55,17 @@ function StatCard({ label, value, delta, trend, icon: Icon, color, bg }: {
 }
 
 export default function DashboardPage(): React.JSX.Element {
-  const [projects,  setProjects]  = useState<Project[]>([]);
-  const [jobs,      setJobs]      = useState<Job[]>([]);
-  const [loading,   setLoading]   = useState(true);
+  // ── Source de vérité unique via React Query ───────────
+  // Les données sont partagées et synchronisées avec toutes les autres pages
+  const { data: projectsData, isLoading: projectsLoading } = useProjects(1, 20);
+  const { data: jobsData, isLoading: jobsLoading } = useJobs(1, 50);
 
-  useEffect(() => {
-    const h = authH();
-    Promise.all([
-      fetch(`${BACKEND}/projects`, { headers: h }).then(r => r.ok ? r.json() : { data: { data: [] } }),
-      fetch(`${BACKEND}/jobs`,     { headers: h }).then(r => r.ok ? r.json() : { data: { data: [] } }),
-    ]).then(([pData, jData]) => {
-      // FIX PHASE 13 — BUG 6:
-      // TransformInterceptor wrappe: {success, data: {data:[...], total:n}}
-      // Avant: pData.data ?? pData → retournait {data:[...], total:n} (objet, pas tableau)
-      // Fix: lire pData?.data?.data ?? pData?.data ?? pData
-      const ps = (
-        (pData as { data?: { data?: Project[] } })?.data?.data ??
-        (pData as { data?: Project[] })?.data ??
-        pData
-      ) as Project[];
-      const js = (
-        (jData as { data?: { data?: Job[] } })?.data?.data ??
-        (jData as { data?: Job[] })?.data ??
-        jData
-      ) as Job[];
-      console.log('[Dashboard] projects raw:', pData);
-      console.log('[Dashboard] jobs raw:', jData);
-      console.log('[Dashboard] projects resolved:', ps?.length ?? 0, 'items');
-      console.log('[Dashboard] jobs resolved:', js?.length ?? 0, 'items');
-      setProjects(Array.isArray(ps) ? ps : []);
-      setJobs(Array.isArray(js) ? js : []);
-    }).catch((err) => {
-      console.error('[Dashboard] fetch error:', err);
-    }).finally(() => setLoading(false));
-  }, []);
+  const loading = projectsLoading || jobsLoading;
 
-  const totalProjects  = projects.length;
+  const projects = projectsData?.data ?? [];
+  const jobs     = jobsData?.data ?? [];
+
+  const totalProjects  = projectsData?.total ?? projects.length;
   const activeJobs     = jobs.filter(j => ['pending','analyzing','converting'].includes(j.status)).length;
   const completedJobs  = jobs.filter(j => ['done','completed'].includes(j.status)).length;
   const failedJobs     = jobs.filter(j => j.status === 'failed').length;

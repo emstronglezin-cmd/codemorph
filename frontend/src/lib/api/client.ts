@@ -47,9 +47,14 @@ export function setAccessToken(token: string): void {
 
 export function clearAccessToken(): void {
   if (typeof window === 'undefined') return;
+  // FIX PHASE 2 — ISO-03 : supprimer TOUS les stockages au logout
+  // Avant : codemorph-auth était préservé → restauration de session cross-compte
   (window as Window & { __CODEMORPH_ACCESS_TOKEN__?: string }).__CODEMORPH_ACCESS_TOKEN__ = undefined;
   localStorage.removeItem('cm_access_token');
-  // Ne pas supprimer codemorph-auth car il contient aussi les infos user
+  // Supprimer le store Zustand persisté pour éviter la restauration cross-compte
+  localStorage.removeItem('codemorph-auth');
+  // Supprimer sessionStorage également
+  try { sessionStorage.clear(); } catch { /* ignore */ }
 }
 
 // ── Axios instance ────────────────────────────────────────

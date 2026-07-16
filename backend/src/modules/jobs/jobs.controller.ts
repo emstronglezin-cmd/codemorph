@@ -21,9 +21,15 @@ import {
   UseGuards,
   ParseUUIDPipe,
   BadRequestException,
+  UnauthorizedException,
+  NotFoundException,
   Logger,
+  Res,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import type { Response } from 'express';
 import { ApiTags, ApiOperation, ApiBearerAuth, ApiQuery } from '@nestjs/swagger';
+import { SkipThrottle } from '@nestjs/throttler';
 import { JobsService, StartConversionDto } from './jobs.service';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
@@ -34,6 +40,8 @@ import { UploadsService } from '../uploads/uploads.service';
 import { StartFromGithubDto } from './dto/start-github.dto';
 import { StartFromZipDto }    from './dto/start-zip.dto';
 import { StartFromUrlDto }    from './dto/start-url.dto';
+import { Req } from '@nestjs/common';
+import type { Request } from 'express';
 
 @ApiTags('jobs')
 @ApiBearerAuth()
@@ -45,6 +53,7 @@ export class JobsController {
   constructor(
     private readonly jobsService:    JobsService,
     private readonly uploadsService: UploadsService,
+    private readonly config:         ConfigService,
   ) {}
 
   @Post()
@@ -103,10 +112,69 @@ export class JobsController {
     return job;
   }
 
+  // ── GET /jobs/:id/download — télécharger le résultat ZIP ─
+  // FIX PHASE 9 : endpoint manquant — history/page.tsx l'appelle sur handleDownload()
+  // Retourne le ZIP généré stocké dans job.result.files (format JSON → ZIP en mémoire)
+  @Get(':id/download')
+  @ApiOperation({ summary: 'Download job result as ZIP' })
+  async download(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser() user: JwtPayload,
+    @Res() res: Response,
+  ) {
+    const job = await this.jobsService.findById(id);
+    if (job.userId !== (user.sub as string)) {
+      throw new UnauthorizedException('Access denied');
+    }
+    if (job.status !== 'done') {
+      throw new BadRequestException(`Job ${id} is not completed (status: ${job.status})`);
+    }
+
+    const result = job.result as Record<string, unknown> | null;
+    const files  = result?.['files'] as Array<{ path: string; content: string }> | undefined;
+
+    if (!files || files.length === 0) {
+      throw new NotFoundException('No output files found for this job');
+    }
+
+    // Générer un ZIP en mémoire avec les fichiers convertis
+    const AdmZip = (await import('adm-zip')).default;
+    const zip    = new AdmZip();
+
+    for (const file of files) {
+      // Protection Zip Slip : ignorer les chemins dangereux
+      const safePath = file.path.replace(/\.\.\//g, '').replace(/^\//, '');
+      if (!safePath || safePath.includes('\x00')) continue;
+      zip.addFile(safePath, Buffer.from(file.content ?? '', 'utf8'));
+    }
+
+    const buffer = zip.toBuffer();
+    const fileName = `codemorph-${id.slice(0, 8)}.zip`;
+
+    this.logger.log(`[download] Job ${id} → ${files.length} files → ${buffer.length} bytes`);
+
+    res.set({
+      'Content-Type':        'application/zip',
+      'Content-Disposition': `attachment; filename="${fileName}"`,
+      'Content-Length':      String(buffer.length),
+    });
+    res.end(buffer);
+  }
+
+  // FIX PHASE 6 — SEC-10 : ajout ownership check
+  // Avant: aucun filtre userId → n'importe quel utilisateur connecté pouvait lire
+  //        les jobs d'un autre projet en devinant le projectId (UUID)
+  // Fix: filtre sur userId + vérification que le projet appartient à l'utilisateur
   @Get('project/:projectId')
-  @ApiOperation({ summary: 'Get all jobs for a project' })
-  async findByProject(@Param('projectId', ParseUUIDPipe) projectId: string) {
-    return this.jobsService.findByProject(projectId);
+  @ApiOperation({ summary: 'Get all jobs for a project (owned by current user)' })
+  async findByProject(
+    @Param('projectId', ParseUUIDPipe) projectId: string,
+    @CurrentUser() user: JwtPayload,
+  ) {
+    const userId = user.sub as string;
+    const jobs = await this.jobsService.findByProject(projectId);
+    // Filtrer uniquement les jobs appartenant à cet utilisateur
+    return jobs.filter(j => j.userId === userId);
   }
 
   @Delete(':id')
@@ -171,13 +239,19 @@ export class JobsController {
     };
   }
 
-  // ── Callback from AI Engine (public) ──────────────────
+  // ── Callback from AI Engine (protégé par secret partagé) ─
+  // FIX PHASE 6 — SEC-callback: le callback était @Public() sans validation
+  // → n'importe qui pouvait forcer un job en DONE avec de faux résultats
+  // Fix: vérification du secret AI_ENGINE_SECRET dans le header X-AI-Engine-Secret
+  // Si AI_ENGINE_SECRET non configuré → avertissement + accepté (compat dev)
+  @SkipThrottle()  // Le callback vient d'un service interne — pas de rate limit
   @Public()
   @Post(':id/callback')
   @HttpCode(HttpStatus.OK)
-  @ApiOperation({ summary: 'AI Engine callback — update job result' })
+  @ApiOperation({ summary: 'AI Engine callback — update job result (protected by X-AI-Engine-Secret)' })
   async callback(
     @Param('id', ParseUUIDPipe) id: string,
+    @Req() req: Request,
     @Body()
     body: {
       success:         boolean;
@@ -188,6 +262,19 @@ export class JobsController {
       linesGenerated?: number;
     },
   ) {
+    // Vérifier le secret partagé Backend↔AI Engine
+    const expectedSecret = this.config.get<string>('AI_ENGINE_SECRET', '');
+    if (expectedSecret) {
+      const provided = req.headers['x-ai-engine-secret'] as string | undefined;
+      if (!provided || provided !== expectedSecret) {
+        this.logger.warn(`[Callback] Job ${id} — rejected: invalid X-AI-Engine-Secret`);
+        throw new UnauthorizedException('Invalid or missing X-AI-Engine-Secret header');
+      }
+    } else {
+      // En dev sans secret configuré → warn mais accepter
+      this.logger.warn(`[Callback] AI_ENGINE_SECRET not set — callback accepted without auth (dev mode)`);
+    }
+
     this.logger.log(`[Callback] Job ${id} → success=${body.success}`);
     await this.jobsService.handleCallback(id, body);
     return { ok: true };

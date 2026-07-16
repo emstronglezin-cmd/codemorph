@@ -145,10 +145,20 @@ export class AiEngineClient {
     };
 
     try {
+      // FIX PHASE 5 — SEC-01 : transmettre le secret partagé AI_ENGINE_SECRET
+      const aiEngineSecret = this.config.get<string>('AI_ENGINE_SECRET', '');
+      const extraHeaders: Record<string, string> = {
+        'Content-Type': 'application/json',
+        'X-Source': 'codemorph-backend',
+      };
+      if (aiEngineSecret) {
+        extraHeaders['X-AI-Engine-Secret'] = aiEngineSecret;
+      }
+
       const res = await firstValueFrom(
         this.http
           .post<AiConvertResponse>(targetUrl, payload, {
-            headers:         { 'Content-Type': 'application/json', 'X-Source': 'codemorph-backend' },
+            headers:         extraHeaders,
             timeout:         30_000,
             validateStatus:  (s) => s < 500,
           })

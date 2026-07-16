@@ -67,6 +67,17 @@ convertRouter.post('/', async (req: Request, res: Response, next: NextFunction):
       return;
     }
 
+    // FIX PHASE 5/6 — SEC-04 : validation SSRF du callbackUrl
+    // FIX PHASE 6: import depuis utils/ssrf.ts (pas '../index' → plus d'import circulaire)
+    if (callbackUrl) {
+      const { isCallbackUrlSafe } = await import('../utils/ssrf');
+      if (!isCallbackUrlSafe(callbackUrl)) {
+        console.warn(`[SEC-04] SSRF attempt blocked: callbackUrl="${callbackUrl}"`);
+        res.status(400).json({ error: `Invalid callbackUrl — SSRF protection blocked this host: ${callbackUrl}` });
+        return;
+      }
+    }
+
     const ctx: ConversionContext = {
       jobId:           jobId ?? uuidv4(),
       projectId:       projectId ?? jobId ?? uuidv4(),

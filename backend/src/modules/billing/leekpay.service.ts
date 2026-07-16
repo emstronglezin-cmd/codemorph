@@ -521,17 +521,24 @@ export class LeekPayService {
     rawPayload: string,
     signature: string,
   ): Promise<{ processed: boolean; event: string }> {
-    // Vérification signature (sécurité)
-    // Si LEEKPAY_PUBLIC_KEY non configurée, on log un warning mais on continue
-    // pour permettre les tests sans configuration complète
-    if (this.publicKey) {
+    // FIX PHASE 6 — SEC-12 : forcer la vérification de signature webhook LeekPay
+    // AVANT : si LEEKPAY_PUBLIC_KEY absente → bypass silencieux (tout webhook accepté)
+    // MAINTENANT : si LEEKPAY_PUBLIC_KEY absente EN PRODUCTION → rejeter le webhook
+    // EN DEV : avertissement mais on continue (pour faciliter les tests)
+    const isProd = process.env['NODE_ENV'] === 'production';
+    if (!this.publicKey) {
+      if (isProd) {
+        this.logger.error('[SEC-12] LEEKPAY_PUBLIC_KEY not configured — webhook REJECTED in production');
+        throw new UnauthorizedException('Webhook signature verification failed: LEEKPAY_PUBLIC_KEY not configured');
+      }
+      this.logger.warn('[SEC-12] LEEKPAY_PUBLIC_KEY not set — webhook signature SKIPPED (dev mode only)');
+    } else {
       const isValid = this.verifyWebhookSignature(rawPayload, signature);
       if (!isValid) {
-        this.logger.warn('LeekPay webhook: invalid signature');
+        this.logger.warn('[SEC-12] LeekPay webhook: invalid signature — REJECTED');
         throw new UnauthorizedException('Invalid webhook signature');
       }
-    } else {
-      this.logger.warn('LeekPay webhook: signature non vérifiée (LEEKPAY_PUBLIC_KEY manquante)');
+      this.logger.log('[SEC-12] LeekPay webhook signature verified ✓');
     }
 
     const payload = JSON.parse(rawPayload) as LeekPayWebhookPayload;

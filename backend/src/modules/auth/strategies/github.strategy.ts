@@ -17,7 +17,13 @@ export class GitHubStrategy extends PassportStrategy(Strategy, 'github') {
         'GITHUB_CALLBACK_URL',
         'http://localhost:4000/api/v1/auth/github/callback',
       ),
-      scope: ['user:email', 'read:user', 'repo'],
+      // FIX PHASE 3 — SEC-03 : scopes réduits au minimum nécessaire
+      // 'repo' donnait accès en écriture à tous les repos — trop permissif
+      // 'read:org' ajouté pour les organisations
+      scope: ['user:email', 'read:user', 'read:org'],
+      // state: true active la validation CSRF du paramètre state OAuth
+      // passport-github2 génère et vérifie automatiquement le state
+      state: true,
     });
   }
 

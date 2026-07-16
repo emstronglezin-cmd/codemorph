@@ -36,6 +36,8 @@ interface ProjectState {
   deleteProject: (id: string) => Promise<void>;
   setCurrentProject: (project: Project | null) => void;
   clearError: () => void;
+  // FIX PHASE 2 — ISO-04 : réinitialisation au logout
+  resetStore: () => void;
 }
 
 export const useProjectStore = create<ProjectState>((set, _get) => ({
@@ -90,4 +92,6 @@ export const useProjectStore = create<ProjectState>((set, _get) => ({
 
   setCurrentProject: (project) => set({ currentProject: project }),
   clearError: () => set({ error: null }),
+  // FIX PHASE 2 — ISO-04 : réinitialiser le store au logout
+  resetStore: () => set({ projects: [], currentProject: null, total: 0, isLoading: false, error: null }),
 }));

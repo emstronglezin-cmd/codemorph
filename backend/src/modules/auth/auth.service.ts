@@ -6,6 +6,7 @@ import {
   UnauthorizedException,
   ConflictException,
   NotFoundException,
+  BadRequestException,
   Logger,
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
@@ -15,6 +16,7 @@ import { v4 as uuidv4 } from 'uuid';
 
 import type { AuthTokens, JwtPayload, UserId } from '@codemorph/shared';
 import { UsersService } from '../users/users.service';
+import { CacheService } from '../../cache/cache.service';
 import type { SignUpDto } from './dto/sign-up.dto';
 import type { SignInDto } from './dto/sign-in.dto';
 
@@ -26,6 +28,7 @@ export class AuthService {
     private readonly usersService: UsersService,
     private readonly jwtService:   JwtService,
     private readonly config:        ConfigService,
+    private readonly cacheService:  CacheService,
   ) {}
 
   // ── Validate credentials ─────────────────────────────
@@ -80,12 +83,22 @@ export class AuthService {
   }
 
   // ── Sign Out ─────────────────────────────────────────
-  async signOut(_userId: UserId): Promise<void> {
-    // In production: invalidate refresh token in Redis
-    // await this.redis.del(`cm:session:${userId}`);
+  // FIX PHASE 2 — SEC-08 : signOut invalide maintenant les refresh tokens via Redis
+  // Format de clé : cm:revoked:user:<userId> — tous les tokens du user sont révoqués
+  async signOut(userId: UserId): Promise<void> {
+    try {
+      const refreshExpiresIn = this.config.get<string>('jwt.refreshExpiresIn') ?? '30d';
+      const ttlSecs = Math.floor(this.parseExpiry(refreshExpiresIn) / 1000);
+      await this.cacheService.set(`cm:revoked:user:${userId as string}`, '1', ttlSecs);
+      this.logger.log(`[signOut] User ${userId} — refresh tokens revoked (TTL ${ttlSecs}s)`);
+    } catch (err) {
+      // Ne pas bloquer si Redis down — signOut gracieux
+      this.logger.warn(`[signOut] Redis unavailable — revocation not persisted: ${(err as Error).message}`);
+    }
   }
 
   // ── Refresh Tokens ────────────────────────────────────
+  // FIX PHASE 2 — SEC-08 : vérifier la blocklist Redis avant d'émettre de nouveaux tokens
   async refreshTokens(refreshToken: string): Promise<{ tokens: AuthTokens }> {
     if (!refreshToken) {
       throw new UnauthorizedException('Refresh token required');
@@ -98,6 +111,18 @@ export class AuthService {
       });
     } catch {
       throw new UnauthorizedException('Invalid or expired refresh token');
+    }
+
+    // Vérifier si l'utilisateur est révoqué (déconnecté côté serveur)
+    try {
+      const revoked = await this.cacheService.get<string>(`cm:revoked:user:${payload.sub}`);
+      if (revoked) {
+        throw new UnauthorizedException('Session revoked. Please sign in again.');
+      }
+    } catch (err) {
+      if (err instanceof UnauthorizedException) throw err;
+      // Redis down → ignorer (fail open pour disponibilité)
+      this.logger.warn(`[refreshTokens] Redis unavailable — skipping revocation check`);
     }
 
     const user = await this.usersService.findById(payload.sub);
@@ -129,6 +154,41 @@ export class AuthService {
     const passwordHash = await bcrypt.hash(newPassword, 12);
     void passwordHash;
     // await this.usersService.updatePassword(userId, passwordHash);
+  }
+
+  // ── Change Password (authenticated) ──────────────────
+  // FIX PHASE 6 : route manquante — settings/page.tsx l'appelle
+  async changePassword(userId: UserId, currentPassword: string, newPassword: string): Promise<void> {
+    // 1. Charger l'utilisateur avec son hash (select: false sur passwordHash)
+    const user = await this.usersService.findByIdOrFail(userId);
+
+    // 2. Vérifier que l'utilisateur a un compte email (pas OAuth-only)
+    if (!user.passwordHash) {
+      throw new BadRequestException(
+        'Your account uses OAuth (Google/GitHub) — password change not supported. ' +
+        'Please use the OAuth provider to manage your account.',
+      );
+    }
+
+    // 3. Vérifier l'ancien mot de passe
+    const isValid = await bcrypt.compare(currentPassword, user.passwordHash);
+    if (!isValid) {
+      throw new UnauthorizedException('Current password is incorrect');
+    }
+
+    // 4. Hasher et sauvegarder le nouveau mot de passe
+    const newHash = await bcrypt.hash(newPassword, 12);
+    await this.usersService.updatePassword(userId, newHash);
+
+    // 5. Révoquer tous les tokens existants (re-login requis)
+    try {
+      const refreshExpiresIn = this.config.get<string>('jwt.refreshExpiresIn') ?? '30d';
+      const ttlSecs = Math.floor(this.parseExpiry(refreshExpiresIn) / 1000);
+      await this.cacheService.set(`cm:revoked:user:${userId as string}`, '1', ttlSecs);
+      this.logger.log(`[changePassword] User ${userId as string} — tokens revoked after password change`);
+    } catch {
+      this.logger.warn(`[changePassword] Redis unavailable — token revocation skipped`);
+    }
   }
 
   // ── Get Me ───────────────────────────────────────────

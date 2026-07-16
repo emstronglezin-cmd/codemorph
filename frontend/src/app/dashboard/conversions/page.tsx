@@ -1,31 +1,27 @@
 'use client';
 // ============================================================
-// CodeMorph — Conversions Page (vraies données API)
+// CodeMorph — Conversions Page (/dashboard/conversions)
+// PHASE 10 FIX :
+//   - Suppression du fetch() brut + polling manuel sans AbortController
+//   - Utilise useJobs() (React Query) : source de vérité unique
+//   - refetchInterval auto géré par React Query (3s si actifs, sinon off)
+//   - Recherche client-side par langage
+//   - Filtres : Tous / Actifs / Terminés / Échoués
+//   - Lien "Suivre" → page détail job
+//   - Pas de fuite mémoire (AbortController géré par React Query)
 // ============================================================
 import type React from 'react';
-import { useEffect, useState } from 'react';
+import { useState, useMemo } from 'react';
 import Link from 'next/link';
-import { Plus, Zap, Search, Filter } from 'lucide-react';
+import { Plus, Zap, Search, Filter, Loader2, RefreshCw,
+         CheckCircle2, XCircle, Clock } from 'lucide-react';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
-import { Badge } from '@/components/ui/badge';
-import { Button } from '@/components/ui/button';
-import { getAccessToken } from '@/lib/api/client';
+import { Badge }   from '@/components/ui/badge';
+import { Button }  from '@/components/ui/button';
+import { useJobs } from '@/hooks/useJobs';
+import { cn }      from '@/lib/utils/cn';
 
-const BACKEND = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:4000/api/v1';
-
-interface Job {
-  id:              string;
-  status:          string;
-  sourceLanguage:  string;
-  targetLanguage:  string;
-  progress:        number;
-  filesGenerated?: number;
-  linesGenerated?: number;
-  createdAt:       string;
-  completedAt?:    string;
-  projectId?:      string;
-}
-
+// ── Types ─────────────────────────────────────────────────
 const STATUS_CFG: Record<string, { label: string; variant: 'success'|'warning'|'error'|'default'|'info' }> = {
   done:       { label: 'Terminé',    variant: 'success' },
   completed:  { label: 'Terminé',    variant: 'success' },
@@ -35,60 +31,48 @@ const STATUS_CFG: Record<string, { label: string; variant: 'success'|'warning'|'
   failed:     { label: 'Échoué',     variant: 'error'   },
 };
 
-function authH() {
-  const t = getAccessToken();
-  return { 'Content-Type': 'application/json', ...(t ? { Authorization: `Bearer ${t}` } : {}) };
-}
+type FilterMode = 'all' | 'active' | 'done' | 'failed';
 
+// ── Page ─────────────────────────────────────────────────
 export default function ConversionsPage(): React.JSX.Element {
-  const [jobs,       setJobs]       = useState<Job[]>([]);
-  const [loading,    setLoading]    = useState(true);
-  const [search,     setSearch]     = useState('');
-  const [filter,     setFilter]     = useState<string>('all');
+  const [search, setSearch] = useState('');
+  const [filter, setFilter] = useState<FilterMode>('all');
 
-  useEffect(() => {
-    fetch(`${BACKEND}/jobs`, { headers: authH() })
-      .then(r => r.ok ? r.json() : { data: [] })
-      .then(d => {
-        const js = (d.data ?? d) as Job[];
-        setJobs(Array.isArray(js) ? js : []);
-      })
-      .catch(() => setJobs([]))
-      .finally(() => setLoading(false));
-  }, []);
-
-  // Polling pour les jobs en cours
-  useEffect(() => {
-    if (!jobs.some(j => ['pending','analyzing','converting'].includes(j.status))) return;
-    const id = setInterval(() => {
-      fetch(`${BACKEND}/jobs`, { headers: authH() })
-        .then(r => r.ok ? r.json() : { data: [] })
-        .then(d => { const js = (d.data ?? d) as Job[]; if (Array.isArray(js)) setJobs(js); })
-        .catch(() => {});
-    }, 5000);
-    return () => clearInterval(id);
-  }, [jobs]);
-
-  const FILTER_OPTS = [
-    { value: 'all',       label: 'Tous' },
-    { value: 'active',    label: 'Actifs' },
-    { value: 'done',      label: 'Terminés' },
-    { value: 'failed',    label: 'Échoués' },
-  ];
-
-  const filtered = jobs.filter(j => {
-    const matchSearch = !search || `${j.sourceLanguage} ${j.targetLanguage}`.toLowerCase().includes(search.toLowerCase());
-    const matchFilter =
-      filter === 'all' ? true :
-      filter === 'active' ? ['pending','analyzing','converting'].includes(j.status) :
-      filter === 'done' ? ['done','completed'].includes(j.status) :
-      j.status === filter;
-    return matchSearch && matchFilter;
-  });
+  // PHASE 10 FIX : React Query gère le polling proprement
+  // refetchInterval dans useJobs.ts : 3000ms si jobs actifs, false sinon
+  // Plus de setInterval manuel / AbortController / fuite mémoire
+  const { data, isLoading, refetch, isFetching } = useJobs(1, 200);
+  const jobs = data?.data ?? [];
 
   const active    = jobs.filter(j => ['pending','analyzing','converting'].includes(j.status)).length;
   const completed = jobs.filter(j => ['done','completed'].includes(j.status)).length;
   const failed    = jobs.filter(j => j.status === 'failed').length;
+
+  const filtered = useMemo(() => {
+    let list = jobs;
+
+    if (search.trim()) {
+      const q = search.toLowerCase();
+      list = list.filter(j =>
+        (j.sourceLanguage ?? '').toLowerCase().includes(q) ||
+        (j.targetLanguage ?? '').toLowerCase().includes(q),
+      );
+    }
+
+    switch (filter) {
+      case 'active': return list.filter(j => ['pending','analyzing','converting'].includes(j.status));
+      case 'done':   return list.filter(j => ['done','completed'].includes(j.status));
+      case 'failed': return list.filter(j => j.status === 'failed');
+      default:       return list;
+    }
+  }, [jobs, search, filter]);
+
+  const FILTER_OPTS: { value: FilterMode; label: string }[] = [
+    { value: 'all',    label: 'Tous' },
+    { value: 'active', label: 'Actifs' },
+    { value: 'done',   label: 'Terminés' },
+    { value: 'failed', label: 'Échoués' },
+  ];
 
   return (
     <div className="space-y-6">
@@ -97,23 +81,47 @@ export default function ConversionsPage(): React.JSX.Element {
       <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
         <div>
           <h1 className="text-2xl font-bold tracking-tight">Conversions</h1>
-          <p className="text-muted-foreground">Suivez tous vos jobs de conversion de code.</p>
+          <p className="text-muted-foreground text-sm">
+            Suivez tous vos jobs de conversion de code.
+            {active > 0 && (
+              <span className="ml-2 text-blue-400 font-medium">
+                {active} en cours — actualisation auto toutes les 3s
+              </span>
+            )}
+          </p>
         </div>
-        <Link href="/dashboard/projects/new">
-          <Button leftIcon={<Plus className="h-4 w-4" />} variant="premium">Nouveau projet</Button>
-        </Link>
+        <div className="flex items-center gap-2">
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => void refetch()}
+            disabled={isFetching}
+          >
+            <RefreshCw className={cn('h-4 w-4', isFetching && 'animate-spin')} />
+          </Button>
+          <Link href="/dashboard/projects/new">
+            <Button leftIcon={<Plus className="h-4 w-4" />} variant="premium">Nouveau projet</Button>
+          </Link>
+        </div>
       </div>
 
       {/* Compteurs */}
       <div className="grid grid-cols-3 gap-4">
         {[
-          { label: 'Actifs',    value: active,    color: 'text-warning',   bg: 'bg-warning/10'  },
-          { label: 'Terminés',  value: completed, color: 'text-success',   bg: 'bg-success/10'  },
-          { label: 'Échoués',   value: failed,    color: 'text-red-400',   bg: 'bg-red-500/10'  },
+          { label: 'Actifs',    value: active,    color: 'text-warning',  bg: 'bg-warning/10',  icon: <Loader2 className="h-4 w-4 text-warning animate-spin" /> },
+          { label: 'Terminés',  value: completed, color: 'text-success',  bg: 'bg-success/10',  icon: <CheckCircle2 className="h-4 w-4 text-success" /> },
+          { label: 'Échoués',   value: failed,    color: 'text-red-400',  bg: 'bg-red-500/10',  icon: <XCircle className="h-4 w-4 text-red-400" /> },
         ].map(s => (
-          <Card key={s.label} className="p-4">
-            <p className="text-xs text-muted-foreground uppercase tracking-wide">{s.label}</p>
-            <p className={`text-2xl font-bold mt-1 ${s.color}`}>{loading ? '…' : s.value}</p>
+          <Card key={s.label}>
+            <CardContent className="flex items-center gap-3 p-4">
+              <div className={cn('flex h-9 w-9 items-center justify-center rounded-lg', s.bg)}>
+                {s.icon}
+              </div>
+              <div>
+                <p className="text-xs text-muted-foreground uppercase tracking-wide">{s.label}</p>
+                <p className={cn('text-2xl font-bold mt-0.5', s.color)}>{isLoading ? '…' : s.value}</p>
+              </div>
+            </CardContent>
           </Card>
         ))}
       </div>
@@ -130,17 +138,18 @@ export default function ConversionsPage(): React.JSX.Element {
             className="w-full pl-9 pr-4 py-2 text-sm rounded-lg border border-input bg-background focus:outline-none focus:ring-2 focus:ring-ring"
           />
         </div>
-        <div className="flex items-center gap-2">
-          <Filter className="h-4 w-4 text-muted-foreground" />
+        <div className="flex items-center gap-2 flex-wrap">
+          <Filter className="h-4 w-4 text-muted-foreground shrink-0" />
           {FILTER_OPTS.map(o => (
             <button
               key={o.value}
               onClick={() => setFilter(o.value)}
-              className={`px-3 py-1.5 text-xs rounded-lg font-medium transition-colors ${
+              className={cn(
+                'rounded-full border px-3 py-1 text-xs font-medium transition-colors',
                 filter === o.value
-                  ? 'bg-primary text-primary-foreground'
-                  : 'bg-muted text-muted-foreground hover:bg-accent'
-              }`}
+                  ? 'border-primary bg-primary/20 text-primary'
+                  : 'border-border bg-card text-muted-foreground hover:border-primary/50',
+              )}
             >
               {o.label}
             </button>
@@ -156,11 +165,13 @@ export default function ConversionsPage(): React.JSX.Element {
             {filter !== 'all' && ` · ${FILTER_OPTS.find(o => o.value === filter)?.label}`}
           </CardTitle>
           <CardDescription>
-            {active > 0 ? `${active} en cours — actualisation automatique toutes les 5s` : 'Toutes les conversions'}
+            {active > 0
+              ? `${active} en cours — actualisation automatique`
+              : 'Toutes les conversions'}
           </CardDescription>
         </CardHeader>
         <CardContent className="p-0">
-          {loading ? (
+          {isLoading ? (
             <div className="divide-y divide-border">
               {[1,2,3].map(i => (
                 <div key={i} className="flex items-center gap-4 px-6 py-4">
@@ -197,22 +208,28 @@ export default function ConversionsPage(): React.JSX.Element {
           ) : (
             <div className="divide-y divide-border">
               {filtered.map(job => {
-                const cfg = STATUS_CFG[job.status] ?? { label: job.status, variant: 'default' as const };
+                const cfg     = STATUS_CFG[job.status] ?? { label: job.status, variant: 'default' as const };
+                const isActive = ['pending','analyzing','converting'].includes(job.status);
+                const isDone   = ['done','completed'].includes(job.status);
                 return (
                   <div key={job.id} className="flex items-center gap-4 px-6 py-4 hover:bg-accent/30 transition-colors">
                     {/* Icône statut */}
-                    <div className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-xl ${
+                    <div className={cn(
+                      'flex h-10 w-10 shrink-0 items-center justify-center rounded-xl',
                       cfg.variant === 'success' ? 'bg-success/10' :
                       cfg.variant === 'warning' ? 'bg-warning/10' :
                       cfg.variant === 'error'   ? 'bg-red-500/10' :
-                      cfg.variant === 'info'    ? 'bg-blue-500/10' : 'bg-muted'
-                    }`}>
-                      <Zap className={`h-5 w-5 ${
-                        cfg.variant === 'success' ? 'text-success' :
-                        cfg.variant === 'warning' ? 'text-warning' :
-                        cfg.variant === 'error'   ? 'text-red-400' :
-                        cfg.variant === 'info'    ? 'text-blue-400' : 'text-muted-foreground'
-                      }`} />
+                      cfg.variant === 'info'    ? 'bg-blue-500/10' : 'bg-muted',
+                    )}>
+                      {isActive
+                        ? <Loader2 className={cn('h-5 w-5 animate-spin',
+                            job.status === 'analyzing'  ? 'text-blue-400' : 'text-warning')} />
+                        : isDone
+                          ? <CheckCircle2 className="h-5 w-5 text-success" />
+                          : job.status === 'failed'
+                            ? <XCircle className="h-5 w-5 text-red-400" />
+                            : <Clock className="h-5 w-5 text-muted-foreground" />
+                      }
                     </div>
 
                     {/* Infos */}
@@ -225,32 +242,57 @@ export default function ConversionsPage(): React.JSX.Element {
                         {job.filesGenerated ? ` · ${job.filesGenerated} fichiers` : ''}
                         {job.linesGenerated ? ` · ${job.linesGenerated.toLocaleString()} lignes` : ''}
                       </p>
-                      {['analyzing','converting'].includes(job.status) && (
+                      {/* Barre de progression */}
+                      {isActive && (
                         <div className="flex items-center gap-2 mt-1">
-                          <div className="flex-1 h-1.5 rounded-full bg-muted overflow-hidden">
+                          <div className="flex-1 h-1.5 rounded-full bg-muted overflow-hidden max-w-[160px]">
                             <div
-                              className="h-full bg-primary rounded-full transition-all duration-500"
+                              className="h-full rounded-full transition-all duration-500 bg-primary"
                               style={{ width: `${job.progress ?? 0}%` }}
                             />
                           </div>
-                          <span className="text-xs text-muted-foreground tabular-nums">{job.progress ?? 0}%</span>
+                          <span className="text-xs text-muted-foreground tabular-nums">
+                            {job.progress ?? 0}%
+                          </span>
                         </div>
+                      )}
+                      {/* Phase courante */}
+                      {isActive && job.currentPhase && (
+                        <p className="text-xs text-muted-foreground/60">{job.currentPhase}</p>
+                      )}
+                      {/* Erreur */}
+                      {job.status === 'failed' && job.errorMessage && (
+                        <p className="text-xs text-red-400 truncate" title={job.errorMessage}>
+                          {job.errorMessage}
+                        </p>
                       )}
                     </div>
 
-                    {/* Badge + Action */}
+                    {/* Badge + Actions */}
                     <div className="flex items-center gap-3 shrink-0">
                       <Badge variant={cfg.variant} size="sm">{cfg.label}</Badge>
-                      {job.projectId && ['pending','analyzing','converting'].includes(job.status) && (
-                        <Link href={`/dashboard/projects/${job.projectId}/job/${job.id}`}>
-                          <Button variant="outline" size="sm">Suivre</Button>
+
+                      {/* Lien vers le détail du job */}
+                      {isActive && job.projectId && (
+                        <Link href={`/dashboard/projects/${job.projectId}`}>
+                          <Button variant="outline" size="sm" className="text-xs h-7">
+                            Suivre
+                          </Button>
                         </Link>
                       )}
-                      {job.projectId && ['done','completed'].includes(job.status) && (
-                        <Link href={`/dashboard/projects/${job.projectId}/result/${job.id}`}>
-                          <Button variant="premium" size="sm">Résultat</Button>
+                      {isDone && job.projectId && (
+                        <Link href={`/dashboard/projects/${job.projectId}`}>
+                          <Button variant="premium" size="sm" className="text-xs h-7">
+                            Résultat
+                          </Button>
                         </Link>
                       )}
+                      {/* Lien historique pour les détails */}
+                      <Link href="/dashboard/history">
+                        <Button variant="ghost" size="sm" className="text-xs h-7 text-muted-foreground">
+                          Détails
+                        </Button>
+                      </Link>
                     </div>
                   </div>
                 );

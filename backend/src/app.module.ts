@@ -4,11 +4,14 @@
 import { Module }        from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
-import { ThrottlerModule } from '@nestjs/throttler';
+import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler';
 import { ScheduleModule }  from '@nestjs/schedule';
 import { TerminusModule }  from '@nestjs/terminus';
 import { BullModule }      from '@nestjs/bull';
 import { RedisModule }     from '@liaoliaots/nestjs-redis';
+// FIX PHASE 6 — ARCH-01 : ThrottlerGuard global (APP_GUARD)
+// Sans APP_GUARD, ThrottlerModule est configuré mais 0 routes sont limitées
+import { APP_GUARD } from '@nestjs/core';
 
 /**
  * Normalise une URL Redis en s'assurant qu'elle a un protocole valide.
@@ -207,6 +210,14 @@ import { redisConfig }    from './config/redis.config';
 
     // ── Observability ──────────────────────────────────────
     ObservabilityModule,
+  ],
+  // FIX PHASE 6 — ARCH-01 : ThrottlerGuard global
+  // ThrottlerModule était configuré mais APP_GUARD absent → 0 routes limitées
+  providers: [
+    {
+      provide:  APP_GUARD,
+      useClass: ThrottlerGuard,
+    },
   ],
 })
 export class AppModule {}

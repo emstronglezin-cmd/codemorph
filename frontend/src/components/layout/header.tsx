@@ -5,11 +5,13 @@
 
 import * as React from 'react';
 import Link from 'next/link';
-import { Bell, Search, Sun, Moon, Command, Menu } from 'lucide-react';
+import { Search, Sun, Moon, Command, Menu } from 'lucide-react';
 
 import { cn } from '@/lib/utils/cn';
 import { Button } from '@/components/ui/button';
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
+// PHASE 13 : NotificationCenter remplace le bouton Bell statique
+import { NotificationCenter } from '@/components/notifications/NotificationCenter';
 
 interface HeaderProps {
   className?: string;
@@ -81,14 +83,8 @@ export function Header({ className, onMobileMenuToggle }: HeaderProps): React.JS
           )}
         </Button>
 
-        {/* Notifications */}
-        <Button variant="ghost" size="icon-sm" className="relative" aria-label="Notifications">
-          <Bell className="h-4 w-4" />
-          <span className="absolute right-1.5 top-1.5 flex h-2 w-2">
-            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-primary opacity-75" />
-            <span className="relative inline-flex rounded-full h-2 w-2 bg-primary" />
-          </span>
-        </Button>
+        {/* PHASE 13 : NotificationCenter dynamique */}
+        <NotificationCenter />
 
         {/* User avatar */}
         <Link href="/dashboard/profile">

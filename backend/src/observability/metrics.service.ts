@@ -1,8 +1,10 @@
 // ============================================================
 // CodeMorph — Metrics Service
-// Job metrics, AI usage tracking, performance monitoring
+// FIX PHASE 4 — ARCH-08 : tous les appels Redis entourés de try/catch
+// Avant : @InjectRedis() sans try/catch → crash si Redis down
+// Fix   : chaque opération Redis est dans un try/catch avec fallback
 // ============================================================
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, Between } from 'typeorm';
 import { InjectRedis } from '@liaoliaots/nestjs-redis';
@@ -13,7 +15,7 @@ import { UsageQuotaEntity }     from '../modules/quota/quota.entity';
 
 export interface JobMetrics {
   totalJobs:       number;
-  successRate:     number;   // 0–100
+  successRate:     number;
   avgDurationMs:   number;
   byStatus:        Record<string, number>;
   byFramework:     Record<string, number>;
@@ -25,7 +27,7 @@ export interface AiUsageMetrics {
   totalTokens:    number;
   avgTokens:      number;
   byPlan:         Record<string, { requests: number; tokens: number }>;
-  costEstimate:   number;   // USD estimate
+  costEstimate:   number;
 }
 
 export interface PlatformMetrics {
@@ -35,11 +37,13 @@ export interface PlatformMetrics {
   errorRate:    number;
 }
 
-const METRICS_TTL   = 300; // 5 min cache
-const AI_COST_PER_1K_TOKENS = 0.01; // GPT-4o estimate
+const METRICS_TTL   = 300;
+const AI_COST_PER_1K_TOKENS = 0.01;
 
 @Injectable()
 export class MetricsService {
+  private readonly logger = new Logger(MetricsService.name);
+
   constructor(
     @InjectRepository(JobEntity)
     private readonly jobRepo: Repository<JobEntity>,
@@ -51,62 +55,85 @@ export class MetricsService {
     private readonly redis: Redis,
   ) {}
 
+  // ── Safe Redis helper — ne jamais crasher si Redis down ──
+  // FIX PHASE 4 — ARCH-08 : toute opération Redis passe par cette méthode
+  private async safeRedis<T>(
+    operation: () => Promise<T>,
+    fallback: T,
+    context = 'redis',
+  ): Promise<T> {
+    try {
+      return await operation();
+    } catch (err) {
+      this.logger.warn(`[MetricsService] ${context} error (Redis down?): ${(err as Error).message}`);
+      return fallback;
+    }
+  }
+
   // ── Record request duration ───────────────────────────
   async recordRequest(method: string, path: string, statusCode: number, durationMs: number): Promise<void> {
-    const key = `cm:metrics:req:${new Date().toISOString().slice(0, 13)}`; // hourly bucket
-    await this.redis.hincrby(key, `${method}:${path}:${statusCode}`, 1);
-    await this.redis.expire(key, 86_400 * 2); // 2 days
-
-    // Track latency bucket
-    const bucket = this.latencyBucket(durationMs);
-    await this.redis.hincrby(`cm:metrics:latency:${new Date().toISOString().slice(0, 13)}`, bucket, 1);
+    const key = `cm:metrics:req:${new Date().toISOString().slice(0, 13)}`;
+    await this.safeRedis(async () => {
+      await this.redis.hincrby(key, `${method}:${path}:${statusCode}`, 1);
+      await this.redis.expire(key, 86_400 * 2);
+      const bucket = this.latencyBucket(durationMs);
+      await this.redis.hincrby(`cm:metrics:latency:${new Date().toISOString().slice(0, 13)}`, bucket, 1);
+    }, undefined, 'recordRequest');
   }
 
   // ── Track AI call ─────────────────────────────────────
   async trackAiCall(userId: string, plan: string, tokens: number, durationMs: number): Promise<void> {
-    const hourKey = `cm:metrics:ai:${new Date().toISOString().slice(0, 13)}`;
-    await this.redis.hincrby(hourKey, 'requests', 1);
-    await this.redis.hincrby(hourKey, 'tokens',   tokens);
-    await this.redis.hincrby(hourKey, `plan:${plan}:requests`, 1);
-    await this.redis.hincrby(hourKey, `plan:${plan}:tokens`,   tokens);
-    await this.redis.expire(hourKey, 86_400 * 7); // 7 days
-
-    // Per-user AI usage (daily)
-    const dayKey = `cm:metrics:ai:user:${userId}:${new Date().toISOString().slice(0, 10)}`;
-    await this.redis.hincrby(dayKey, 'requests', 1);
-    await this.redis.hincrby(dayKey, 'tokens',   tokens);
-    await this.redis.expire(dayKey, 86_400 * 32);
-
     void durationMs;
+    const hourKey = `cm:metrics:ai:${new Date().toISOString().slice(0, 13)}`;
+    await this.safeRedis(async () => {
+      await this.redis.hincrby(hourKey, 'requests', 1);
+      await this.redis.hincrby(hourKey, 'tokens',   tokens);
+      await this.redis.hincrby(hourKey, `plan:${plan}:requests`, 1);
+      await this.redis.hincrby(hourKey, `plan:${plan}:tokens`,   tokens);
+      await this.redis.expire(hourKey, 86_400 * 7);
+
+      const dayKey = `cm:metrics:ai:user:${userId}:${new Date().toISOString().slice(0, 10)}`;
+      await this.redis.hincrby(dayKey, 'requests', 1);
+      await this.redis.hincrby(dayKey, 'tokens',   tokens);
+      await this.redis.expire(dayKey, 86_400 * 32);
+    }, undefined, 'trackAiCall');
   }
 
   // ── Track job event ───────────────────────────────────
   async trackJobEvent(
-    event:      'created' | 'completed' | 'failed',
-    jobId:      string,
-    framework?: string,
+    event:       'created' | 'completed' | 'failed',
+    jobId:       string,
+    framework?:  string,
     durationMs?: number,
   ): Promise<void> {
-    const key = `cm:metrics:jobs:${new Date().toISOString().slice(0, 10)}`;
-    await this.redis.hincrby(key, event, 1);
-    if (framework) await this.redis.hincrby(key, `fw:${framework}`, 1);
-    if (durationMs && event === 'completed') {
-      await this.redis.lpush('cm:metrics:job:durations', durationMs);
-      await this.redis.ltrim('cm:metrics:job:durations', 0, 999); // keep last 1000
-    }
-    await this.redis.expire(key, 86_400 * 30);
     void jobId;
+    const key = `cm:metrics:jobs:${new Date().toISOString().slice(0, 10)}`;
+    await this.safeRedis(async () => {
+      await this.redis.hincrby(key, event, 1);
+      if (framework) await this.redis.hincrby(key, `fw:${framework}`, 1);
+      if (durationMs && event === 'completed') {
+        await this.redis.lpush('cm:metrics:job:durations', durationMs);
+        await this.redis.ltrim('cm:metrics:job:durations', 0, 999);
+      }
+      await this.redis.expire(key, 86_400 * 30);
+    }, undefined, 'trackJobEvent');
   }
 
   // ── Get job metrics ───────────────────────────────────
   async getJobMetrics(): Promise<JobMetrics> {
-    const cached = await this.redis.get('cm:metrics:cache:jobs');
-    if (cached) return JSON.parse(cached) as JobMetrics;
+    // Check cache
+    const cached = await this.safeRedis(
+      () => this.redis.get('cm:metrics:cache:jobs'),
+      null, 'getJobMetrics-cache',
+    );
+    if (cached) {
+      try { return JSON.parse(cached) as JobMetrics; } catch { /* ignore */ }
+    }
 
     const now      = new Date();
     const since24h = new Date(now.getTime() - 86_400_000);
 
-    const [total, byStatusRaw, last24h, durations] = await Promise.all([
+    const [total, byStatusRaw, last24h] = await Promise.all([
       this.jobRepo.count(),
       this.jobRepo
         .createQueryBuilder('j')
@@ -115,16 +142,20 @@ export class MetricsService {
         .groupBy('j.status')
         .getRawMany<{ status: string; count: string }>(),
       this.jobRepo.count({ where: { createdAt: Between(since24h, now) } }),
-      this.redis.lrange('cm:metrics:job:durations', 0, -1),
     ]);
+
+    const durations = await this.safeRedis(
+      () => this.redis.lrange('cm:metrics:job:durations', 0, -1),
+      [] as string[], 'getJobMetrics-durations',
+    );
 
     const byStatus: Record<string, number> = {};
     for (const row of byStatusRaw) {
       byStatus[row.status] = parseInt(row.count, 10);
     }
 
-    const done   = byStatus[JobStatus.DONE]   ?? 0;
-    const failed = byStatus[JobStatus.FAILED] ?? 0;
+    const done     = byStatus[JobStatus.DONE]   ?? 0;
+    const failed   = byStatus[JobStatus.FAILED] ?? 0;
     const finished = done + failed;
 
     const avgDurationMs = durations.length
@@ -150,16 +181,24 @@ export class MetricsService {
       last24h,
     };
 
-    await this.redis.set('cm:metrics:cache:jobs', JSON.stringify(metrics), 'EX', METRICS_TTL);
+    await this.safeRedis(
+      () => this.redis.set('cm:metrics:cache:jobs', JSON.stringify(metrics), 'EX', METRICS_TTL),
+      null, 'getJobMetrics-setCache',
+    );
+
     return metrics;
   }
 
   // ── Get AI usage metrics ──────────────────────────────
   async getAiUsageMetrics(): Promise<AiUsageMetrics> {
-    const cached = await this.redis.get('cm:metrics:cache:ai');
-    if (cached) return JSON.parse(cached) as AiUsageMetrics;
+    const cached = await this.safeRedis(
+      () => this.redis.get('cm:metrics:cache:ai'),
+      null, 'getAiUsageMetrics-cache',
+    );
+    if (cached) {
+      try { return JSON.parse(cached) as AiUsageMetrics; } catch { /* ignore */ }
+    }
 
-    // Aggregate last 7 days from Redis
     const keys: string[] = [];
     for (let i = 0; i < 7 * 24; i++) {
       const d = new Date(Date.now() - i * 3_600_000);
@@ -170,19 +209,23 @@ export class MetricsService {
     let totalTokens   = 0;
     const byPlan: Record<string, { requests: number; tokens: number }> = {};
 
-    const pipeline = this.redis.pipeline();
-    for (const k of keys) pipeline.hgetall(k);
-    const results = await pipeline.exec();
+    const results = await this.safeRedis(async () => {
+      const pipeline = this.redis.pipeline();
+      for (const k of keys) pipeline.hgetall(k);
+      return pipeline.exec();
+    }, null, 'getAiUsageMetrics-pipeline');
 
-    for (const [, data] of (results ?? [])) {
-      if (!data || typeof data !== 'object') continue;
-      const d = data as Record<string, string>;
-      totalRequests += parseInt(d['requests'] ?? '0', 10);
-      totalTokens   += parseInt(d['tokens']   ?? '0', 10);
-      for (const [plan] of [['free'], ['pro'], ['pro_max']]) {
-        if (!byPlan[plan]) byPlan[plan] = { requests: 0, tokens: 0 };
-        byPlan[plan].requests += parseInt(d[`plan:${plan}:requests`] ?? '0', 10);
-        byPlan[plan].tokens   += parseInt(d[`plan:${plan}:tokens`]   ?? '0', 10);
+    if (results) {
+      for (const [, data] of results) {
+        if (!data || typeof data !== 'object') continue;
+        const d = data as Record<string, string>;
+        totalRequests += parseInt(d['requests'] ?? '0', 10);
+        totalTokens   += parseInt(d['tokens']   ?? '0', 10);
+        for (const plan of ['free', 'pro', 'pro_max']) {
+          if (!byPlan[plan]) byPlan[plan] = { requests: 0, tokens: 0 };
+          byPlan[plan].requests += parseInt(d[`plan:${plan}:requests`] ?? '0', 10);
+          byPlan[plan].tokens   += parseInt(d[`plan:${plan}:tokens`]   ?? '0', 10);
+        }
       }
     }
 
@@ -194,7 +237,11 @@ export class MetricsService {
       costEstimate: Math.round((totalTokens / 1_000) * AI_COST_PER_1K_TOKENS * 100) / 100,
     };
 
-    await this.redis.set('cm:metrics:cache:ai', JSON.stringify(metrics), 'EX', METRICS_TTL);
+    await this.safeRedis(
+      () => this.redis.set('cm:metrics:cache:ai', JSON.stringify(metrics), 'EX', METRICS_TTL),
+      null, 'getAiUsageMetrics-setCache',
+    );
+
     return metrics;
   }
 

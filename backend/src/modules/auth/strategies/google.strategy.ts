@@ -18,6 +18,9 @@ export class GoogleStrategy extends PassportStrategy(Strategy, 'google') {
         'http://localhost:4000/api/v1/auth/google/callback',
       ),
       scope: ['email', 'profile'],
+      // FIX PHASE 3 — SEC-03 : state=true active la validation CSRF OAuth
+      // passport-google-oauth20 génère et vérifie automatiquement le state
+      state: true,
     });
   }
 

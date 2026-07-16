@@ -17,6 +17,8 @@ import { UsersService }    from './users.service';
 import { JwtAuthGuard }   from '../../common/guards/jwt-auth.guard';
 import { CurrentUser }    from '../../common/decorators/current-user.decorator';
 import type { JwtPayload } from '@codemorph/shared';
+// FIX PHASE 6 — SEC-15 : DTO whitelist stricte (bloque plan/role/status)
+import { UpdateProfileDto } from './dto/update-profile.dto';
 
 @ApiTags('users')
 @UseGuards(JwtAuthGuard)
@@ -32,12 +34,17 @@ export class UsersController {
   }
 
   @Patch('me')
-  @ApiOperation({ summary: 'Update current user profile' })
+  @ApiOperation({ summary: 'Update current user profile (name and avatarUrl only)' })
   async updateProfile(
     @CurrentUser() user: JwtPayload,
-    @Body() body: { name?: string; avatarUrl?: string | null },
+    @Body() body: UpdateProfileDto,
   ): Promise<unknown> {
-    return this.usersService.update(user.sub, body);
+    // FIX SEC-15 : UpdateProfileDto est validé par ValidationPipe global
+    // Seuls name et avatarUrl peuvent être modifiés — plan/role/status ignorés
+    return this.usersService.update(user.sub, {
+      name:      body.name,
+      avatarUrl: body.avatarUrl,
+    });
   }
 
   @Delete('me')

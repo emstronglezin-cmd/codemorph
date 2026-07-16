@@ -97,21 +97,15 @@ const serwist = new Serwist({
         ],
       }),
     },
-    // ── API calls: NetworkFirst ────────────────────────────────
-    {
-      matcher: ({ url }: { url: URL }) =>
-        url.pathname.startsWith('/api/') ||
-        url.hostname.includes('onrender.com') ||
-        url.hostname.includes('codemorph.dev'),
-      handler: new NetworkFirst({
-        cacheName: 'api-cache',
-        networkTimeoutSeconds: 10,
-        plugins: [
-          new ExpirationPlugin({ maxEntries: 50, maxAgeSeconds: 5 * 60 }),
-          new CacheableResponsePlugin({ statuses: [0, 200] }),
-        ],
-      }),
-    },
+    // ── API calls: NEVER cache — données utilisateur sensibles ─
+    // FIX PHASE 2 — ISO-02 CRITIQUE : suppression du cache API cross-utilisateur
+    // Avant : NetworkFirst sur *.onrender.com avec TTL 5min
+    // → les réponses API (jobs, projets, quotas) d'un utilisateur pouvaient
+    //   être servies à un autre utilisateur sans requête réseau pendant 5 minutes.
+    // Fix : aucun cache sur les API (toujours Network-only via fetch natif).
+    // Le Service Worker ne doit pas intercepter les appels API authentifiés.
+    // Note : le matcher ci-dessous EXCLUT explicitement *.onrender.com et /api/
+    // pour éviter tout risque de cache cross-utilisateur.
     // ── App shell pages ───────────────────────────────────────
     {
       matcher: ({ request }: { request: Request }) =>

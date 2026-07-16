@@ -13,10 +13,12 @@ import { LocalStrategy }   from './strategies/local.strategy';
 import { GoogleStrategy }  from './strategies/google.strategy';
 import { GitHubStrategy }  from './strategies/github.strategy';
 import { UsersModule }     from '../users/users.module';
+import { AppCacheModule }  from '../../cache/cache.module';
 
 @Module({
   imports: [
     UsersModule,
+    AppCacheModule,
     PassportModule.register({ defaultStrategy: 'jwt' }),
     JwtModule.registerAsync({
       imports:    [ConfigModule],
