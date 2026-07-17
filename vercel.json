@@ -2,7 +2,6 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "version": 2,
   "framework": "nextjs",
-  "rootDirectory": "frontend",
   "env": {
     "NEXT_TELEMETRY_DISABLED": "1"
   },
