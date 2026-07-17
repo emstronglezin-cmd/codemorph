@@ -2,9 +2,12 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "version": 2,
   "framework": "nextjs",
+  "rootDirectory": "frontend",
   "env": {
     "NEXT_TELEMETRY_DISABLED": "1"
   },
+  "installCommand": "npm install --legacy-peer-deps",
+  "buildCommand": "npm run build",
   "headers": [
     {
       "source": "/sw.js",

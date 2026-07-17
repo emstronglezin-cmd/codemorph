@@ -77,7 +77,7 @@ async function bootstrap(): Promise<void> {
     },
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     credentials: true,
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-Request-ID', 'X-Org-ID'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Request-ID', 'X-Org-ID', 'X-AI-Engine-Secret'],
   });
 
   // ── Middleware ───────────────────────────────────────────

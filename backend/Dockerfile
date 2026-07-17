@@ -68,8 +68,9 @@ RUN npm install --omit=dev --legacy-peer-deps && \
 
 # ── Compiled artifacts ────────────────────────────────────────
 COPY --from=builder /app/backend/dist ./dist/
-# Copy shared dist if it exists
+# Copy shared dist (nécessaire pour @codemorph/shared résolution à runtime)
 COPY --from=builder /app/shared/dist /app/shared/dist/
+COPY --from=builder /app/shared/package.json /app/shared/package.json
 
 # ── Runtime ───────────────────────────────────────────────────
 USER nestjs

@@ -65,21 +65,23 @@ export const apiClient: AxiosInstance = axios.create({
   timeout:         30_000,
 });
 
-// ── Request interceptor — injecter le Bearer token + LOG ──
+// ── Request interceptor — injecter le Bearer token ────────
 apiClient.interceptors.request.use((config: InternalAxiosRequestConfig) => {
   const token = getAccessToken();
   if (token && config.headers) {
     config.headers.Authorization = `Bearer ${token}`;
   }
-  // LOG détaillé de chaque requête API
-  const payload = config.data ? (() => {
-    try { return JSON.parse(config.data as string); } catch { return config.data; }
-  })() : undefined;
-  console.log(`[apiClient] ▶ ${config.method?.toUpperCase() ?? 'GET'} ${config.baseURL ?? ''}${config.url ?? ''}`, {
-    params:  config.params,
-    payload,
-    hasToken: !!token,
-  });
+  // Logs uniquement en développement (jamais en production)
+  if (process.env.NODE_ENV === 'development') {
+    const payload = config.data ? (() => {
+      try { return JSON.parse(config.data as string); } catch { return config.data; }
+    })() : undefined;
+    console.log(`[apiClient] ▶ ${config.method?.toUpperCase() ?? 'GET'} ${config.url ?? ''}`, {
+      params:  config.params,
+      payload,
+      hasToken: !!token,
+    });
+  }
   return config;
 });
 
@@ -94,20 +96,20 @@ function processQueue(token: string | null): void {
 
 apiClient.interceptors.response.use(
   (res) => {
-    // LOG de chaque réponse réussie
-    console.log(`[apiClient] ◀ ${res.status} ${res.config.method?.toUpperCase() ?? 'GET'} ${res.config.url ?? ''}`, {
-      data: res.data,
-    });
+    // Logs uniquement en développement
+    if (process.env.NODE_ENV === 'development') {
+      console.log(`[apiClient] ◀ ${res.status} ${res.config.method?.toUpperCase() ?? 'GET'} ${res.config.url ?? ''}`);
+    }
     return res;
   },
   async (error: AxiosError) => {
-    // LOG de chaque erreur
-    console.error(`[apiClient] ✖ ${error.response?.status ?? 'network'} ${error.config?.method?.toUpperCase() ?? 'GET'} ${error.config?.url ?? ''}`, {
-      status:  error.response?.status,
-      data:    error.response?.data,
-      message: error.message,
-      stack:   error.stack,
-    });
+    // Toujours logger les erreurs (utile en prod pour diagnostics)
+    if (process.env.NODE_ENV === 'development') {
+      console.error(`[apiClient] ✖ ${error.response?.status ?? 'network'} ${error.config?.method?.toUpperCase() ?? 'GET'} ${error.config?.url ?? ''}`, {
+        status:  error.response?.status,
+        message: error.message,
+      });
+    }
     const original = error.config as InternalAxiosRequestConfig & { _retry?: boolean };
 
     // Seul les 401 sont traités, et seulement une fois

@@ -16,6 +16,7 @@ import {
 } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiResponse, ApiBearerAuth } from '@nestjs/swagger';
 import { AuthGuard } from '@nestjs/passport';
+import { Throttle } from '@nestjs/throttler';
 import type { Response, Request } from 'express';
 
 import { AuthService }        from './auth.service';
@@ -47,6 +48,8 @@ export class AuthController {
   @Public()
   @Post('sign-up')
   @HttpCode(HttpStatus.CREATED)
+  // SEC : limiter les inscriptions à 5/min pour éviter les créations massives
+  @Throttle({ default: { limit: 5, ttl: 60_000 } })
   @ApiOperation({ summary: 'Register a new user' })
   @ApiResponse({ status: 201, description: 'User created successfully' })
   @ApiResponse({ status: 409, description: 'Email already in use' })
@@ -63,6 +66,8 @@ export class AuthController {
   @Public()
   @Post('sign-in')
   @HttpCode(HttpStatus.OK)
+  // SEC : limiter les tentatives de connexion à 10/min par IP (anti brute-force)
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
   @ApiOperation({ summary: 'Sign in with email & password' })
   @ApiResponse({ status: 200, description: 'Sign in successful' })
   @ApiResponse({ status: 401, description: 'Invalid credentials' })
