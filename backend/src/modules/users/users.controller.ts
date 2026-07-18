@@ -1,5 +1,6 @@
 // ============================================================
 // CodeMorph — Users Controller
+// FIX PHASE 19 : +DELETE /users/me/github (disconnect GitHub)
 // ============================================================
 import {
   Controller,
@@ -47,6 +48,16 @@ export class UsersController {
     });
   }
 
+  // FIX PHASE 19 — FIX-2 : déconnecter GitHub (supprime le token)
+  // Après déconnexion, /auth/github-repos retourne GITHUB_NOT_CONNECTED
+  // → frontend ne peut plus afficher de repos (isolation garantie)
+  @Delete('me/github')
+  @HttpCode(HttpStatus.NO_CONTENT)
+  @ApiOperation({ summary: 'Disconnect GitHub account (removes stored access token)' })
+  async disconnectGithub(@CurrentUser() user: JwtPayload): Promise<void> {
+    await this.usersService.disconnectGithub(user.sub);
+  }
+
   @Delete('me')
   @HttpCode(HttpStatus.NO_CONTENT)
   @ApiOperation({ summary: 'Deactivate current user account' })
@@ -54,3 +65,4 @@ export class UsersController {
     await this.usersService.deactivate(user.sub);
   }
 }
+

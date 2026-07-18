@@ -348,3 +348,171 @@
   .grid-auto-fill-md  { grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); }
   .grid-auto-fill-lg  { grid-template-columns: repeat(auto-fill, minmax(400px, 1fr)); }
 }
+
+/* ============================================================
+   FIX-5 Phase 19 — Correctifs Responsive Global
+   Cible : 320px → 1024px — Aucun overflow / scroll horizontal
+   ============================================================ */
+
+/* 1. Bloquer tout overflow horizontal sur la page entière */
+html, body {
+  overflow-x: hidden;
+  max-width: 100vw;
+}
+
+/* 2. Empêcher les conteneurs internes de déborder */
+*, *::before, *::after {
+  box-sizing: border-box;
+  min-width: 0; /* Fix flexbox/grid children overflow */
+}
+
+/* 3. Images et médias : toujours dans leur conteneur */
+img, video, svg, canvas, embed, object {
+  max-width: 100%;
+  height: auto;
+}
+
+/* 4. Tableaux : défilement horizontal si nécessaire (jamais de débordement) */
+table {
+  display: block;
+  width: 100%;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+/* 5. Conteneurs de code / pre */
+pre, code {
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: break-word;
+}
+
+/* ── Responsive Breakpoints ─────────────────────────────── */
+@media (max-width: 480px) {
+  /* Header : masquer le libellé de recherche, réduire les gaps */
+  .pwa-header-offset .flex.flex-1 {
+    max-width: none;
+  }
+
+  /* Stat cards : 1 colonne sous 480px */
+  .stat-card {
+    min-width: 0;
+  }
+
+  /* Boutons dans les headers de page : wrap correctement */
+  .page-actions-row {
+    flex-wrap: wrap;
+    gap: 0.5rem;
+  }
+
+  /* Tables de conversions/history : rendre les colonnes masquées sur mobile */
+  .table-col-hide-xs {
+    display: none !important;
+  }
+
+  /* Grille de stats : 2 colonnes minimum */
+  .stats-grid {
+    grid-template-columns: repeat(2, 1fr) !important;
+  }
+
+  /* Cards avec overflow possible */
+  .card-overflow-fix {
+    overflow: hidden;
+    word-break: break-word;
+  }
+}
+
+@media (max-width: 640px) {
+  /* Réduire le padding sur mobile */
+  main {
+    padding-left: 1rem !important;
+    padding-right: 1rem !important;
+  }
+
+  /* h1 : réduire la taille sur mobile */
+  .dashboard-title {
+    font-size: 1.25rem !important;
+    line-height: 1.75rem !important;
+  }
+
+  /* Boutons avec icônes : afficher l'icône seule si texte trop long */
+  .btn-icon-only-xs .btn-text {
+    display: none;
+  }
+
+  /* Pagination : boutons plus petits */
+  .pagination-btn {
+    min-width: 2rem;
+    padding: 0.25rem 0.5rem;
+    font-size: 0.75rem;
+  }
+
+  /* Filtres en wrap */
+  .filters-row {
+    flex-wrap: wrap;
+    gap: 0.375rem;
+  }
+
+  /* Tableaux de données : stack vertical sur mobile */
+  .data-row-mobile {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    padding: 0.75rem 1rem;
+  }
+}
+
+@media (max-width: 768px) {
+  /* Sidebar masquée → éviter le décalage du contenu principal */
+  .sidebar-push {
+    margin-left: 0 !important;
+  }
+
+  /* Cards grids : 1 colonne sur petit écran */
+  .grid-responsive-cards {
+    grid-template-columns: 1fr !important;
+  }
+
+  /* Header search : cacher le raccourci clavier */
+  .search-kbd-hint {
+    display: none;
+  }
+}
+
+/* ── Correctifs spécifiques composants ──────────────────── */
+
+/* History / Conversions : table sur mobile → stack */
+@media (max-width: 1024px) {
+  /* Colonnes cachées sur tablette */
+  .lg-only-col {
+    display: none !important;
+  }
+}
+
+/* Fix : textes longs (emails, URLs) ne débordent plus */
+.truncate-safe {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  max-width: 100%;
+}
+
+/* Fix : flex/grid enfants avec texte long */
+.flex-min-w-0 {
+  min-width: 0;
+  flex: 1 1 0%;
+}
+
+/* Fix : boutons d'action dans les listes ne débordent plus */
+.action-buttons-wrap {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+/* Fix : inputs ne débordent jamais */
+input, textarea, select {
+  max-width: 100%;
+}

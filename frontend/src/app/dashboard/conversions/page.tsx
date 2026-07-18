@@ -106,7 +106,7 @@ export default function ConversionsPage(): React.JSX.Element {
       </div>
 
       {/* Compteurs */}
-      <div className="grid grid-cols-3 gap-4">
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
         {[
           { label: 'Actifs',    value: active,    color: 'text-warning',  bg: 'bg-warning/10',  icon: <Loader2 className="h-4 w-4 text-warning animate-spin" /> },
           { label: 'Terminés',  value: completed, color: 'text-success',  bg: 'bg-success/10',  icon: <CheckCircle2 className="h-4 w-4 text-success" /> },

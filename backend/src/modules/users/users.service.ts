@@ -144,6 +144,12 @@ export class UsersService {
       .getOne();
   }
 
+  // ── Disconnect GitHub (FIX-2 : isolation repos) ──────
+  // Supprime le token GitHub du user → plus aucun repo visible
+  async disconnectGithub(id: UserId): Promise<void> {
+    await this.usersRepo.update(id as string, { githubAccessToken: null });
+  }
+
   // ── Count ─────────────────────────────────────────────
   async count(): Promise<number> {
     return this.usersRepo.count();

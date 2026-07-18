@@ -1,5 +1,6 @@
 // ============================================================
 // CodeMorph — Auth Controller (Email + Google + GitHub OAuth)
+// FIX PHASE 19 : GitHub OAuth state géré manuellement via cookie signé
 // ============================================================
 import {
   Controller,
@@ -13,10 +14,12 @@ import {
   Res,
   Req,
   BadRequestException,
+  Logger,
 } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiResponse, ApiBearerAuth } from '@nestjs/swagger';
 import { AuthGuard } from '@nestjs/passport';
 import { Throttle } from '@nestjs/throttler';
+import { randomBytes, createHmac } from 'crypto';
 import type { Response, Request } from 'express';
 
 import { AuthService }        from './auth.service';
@@ -39,10 +42,32 @@ interface OAuthRequest extends Request {
 @ApiTags('auth')
 @Controller('auth')
 export class AuthController {
+  private readonly logger = new Logger(AuthController.name);
+  // Durée de vie du cookie state OAuth : 10 minutes
+  private static readonly OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
+
   constructor(
     private readonly authService: AuthService,
     private readonly usersService: UsersService,
   ) {}
+
+  // ── Helper : signer/vérifier le state CSRF OAuth via HMAC ──
+  // Permet de valider le state sans session Express
+  private signState(state: string): string {
+    const secret = process.env['COOKIE_SECRET'] ?? process.env['JWT_SECRET'] ?? 'fallback-state-secret';
+    return createHmac('sha256', secret).update(state).digest('hex');
+  }
+
+  private verifyState(state: string, signature: string): boolean {
+    const expected = this.signState(state);
+    // Comparaison en temps constant pour éviter les timing attacks
+    if (expected.length !== signature.length) return false;
+    let diff = 0;
+    for (let i = 0; i < expected.length; i++) {
+      diff |= expected.charCodeAt(i) ^ signature.charCodeAt(i);
+    }
+    return diff === 0;
+  }
 
   // ── POST /auth/sign-up ───────────────────────────────
   @Public()
@@ -201,28 +226,80 @@ export class AuthController {
   }
 
   // ── GitHub OAuth ──────────────────────────────────────
+  // FIX PHASE 19 : state CSRF géré manuellement via cookie signé httpOnly
+  // (state: true dans passport-github2 nécessite express-session — incompatible JWT stateless)
   @Public()
   @Get('github')
-  @UseGuards(AuthGuard('github'))
-  @ApiOperation({ summary: 'Initiate GitHub OAuth login' })
-  githubAuth(): void {
-    // Passport redirects
+  @ApiOperation({ summary: 'Initiate GitHub OAuth login (stateless state via signed cookie)' })
+  async githubAuth(
+    @Res() res: Response,
+  ): Promise<void> {
+    // 1. Générer un state aléatoire sécurisé
+    const state  = randomBytes(32).toString('hex');
+    const sig    = this.signState(state);
+    const isProd = process.env['NODE_ENV'] === 'production';
+
+    // 2. Stocker le state dans un cookie httpOnly signé (TTL 10min)
+    res.cookie('cm_oauth_state', `${state}.${sig}`, {
+      httpOnly: true,
+      secure:   isProd,
+      sameSite: isProd ? 'none' : 'lax',
+      maxAge:   AuthController.OAUTH_STATE_TTL_MS,
+      path:     '/',
+    });
+
+    // 3. Construire l'URL GitHub OAuth avec le state
+    const clientId    = process.env['GITHUB_CLIENT_ID'] ?? '';
+    const callbackUrl = process.env['GITHUB_CALLBACK_URL']
+      ?? 'http://localhost:4000/api/v1/auth/github/callback';
+
+    const githubUrl = new URL('https://github.com/login/oauth/authorize');
+    githubUrl.searchParams.set('client_id',    clientId);
+    githubUrl.searchParams.set('redirect_uri', callbackUrl);
+    githubUrl.searchParams.set('scope',        'user:email read:user read:org');
+    githubUrl.searchParams.set('state',        state);
+
+    this.logger.log(`[GitHub OAuth] Redirecting → GitHub state=${state.slice(0, 8)}…`);
+    res.redirect(githubUrl.toString());
   }
 
   @Public()
   @Get('github/callback')
   @UseGuards(AuthGuard('github'))
-  @ApiOperation({ summary: 'GitHub OAuth callback' })
+  @ApiOperation({ summary: 'GitHub OAuth callback — validates state cookie' })
   async githubCallback(
-    @Req()  req: OAuthRequest,
-    @Res()  res: Response,
+    @Req()   req: OAuthRequest,
+    @Res()   res: Response,
+    @Query('state') queryState: string,
   ): Promise<void> {
+    const frontendUrl = process.env['FRONTEND_URL'] ?? 'https://codemorph-coral.vercel.app';
+
+    // 4. Valider le state depuis le cookie
+    const cookies   = req.cookies as Record<string, string> | undefined;
+    const cookieVal = cookies?.['cm_oauth_state'] ?? '';
+    const dotIdx    = cookieVal.lastIndexOf('.');
+    const cookieState = dotIdx > 0 ? cookieVal.slice(0, dotIdx) : '';
+    const cookieSig   = dotIdx > 0 ? cookieVal.slice(dotIdx + 1) : '';
+
+    const stateOk =
+      cookieState.length > 0 &&
+      cookieSig.length  > 0 &&
+      cookieState === queryState &&
+      this.verifyState(cookieState, cookieSig);
+
+    if (!stateOk) {
+      this.logger.warn(`[GitHub OAuth] State mismatch — cookie="${cookieVal.slice(0, 16)}…" query="${queryState?.slice(0, 8)}…"`);
+      res.redirect(`${frontendUrl}/auth/sign-in?error=oauth_state_invalid`);
+      return;
+    }
+
+    // 5. Supprimer le cookie state (usage unique)
+    res.clearCookie('cm_oauth_state', { path: '/' });
+
+    // 6. Émettre les JWT et rediriger
     const tokens = await this.authService.loginOAuthUser(req.user);
     this.setRefreshTokenCookie(res, tokens.refreshToken);
-    const frontendUrl = process.env['FRONTEND_URL'] ?? 'https://codemorph-coral.vercel.app';
-    // FIX PHASE 3 — SEC-02 : token transmis via cookie httpOnly uniquement
-    // Plus de token dans l'URL → plus d'exposition dans les logs/Referer
-    // La page oauth-success appelle POST /auth/refresh via cookie pour obtenir l'access token
+    this.logger.log(`[GitHub OAuth] Success → ${frontendUrl}/auth/oauth-success`);
     res.redirect(`${frontendUrl}/auth/oauth-success`);
   }
 

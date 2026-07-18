@@ -371,22 +371,22 @@ export default function HistoryPage() {
 
   // ── Render ─────────────────────────────────────────────
   return (
-    <div className="flex flex-col gap-6 p-6">
+    <div className="flex flex-col gap-6">
       {/* ── Header ── */}
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-3">
-          <div className="flex h-10 w-10 items-center justify-center rounded-xl gradient-brand shadow-glow-sm">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex items-center gap-3 min-w-0">
+          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl gradient-brand shadow-glow-sm">
             <History className="h-5 w-5 text-white" />
           </div>
-          <div>
-            <h1 className="text-2xl font-bold text-foreground">Historique des conversions</h1>
-            <p className="text-sm text-muted-foreground">
+          <div className="min-w-0">
+            <h1 className="text-xl font-bold text-foreground sm:text-2xl">Historique des conversions</h1>
+            <p className="text-sm text-muted-foreground truncate">
               Toutes vos conversions de code — actives, terminées, en échec
             </p>
           </div>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2 shrink-0">
           {/* Refresh manuel */}
           <Button
             variant="outline"

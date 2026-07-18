@@ -71,11 +71,13 @@ import { redisConfig }    from './config/redis.config';
     // ── Redis (global, @liaoliaots/nestjs-redis) ───────────
     // Redis est OPTIONNEL : si REDIS_URL est absent/invalide, on ne crashe pas.
     // L'URL est normalisée pour corriger le cas Upstash (rediss:// manquant).
+    // FIX PHASE 19 : tls activé si rediss:// pour Upstash
     RedisModule.forRootAsync({
       inject:     [ConfigService],
       useFactory: (config: ConfigService) => {
-        const rawUrl  = config.get<string>('REDIS_URL');
+        const rawUrl   = config.get<string>('REDIS_URL');
         const redisUrl = normalizeRedisUrl(rawUrl) ?? 'redis://localhost:6379';
+        const isTls    = redisUrl.startsWith('rediss://');
         return {
           config: {
             url:           redisUrl,
@@ -89,22 +91,40 @@ import { redisConfig }    from './config/redis.config';
               return Math.min(times * 500, 3000);
             },
             enableOfflineQueue: false,
+            // TLS requis pour Upstash (rediss://)
+            ...(isTls ? { tls: { rejectUnauthorized: false } } : {}),
           },
         };
       },
     }),
 
     // ── Bull queue (Redis-backed) ──────────────────────────
+    // FIX PHASE 19 : maxRetriesPerRequest: null obligatoire avec Upstash/TLS
+    // (ioredis 5+ Bull exige null sinon erreur "Reached the max retries per request limit")
     BullModule.forRootAsync({
       inject:     [ConfigService],
       useFactory: (config: ConfigService) => {
         const rawUrl  = config.get<string>('REDIS_URL');
         const redisUrl = normalizeRedisUrl(rawUrl);
-        // Si on a une URL complète, on l'utilise directement via url
-        // Sinon on tombe sur localhost (dev sans Redis)
+        const isTls    = redisUrl?.startsWith('rediss://');
+
+        // Options communes ioredis pour Bull (évitent l'erreur "max retries")
+        const commonRedisOpts = {
+          maxRetriesPerRequest: null as null,  // OBLIGATOIRE avec Bull + Upstash
+          enableReadyCheck:     false,          // Upstash: pas de CLUSTER INFO
+          connectTimeout:       10_000,
+          retryStrategy: (times: number) => {
+            if (times > 10) return null;        // stopper après 10 essais
+            return Math.min(times * 200, 3000);
+          },
+        };
+
         if (redisUrl) {
           return {
-            url: redisUrl,
+            url:   redisUrl,
+            redis: isTls
+              ? { ...commonRedisOpts, tls: { rejectUnauthorized: false } }
+              : { ...commonRedisOpts },
             defaultJobOptions: {
               removeOnComplete: 100,
               removeOnFail:     200,
@@ -119,6 +139,8 @@ import { redisConfig }    from './config/redis.config';
             port:     config.get<number>('REDIS_PORT', 6379),
             password: config.get<string>('REDIS_PASSWORD'),
             db:       config.get<number>('REDIS_QUEUE_DB', 1),
+            maxRetriesPerRequest: null as null,
+            enableReadyCheck:     false,
           },
           defaultJobOptions: {
             removeOnComplete: 100,
