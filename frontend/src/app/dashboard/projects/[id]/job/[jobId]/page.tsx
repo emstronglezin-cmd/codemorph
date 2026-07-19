@@ -28,17 +28,36 @@ interface Job {
   linesGenerated?: number;
   startedAt?: string;
   completedAt?: string;
+  // FIX PHASE 20 — Provider IA dynamique (stocké dans result JSONB après callback)
+  result?: {
+    aiTier?:  string;
+    aiModel?: string;
+    [key: string]: unknown;
+  };
 }
 
 const BACKEND = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:4000/api/v1';
 
+// FIX PHASE 20 — Mapper le tier AI Engine vers un label lisible
+function getAIProviderLabel(tier?: string, model?: string): string {
+  if (!tier) return 'AI Engine';
+  switch (tier) {
+    case 'free-groq':     return model ? `Groq (${model})` : 'Groq (Llama 3.1)';
+    case 'pro-openai':    return model ? `OpenAI (${model})` : 'GPT-4o';
+    case 'pro-anthropic': return model ? `Anthropic (${model})` : 'Claude 3.5 Sonnet';
+    case 'platform':      return model ? `OpenAI (${model})` : 'OpenAI';
+    case 'static':        return 'Static (no AI)';
+    default:              return tier;
+  }
+}
+
 const PIPELINE_PHASES = [
-  { id: 'ast-analysis', label: 'AST Analysis', icon: '🔍', desc: 'Parsing source files & extracting imports' },
+  { id: 'ast-analysis',          label: 'AST Analysis',         icon: '🔍', desc: 'Parsing source files & extracting imports' },
   { id: 'architecture-detection', label: 'Architecture Detection', icon: '🏗️', desc: 'Identifying patterns & design layers' },
-  { id: 'ir-generation', label: 'IR Generation', icon: '🧠', desc: 'Building Intermediate Representation via GPT-4o' },
-  { id: 'mapping', label: 'Framework Mapping', icon: '🗺️', desc: 'Mapping components to target framework' },
-  { id: 'code-planning', label: 'Code Planning', icon: '📋', desc: 'Planning output file structure' },
-  { id: 'validation', label: 'Validation', icon: '✅', desc: 'Validating IR completeness & consistency' },
+  { id: 'ir-generation',         label: 'IR Generation',         icon: '🧠', desc: 'Building Intermediate Representation via {AI_PROVIDER}' },
+  { id: 'mapping',               label: 'Framework Mapping',     icon: '🗺️', desc: 'Mapping components to target framework' },
+  { id: 'code-planning',         label: 'Code Planning',         icon: '📋', desc: 'Planning output file structure' },
+  { id: 'validation',            label: 'Validation',            icon: '✅', desc: 'Validating IR completeness & consistency' },
 ];
 
 const STATUS_COLOR: Record<string, string> = {
@@ -220,7 +239,12 @@ export default function JobTrackingPage() {
                         <span className="text-xs text-primary animate-pulse">running…</span>
                       )}
                     </div>
-                    <p className="text-xs text-muted-foreground">{phase.desc}</p>
+                    <p className="text-xs text-muted-foreground">
+                      {phase.desc.replace(
+                        '{AI_PROVIDER}',
+                        getAIProviderLabel(job?.result?.aiTier as string | undefined, job?.result?.aiModel as string | undefined),
+                      )}
+                    </p>
                   </div>
                 </div>
               );

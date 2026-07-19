@@ -112,6 +112,17 @@ convertRouter.post('/', async (req: Request, res: Response, next: NextFunction):
           const linesGenerated  = result.files?.reduce(
             (acc: number, f: { content: string }) => acc + (f.content?.split('\n').length ?? 0), 0
           ) ?? 0;
+          // FIX PHASE 20 — CRITICAL: ajouter X-AI-Engine-Secret au callback
+          // Le backend (jobs.controller.ts) vérifie ce header avant d'accepter le callback.
+          // Sans ce header → 401 UnauthorizedException → callback silencieusement rejeté
+          // → job reste CONVERTING indéfiniment → watchdog FAILED après 5 min.
+          const aiEngineSecret = process.env['AI_ENGINE_SECRET'] ?? '';
+          const callbackHeaders: Record<string, string> = {
+            'Content-Type': 'application/json',
+          };
+          if (aiEngineSecret) {
+            callbackHeaders['X-AI-Engine-Secret'] = aiEngineSecret;
+          }
           await axios.post(callbackUrl, {
             success:        true,
             jobId:          result.jobId,
@@ -124,12 +135,15 @@ convertRouter.post('/', async (req: Request, res: Response, next: NextFunction):
               targetLanguage:  ctx.targetFramework,
               conversionType:  'ai',
               generatedAt:     new Date().toISOString(),
+              // FIX PHASE 20 — Transmettre le provider IA au backend pour affichage frontend
+              aiTier:  result.aiTier,
+              aiModel: result.aiModel,
             },
             irDocument:     result.ir,
-          }, { timeout: 15_000 }).catch((cbErr: Error) => {
+          }, { timeout: 15_000, headers: callbackHeaders }).catch((cbErr: Error) => {
             console.error(`[PIPELINE] Callback POST FAILED: ${cbErr.message} → ${callbackUrl}`);
           });
-          console.log(`[PIPELINE] Callback sent — job=${ctx.jobId} files=${filesGenerated}`);
+          console.log(`[PIPELINE] Callback sent — job=${ctx.jobId} files=${filesGenerated} secret=${aiEngineSecret ? 'set' : 'NOT SET'}`);
         }
       })
       .catch(async (err: Error) => {
@@ -138,11 +152,19 @@ convertRouter.post('/', async (req: Request, res: Response, next: NextFunction):
           const { default: axios } = await import('axios');
           // FIX: format d'erreur attendu par le backend handleCallback()
           // Backend attend: { success: false, error }
+          // FIX PHASE 20 — CRITICAL: ajouter X-AI-Engine-Secret au callback d'erreur également
+          const aiEngineSecret = process.env['AI_ENGINE_SECRET'] ?? '';
+          const callbackHeaders: Record<string, string> = {
+            'Content-Type': 'application/json',
+          };
+          if (aiEngineSecret) {
+            callbackHeaders['X-AI-Engine-Secret'] = aiEngineSecret;
+          }
           await axios.post(callbackUrl, {
             success: false,
             jobId:   ctx.jobId,
             error:   err.message,
-          }, { timeout: 15_000 }).catch((cbErr: Error) => {
+          }, { timeout: 15_000, headers: callbackHeaders }).catch((cbErr: Error) => {
             console.error(`[PIPELINE] Failure callback POST FAILED: ${cbErr.message}`);
           });
         }

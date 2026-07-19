@@ -7,6 +7,13 @@
 // cookie cm_refresh_token httpOnly (posé par le backend).
 // Cette page appelle POST /auth/refresh via withCredentials
 // pour échanger le cookie contre un access token.
+//
+// FIX PHASE 20 — OAUTH CROSS-DOMAIN fallback :
+// Les navigateurs modernes (Chrome ITP, Safari) bloquent les cookies
+// cross-domain entre *.onrender.com et *.vercel.app même SameSite=None.
+// Fallback : le backend passe le refreshToken encodé dans le fragment
+// URL (#rt=base64url) — jamais envoyé aux serveurs (logs sécurisés).
+// Priorité : cookie httpOnly → fragment URL #rt=
 // ============================================================
 
 import type React from 'react';
@@ -58,6 +65,25 @@ function normalizeMeResponse(raw: MeRaw): AuthUser {
   };
 }
 
+/**
+ * FIX PHASE 20 — Extraire le refreshToken depuis le fragment URL #rt=base64url
+ * Le fragment n'est jamais envoyé aux serveurs → sécurisé contre les logs Referer.
+ * Retourne null si absent ou invalide.
+ */
+function extractRtFromHash(): string | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const hash = window.location.hash; // ex: "#rt=eyJhb..."
+    if (!hash.startsWith('#rt=')) return null;
+    const encoded = hash.slice(4); // supprimer "#rt="
+    if (!encoded) return null;
+    // Décoder base64url → string
+    return atob(encoded.replace(/-/g, '+').replace(/_/g, '/'));
+  } catch {
+    return null;
+  }
+}
+
 function OAuthSuccessInner(): React.JSX.Element {
   const router  = useRouter();
   const setAuth = useAuthStore((s) => s.setAuth);
@@ -67,9 +93,9 @@ function OAuthSuccessInner(): React.JSX.Element {
 
     async function handleOAuthSuccess() {
       try {
-        // FIX PHASE 3 — SEC-02 : utiliser le cookie httpOnly pour obtenir l'access token
-        // Le backend a posé cm_refresh_token en cookie httpOnly lors du callback OAuth.
-        // On appelle POST /auth/refresh avec withCredentials pour échanger le cookie.
+        let token: string | undefined;
+
+        // ── Étape 1 : Essayer le cookie httpOnly (cas nominal, même domaine) ──
         const refreshRes = await fetch(`${BACKEND}/auth/refresh`, {
           method:      'POST',
           credentials: 'include',
@@ -77,17 +103,38 @@ function OAuthSuccessInner(): React.JSX.Element {
           body:        '{}',
         });
 
-        if (!refreshRes.ok) {
-          if (!cancelled) router.replace('/auth/sign-in?error=oauth_failed');
-          return;
+        if (refreshRes.ok) {
+          const refreshData = await refreshRes.json() as RefreshResponse;
+          token =
+            refreshData?.data?.tokens?.accessToken ??
+            refreshData?.data?.accessToken ??
+            refreshData?.tokens?.accessToken ??
+            refreshData?.accessToken;
         }
 
-        const refreshData = await refreshRes.json() as RefreshResponse;
-        const token =
-          refreshData?.data?.tokens?.accessToken ??
-          refreshData?.data?.accessToken ??
-          refreshData?.tokens?.accessToken ??
-          refreshData?.accessToken;
+        // ── Étape 2 : Fallback fragment URL #rt= (cross-domain SameSite block) ──
+        // FIX PHASE 20 : si le cookie a été bloqué par le navigateur (cross-domain),
+        // le backend a passé le refreshToken en base64url dans le fragment #rt=.
+        // On l'utilise directement comme refreshToken pour appeler /auth/refresh.
+        if (!token) {
+          const rtFromHash = extractRtFromHash();
+          if (rtFromHash) {
+            const fallbackRes = await fetch(`${BACKEND}/auth/refresh`, {
+              method:      'POST',
+              credentials: 'include',
+              headers:     { 'Content-Type': 'application/json' },
+              body:        JSON.stringify({ refreshToken: rtFromHash }),
+            });
+            if (fallbackRes.ok) {
+              const fallbackData = await fallbackRes.json() as RefreshResponse;
+              token =
+                fallbackData?.data?.tokens?.accessToken ??
+                fallbackData?.data?.accessToken ??
+                fallbackData?.tokens?.accessToken ??
+                fallbackData?.accessToken;
+            }
+          }
+        }
 
         if (!token) {
           if (!cancelled) router.replace('/auth/sign-in?error=oauth_failed');
@@ -103,6 +150,10 @@ function OAuthSuccessInner(): React.JSX.Element {
 
         if (!cancelled) {
           setAuth(user, token);
+          // Nettoyer le fragment de l'URL avant de naviguer
+          if (typeof window !== 'undefined' && window.location.hash.startsWith('#rt=')) {
+            window.history.replaceState(null, '', window.location.pathname);
+          }
           router.replace('/dashboard');
         }
       } catch {

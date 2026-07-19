@@ -234,6 +234,9 @@ export interface ConversionResult {
   summary:     ConversionSummary;
   tokensUsed:  number;
   durationMs:  number;
+  // FIX PHASE 20 — Exposer le tier et modèle IA utilisés pour affichage côté frontend
+  aiTier?:    string;
+  aiModel?:   string;
 }
 
 export interface GeneratedFile {

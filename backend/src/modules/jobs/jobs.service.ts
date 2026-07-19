@@ -445,6 +445,21 @@ export class JobsService implements OnModuleInit {
       ?? (renderUrl ? `${renderUrl}/api/v1` : 'http://localhost:4000/api/v1');
     const callbackUrl = `${apiUrl}/jobs/${job.id}/callback`;
 
+    // FIX PHASE 20 — DIAG: log complet pour diagnostiquer les problèmes de callbackUrl en production
+    // Si API_URL et RENDER_EXTERNAL_URL ne sont pas définis → callbackUrl = localhost (inaccessible depuis AI Engine)
+    this.logger.log(
+      `[PIPELINE] callbackUrl resolution — API_URL=${apiUrlEnv ?? '(not set)'} ` +
+      `RENDER_EXTERNAL_URL=${renderUrl ?? '(not set)'} ` +
+      `→ callbackUrl=${callbackUrl}`,
+    );
+    if (!apiUrlEnv && !renderUrl) {
+      this.logger.warn(
+        `[PIPELINE] WARNING: Neither API_URL nor RENDER_EXTERNAL_URL is set! ` +
+        `callbackUrl will be localhost:4000 which is unreachable from AI Engine on Render. ` +
+        `Set API_URL=https://<your-backend>.onrender.com/api/v1 in Render env vars.`,
+      );
+    }
+
     this.logger.log(
       `[PIPELINE] AI request sent — jobId=${job.id} files=${files.length} ` +
       `${job.sourceLanguage}→${job.targetLanguage} callbackUrl=${callbackUrl} mockMode=${this.aiEngineClient.isMockMode}`,

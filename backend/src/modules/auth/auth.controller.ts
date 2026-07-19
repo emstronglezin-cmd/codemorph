@@ -218,11 +218,10 @@ export class AuthController {
     const tokens = await this.authService.loginOAuthUser(req.user);
     this.setRefreshTokenCookie(res, tokens.refreshToken);
     const frontendUrl = process.env['FRONTEND_URL'] ?? 'https://codemorph-coral.vercel.app';
-    // FIX PHASE 3 — SEC-02 : token via cookie (httpOnly) uniquement
-    // Avant : ?token= dans l'URL → exposé dans les logs Vercel/Render/Referer
-    // Fix : le token est déjà dans le cookie httpOnly — on redirige sans token dans l'URL
-    // La page oauth-success lira le token depuis un second appel sécurisé /auth/me via cookie
-    res.redirect(`${frontendUrl}/auth/oauth-success`);
+    // FIX PHASE 20 — OAUTH CROSS-DOMAIN (même fix que GitHub) :
+    // Fragment #rt= pour contourner le blocage des cookies cross-domain SameSite
+    const rtEncoded = Buffer.from(tokens.refreshToken).toString('base64url');
+    res.redirect(`${frontendUrl}/auth/oauth-success#rt=${rtEncoded}`);
   }
 
   // ── GitHub OAuth ──────────────────────────────────────
@@ -299,8 +298,16 @@ export class AuthController {
     // 6. Émettre les JWT et rediriger
     const tokens = await this.authService.loginOAuthUser(req.user);
     this.setRefreshTokenCookie(res, tokens.refreshToken);
+
+    // FIX PHASE 20 — OAUTH CROSS-DOMAIN : fallback pour cookies SameSite bloqués
+    // Les navigateurs modernes (Chrome ITP, Safari) bloquent les cookies cross-domain
+    // entre *.onrender.com (backend) et *.vercel.app (frontend) même avec SameSite=None.
+    // Solution : passer le refreshToken dans le fragment URL (#rt=...)
+    // Le fragment n'est JAMAIS envoyé aux serveurs (pas de risque dans les logs Vercel/Render/Referer)
+    // La page oauth-success le récupère avec window.location.hash et l'envoie immédiatement.
+    const rtEncoded = Buffer.from(tokens.refreshToken).toString('base64url');
     this.logger.log(`[GitHub OAuth] Success → ${frontendUrl}/auth/oauth-success`);
-    res.redirect(`${frontendUrl}/auth/oauth-success`);
+    res.redirect(`${frontendUrl}/auth/oauth-success#rt=${rtEncoded}`);
   }
 
   // ── GET /auth/github-repos ────────────────────────────

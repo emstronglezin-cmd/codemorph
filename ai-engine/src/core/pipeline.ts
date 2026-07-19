@@ -98,6 +98,9 @@ export class ConversionPipeline {
       summary:    plan.summary,
       tokensUsed: astResult.tokensUsed + archResult.tokensUsed + irDocument.tokensUsed,
       durationMs,
+      // FIX PHASE 20 — Inclure le tier et modèle IA pour affichage côté frontend
+      aiTier:  tier,
+      aiModel: new AIProvider(opts).getModel(),
     };
   }
 }
