@@ -96,14 +96,25 @@ convertRouter.post('/', async (req: Request, res: Response, next: NextFunction):
 
     const aiOpts = extractAIKeys(req);
 
-    // Respond immediately with jobId — backend marks job as accepted
-    console.log(`[PIPELINE] AI Engine received job=${ctx.jobId} src=${ctx.sourceFramework} tgt=${ctx.targetFramework} codeLen=${sourceCode.length} callbackUrl=${callbackUrl ?? '(none)'}`);
+    // Count files in sourceCode
+    const fileMarkerCount = (sourceCode.match(/\/\/\s*(?:=+\s*)?FILE:\s*/g) ?? []).length;
+    console.log(`[PIPELINE] ━━━ AI Engine received conversion job ━━━`);
+    console.log(`[PIPELINE] job=${ctx.jobId} src=${ctx.sourceFramework} tgt=${ctx.targetFramework}`);
+    console.log(`[PIPELINE] Files detected: ${fileMarkerCount} (from file markers in sourceCode)`);
+    console.log(`[PIPELINE] sourceCode.length=${sourceCode.length} chars callbackUrl=${callbackUrl ?? '(none)'}`);
     res.status(202).json({ jobId: ctx.jobId, accepted: true, message: 'Conversion pipeline started' });
 
     // Run pipeline + callback in background
     pipeline.run(ctx, aiOpts)
       .then(async (result) => {
-        console.log(`[PIPELINE] Pipeline completed — job=${ctx.jobId} files=${result.files?.length ?? 0} duration=${result.durationMs}ms`);
+        const filesCount = result.files?.length ?? 0;
+        const linesTotal = result.files?.reduce((acc: number, f: { content: string }) => acc + (f.content?.split('\n').length ?? 0), 0) ?? 0;
+        console.log(`[PIPELINE] ━━━ Pipeline completed ━━━`);
+        console.log(`[PIPELINE] job=${ctx.jobId} Generated files: ${filesCount} | Total lines: ${linesTotal} | Duration: ${result.durationMs}ms`);
+        result.files?.slice(0, 5).forEach((f: { path: string }, i: number) => {
+          console.log(`[PIPELINE]   [${i+1}] ${f.path}`);
+        });
+        if (filesCount > 5) console.log(`[PIPELINE]   ... and ${filesCount - 5} more files`);
         if (callbackUrl) {
           const { default: axios } = await import('axios');
           // FIX: format de callback attendu par le backend handleCallback()
@@ -143,7 +154,9 @@ convertRouter.post('/', async (req: Request, res: Response, next: NextFunction):
           }, { timeout: 15_000, headers: callbackHeaders }).catch((cbErr: Error) => {
             console.error(`[PIPELINE] Callback POST FAILED: ${cbErr.message} → ${callbackUrl}`);
           });
-          console.log(`[PIPELINE] Callback sent — job=${ctx.jobId} files=${filesGenerated} secret=${aiEngineSecret ? 'set' : 'NOT SET'}`);
+          console.log(`[PIPELINE] ━━━ Callback sent ━━━`);
+          console.log(`[PIPELINE] Callback → ${callbackUrl}`);
+          console.log(`[PIPELINE] filesGenerated=${filesGenerated} linesGenerated=${linesGenerated} secret=${aiEngineSecret ? 'SET' : 'NOT SET — callback may be rejected!'} aiTier=${result.aiTier ?? 'unknown'}`);
         }
       })
       .catch(async (err: Error) => {

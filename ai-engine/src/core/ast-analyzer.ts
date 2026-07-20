@@ -52,14 +52,29 @@ export class ASTAnalyzer {
   async analyze(ctx: ConversionContext): Promise<ASTResult> {
     const { sourceCode, sourceFramework } = ctx;
 
+    const totalChars = sourceCode.length;
+    const totalLines = sourceCode.split('\n').length;
+    console.log(`[AST] analyze() START — sourceFramework=${sourceFramework} totalChars=${totalChars} totalLines=${totalLines}`);
+
     // Split source into virtual files (if multi-file)
     const files = this.parseVirtualFiles(sourceCode);
+
+    const totalFilesLines = files.reduce((a, f) => a + f.lines, 0);
+    console.log(`[AST] Files parsed: ${files.length} | Total lines across files: ${totalFilesLines}`);
+    files.slice(0, 5).forEach((f, i) => {
+      console.log(`[AST]   [${i + 1}] ${f.path} — ${f.lines} lines — ${f.language}`);
+    });
+    if (files.length > 5) {
+      console.log(`[AST]   ... and ${files.length - 5} more files`);
+    }
 
     // Build import graph
     const imports = this.buildImportGraph(files);
 
     // AI-enhanced analysis for complex patterns
     const aiAnalysis = await this.runAIAnalysis(ctx, files);
+
+    console.log(`[AST] analyze() DONE — files=${files.length} classes=${aiAnalysis.classNames.length} functions=${aiAnalysis.functions.length} tokensUsed=${aiAnalysis.tokensUsed}`);
 
     return {
       files,
@@ -75,14 +90,31 @@ export class ASTAnalyzer {
   }
 
   private parseVirtualFiles(sourceCode: string): ASTFile[] {
-    // Handle multi-file format: "// FILE: path/to/file.dart\n<content>"
-    const filePattern = /\/\/\s*FILE:\s*(.+?)\n([\s\S]*?)(?=\/\/\s*FILE:|$)/g;
+    // ── FIX PHASE 21 — CRITICAL: regex mismatch ─────────────────────────────
+    // ai-engine.client.ts sends: "// === FILE: path/to/file.dart ===\ncontent"
+    // Old regex: /\/\/\s*FILE:\s*/ — did NOT match "// === FILE:" (=== breaks it)
+    // New regex: supports BOTH formats:
+    //   - "// === FILE: path ==="  (sent by ai-engine.client.ts)
+    //   - "// FILE: path"          (legacy)
+    //   - "// ==== FILE: path ===" (any number of =)
+    //
+    // Pattern breakdown:
+    //   \/\/\s*        → "// " with optional spaces
+    //   (?:=+\s*)?     → optional "===" prefix
+    //   FILE:\s*       → "FILE:" with optional spaces
+    //   (.+?)          → capture: file path (non-greedy)
+    //   (?:\s*=+)?     → optional "===" suffix
+    //   \n             → newline after header
+    //   ([\s\S]*?)     → capture: file content
+    //   (?=\/\/\s*(?:=+\s*)?FILE:|$) → lookahead: next file header OR end
+    const filePattern = /\/\/\s*(?:=+\s*)?FILE:\s*(.+?)(?:\s*=+)?\n([\s\S]*?)(?=\/\/\s*(?:=+\s*)?FILE:|$)/g;
     const files: ASTFile[] = [];
     let match: RegExpExecArray | null;
 
     while ((match = filePattern.exec(sourceCode)) !== null) {
       const path    = (match[1] ?? '').trim();
       const content = (match[2] ?? '').trim();
+      if (!path || !content) continue; // skip empty captures
       const lang    = this.langFromPath(path);
 
       files.push({
@@ -97,8 +129,12 @@ export class ASTAnalyzer {
       });
     }
 
-    // Single file fallback
-    if (files.length === 0) {
+    // ── LOG: how many files were parsed ──────────────────────────────────────
+    if (files.length > 0) {
+      console.log(`[AST] parseVirtualFiles: ${files.length} virtual files parsed from multi-file format`);
+    } else {
+      // Single file fallback — entire source treated as one file
+      console.log(`[AST] parseVirtualFiles: no multi-file markers found — using single-file fallback`);
       const lang = this.detectLanguage(sourceCode, '');
       files.push({
         path:      `main.${lang}`,

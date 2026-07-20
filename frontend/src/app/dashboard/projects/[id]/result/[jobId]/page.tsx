@@ -6,24 +6,38 @@ import Link from 'next/link';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
+import { getAccessToken } from '@/lib/api/client';
 
 interface GeneratedFile {
   path: string;
   content: string;
   language: string;
   linesCount: number;
+  warnings?: string[];
 }
 
 interface JobResult {
   id: string;
+  status: string;
   sourceLanguage: string;
   targetLanguage: string;
   filesGenerated: number;
   linesGenerated: number;
   completedAt: string;
-  result: {
+  result?: {
     files?: GeneratedFile[];
     outputZipUrl?: string;
+    summary?: {
+      filesProcessed?: number;
+      filesGenerated?: number;
+      framework?: string;
+      sourceLanguage?: string;
+      targetLanguage?: string;
+    };
+    sourceLanguage?: string;
+    targetLanguage?: string;
+    aiTier?: string;
+    aiModel?: string;
   };
 }
 
@@ -72,11 +86,24 @@ export default function ResultStudioPage() {
   useEffect(() => {
     const load = async () => {
       try {
-        const res = await fetch(`${BACKEND}/jobs/${jobId}`, { credentials: 'include' });
+        // FIX PHASE 21: add Authorization header — fetch without it returns 401
+        const token = getAccessToken();
+        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+        if (token) headers['Authorization'] = `Bearer ${token}`;
+
+        const res = await fetch(`${BACKEND}/jobs/${jobId}`, {
+          credentials: 'include',
+          headers,
+        });
         if (res.ok) {
-          const data = await res.json();
-          setJob(data.data ?? data);
+          const data = await res.json() as { data?: JobResult } | JobResult;
+          const jobData = (data as { data?: JobResult }).data ?? (data as JobResult);
+          setJob(jobData);
+        } else {
+          console.error(`[ResultStudio] fetch job failed: ${res.status} ${res.statusText}`);
         }
+      } catch (err) {
+        console.error('[ResultStudio] fetch job error:', err);
       } finally {
         setLoading(false);
       }
@@ -85,11 +112,44 @@ export default function ResultStudioPage() {
   }, [jobId]);
 
   const downloadZip = async () => {
-    const url = job?.result?.outputZipUrl ?? `${BACKEND}/jobs/${jobId}/download`;
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `codemorph-result-${jobId.slice(0, 8)}.zip`;
-    a.click();
+    // FIX PHASE 21: use authenticated fetch() instead of <a>.click()
+    // <a>.click() triggers browser navigation → no Authorization header → AUTH_002
+    try {
+      const token = getAccessToken();
+      const headers: Record<string, string> = {};
+      if (token) headers['Authorization'] = `Bearer ${token}`;
+
+      const downloadUrl = job?.result?.outputZipUrl ?? `${BACKEND}/jobs/${jobId}/download`;
+
+      // If it's an external URL (outputZipUrl), use direct download
+      if (job?.result?.outputZipUrl) {
+        const a = document.createElement('a');
+        a.href = job.result.outputZipUrl;
+        a.download = `codemorph-result-${jobId.slice(0, 8)}.zip`;
+        a.click();
+        return;
+      }
+
+      // Otherwise use authenticated fetch()
+      const res = await fetch(downloadUrl, { headers, credentials: 'include' });
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({})) as { message?: string; code?: string };
+        throw new Error(errData.message ?? `Download failed: ${res.status}`);
+      }
+
+      const blob  = await res.blob();
+      const url   = URL.createObjectURL(blob);
+      const a     = document.createElement('a');
+      a.href      = url;
+      a.download  = `codemorph-result-${jobId.slice(0, 8)}.zip`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      console.error('[ResultStudio] download failed:', err);
+      alert(`Download failed: ${(err as Error).message}`);
+    }
   };
 
   const pushToGitHub = async () => {
@@ -113,7 +173,16 @@ export default function ResultStudioPage() {
     }
   };
 
-  const files = job?.result?.files ?? [];
+  // FIX PHASE 21: sourceLanguage/targetLanguage can be at root OR inside result
+  const sourceLanguage = job?.sourceLanguage ?? job?.result?.sourceLanguage ?? job?.result?.summary?.sourceLanguage ?? '—';
+  const targetLanguage = job?.targetLanguage ?? job?.result?.targetLanguage ?? job?.result?.summary?.targetLanguage ?? '—';
+  const filesGenerated = job?.filesGenerated ?? job?.result?.summary?.filesGenerated ?? 0;
+  const linesGenerated = job?.linesGenerated ?? 0;
+
+  const files = (job?.result?.files ?? []).map((f) => ({
+    ...f,
+    linesCount: f.linesCount ?? f.content?.split('\n').length ?? 0,
+  }));
   const fileTree = buildFileTree(files);
 
   if (loading) {
@@ -143,8 +212,8 @@ export default function ResultStudioPage() {
             <Badge variant="success">Conversion Complete</Badge>
           </h1>
           <p className="text-muted-foreground text-sm mt-1">
-            {job?.sourceLanguage} → {job?.targetLanguage} ·{' '}
-            {job?.filesGenerated} files · {job?.linesGenerated?.toLocaleString()} lines
+            {sourceLanguage} → {targetLanguage} ·{' '}
+            {files.length > 0 ? files.length : filesGenerated} files · {linesGenerated.toLocaleString()} lines
             {job?.completedAt && ` · ${new Date(job.completedAt).toLocaleString()}`}
           </p>
         </div>
@@ -249,9 +318,9 @@ export default function ResultStudioPage() {
       {/* Stats row */}
       <div className="grid grid-cols-4 gap-4">
         {[
-          { label: 'Files Generated', value: job?.filesGenerated ?? 0, icon: '📄' },
-          { label: 'Lines of Code', value: (job?.linesGenerated ?? 0).toLocaleString(), icon: '📝' },
-          { label: 'Frameworks', value: `${job?.sourceLanguage} → ${job?.targetLanguage}`, icon: '🔄' },
+          { label: 'Files Generated', value: files.length > 0 ? files.length : filesGenerated, icon: '📄' },
+          { label: 'Lines of Code', value: linesGenerated.toLocaleString(), icon: '📝' },
+          { label: 'Framework', value: `${sourceLanguage} → ${targetLanguage}`, icon: '🔄' },
           { label: 'Status', value: 'Complete', icon: '✅' },
         ].map((stat) => (
           <Card key={stat.label} className="p-4">

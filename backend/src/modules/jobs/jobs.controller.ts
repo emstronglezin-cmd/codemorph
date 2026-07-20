@@ -109,21 +109,57 @@ export class JobsController {
     if (job.userId !== (user.sub as string)) {
       return { statusCode: 403, message: 'Forbidden' };
     }
+    const resultFiles = (job.result as Record<string, unknown> | null)?.['files'] as Array<unknown> | undefined;
+    this.logger.log(`[GET /jobs/${id}] status=${job.status} filesGenerated=${job.filesGenerated ?? 0} result.files.length=${resultFiles?.length ?? 0} — Frontend received job`);
     return job;
   }
 
   // ── GET /jobs/:id/download — télécharger le résultat ZIP ─
-  // FIX PHASE 9 : endpoint manquant — history/page.tsx l'appelle sur handleDownload()
-  // Retourne le ZIP généré stocké dans job.result.files (format JSON → ZIP en mémoire)
+  // FIX PHASE 9 : endpoint manquant
+  // FIX PHASE 21 : AUTH_002 — les browsers ne peuvent pas envoyer Authorization header
+  //   via <a href>.click() → AUTH_002
+  //   Solution multi-path :
+  //   1. Authorization: Bearer <token>  (fetch() avec auth header — RECOMMENDED)
+  //   2. ?token=<jwt>                   (fallback pour URL directe / window.open)
+  //   Route marquée @Public() pour bypasser JwtAuthGuard global
+  //   puis authentification manuelle dans le handler
+  @Public()
+  @SkipThrottle()
   @Get(':id/download')
-  @ApiOperation({ summary: 'Download job result as ZIP' })
+  @ApiOperation({ summary: 'Download job result as ZIP (Bearer header or ?token= query param)' })
   async download(
     @Param('id', ParseUUIDPipe) id: string,
-    @CurrentUser() user: JwtPayload,
+    @Query('token') tokenParam: string | undefined,
+    @Req() req: Request,
     @Res() res: Response,
   ) {
+    // ── Résoudre le JWT depuis Bearer header OU ?token= query param ──────────
+    const authHeader = req.headers['authorization'] as string | undefined;
+    const bearerToken = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : undefined;
+    const rawToken = bearerToken ?? tokenParam;
+
+    if (!rawToken) {
+      throw new UnauthorizedException({ code: 'AUTH_002', message: 'Authentication required: provide Authorization header or ?token= query param' });
+    }
+
+    let userId: string;
+    try {
+      // Dynamic import pour éviter les problèmes de bundle
+      const jwtLib = await import('jsonwebtoken');
+      const jwtSecret = this.config.get<string>('JWT_SECRET', 'secret');
+      const decoded = jwtLib.verify(rawToken, jwtSecret) as { sub: string };
+      userId = decoded.sub;
+      this.logger.log(`[download] Job ${id} — authenticated userId=${userId} via ${bearerToken ? 'Bearer header' : '?token= param'}`);
+    } catch {
+      throw new UnauthorizedException({ code: 'AUTH_002', message: 'Invalid or expired token' });
+    }
+
     const job = await this.jobsService.findById(id);
-    if (job.userId !== (user.sub as string)) {
+    if (!job) {
+      throw new NotFoundException(`Job ${id} not found`);
+    }
+    if (job.userId !== userId) {
+      this.logger.warn(`[download] Job ${id} — userId mismatch: job.userId=${job.userId} vs request userId=${userId}`);
       throw new UnauthorizedException('Access denied');
     }
     if (job.status !== 'done') {
@@ -151,7 +187,7 @@ export class JobsController {
     const buffer = zip.toBuffer();
     const fileName = `codemorph-${id.slice(0, 8)}.zip`;
 
-    this.logger.log(`[download] Job ${id} → ${files.length} files → ${buffer.length} bytes`);
+    this.logger.log(`[download] Job ${id} → userId=${userId} → ${files.length} files → ${buffer.length} bytes — ZIP ready`);
 
     res.set({
       'Content-Type':        'application/zip',

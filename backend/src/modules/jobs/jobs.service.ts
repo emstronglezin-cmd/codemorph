@@ -503,7 +503,12 @@ export class JobsService implements OnModuleInit {
     },
   ): Promise<void> {
     const job = await this.findById(id);
-    this.logger.log(`[PIPELINE] Callback received — jobId=${id} success=${payload.success}`);
+    this.logger.log(`[PIPELINE] ━━━ Callback received ━━━`);
+    this.logger.log(`[PIPELINE] jobId=${id} success=${payload.success} filesGenerated=${payload.filesGenerated ?? 0} linesGenerated=${payload.linesGenerated ?? 0}`);
+
+    // Log files count from result if present
+    const resultFiles = (payload.result?.['files'] as Array<unknown> | undefined);
+    this.logger.log(`[PIPELINE] result.files.length=${resultFiles?.length ?? 0} (from callback payload)`);
 
     // Get user plan for quota tracking
     const plan = await this.subscriptionSvc.getUserPlan(job.userId);
@@ -523,7 +528,9 @@ export class JobsService implements OnModuleInit {
         filesProcessed: payload.filesGenerated,
         linesProcessed: payload.linesGenerated,
       });
-      this.logger.log(`[PIPELINE] Job completed — jobId=${id} files=${payload.filesGenerated ?? 0}`);
+      this.logger.log(`[PIPELINE] ━━━ Database updated ━━━`);
+      this.logger.log(`[PIPELINE] Saving ${payload.filesGenerated ?? 0} generated files to DB — jobId=${id}`);
+      this.logger.log(`[PIPELINE] Job DONE — jobId=${id} filesGenerated=${payload.filesGenerated ?? 0} linesGenerated=${payload.linesGenerated ?? 0}`);
     } else {
       const errorMsg = payload.error ?? 'Unknown error from AI Engine';
       await this.updateStatus(id, JobStatus.FAILED, {

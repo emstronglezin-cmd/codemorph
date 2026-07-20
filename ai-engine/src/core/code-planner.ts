@@ -20,8 +20,15 @@ export class CodePlanner {
   }
 
   async plan(ctx: ConversionContext, ir: IRDocument): Promise<CodePlan> {
+    console.log(`[CodePlanner] plan() START — target=${ctx.targetFramework} projectId=${ctx.projectId}`);
     const planner = this.getFrameworkPlanner(ctx.targetFramework);
-    return planner(ctx, ir);
+    const result  = await planner(ctx, ir);
+    console.log(`[CodePlanner] plan() DONE — Generated files: ${result.files.length} | Total lines: ${result.summary.totalLines}`);
+    result.files.forEach((f, i) => {
+      if (i < 8) console.log(`[CodePlanner]   [${i + 1}] ${f.path}`);
+    });
+    if (result.files.length > 8) console.log(`[CodePlanner]   ... and ${result.files.length - 8} more files`);
+    return result;
   }
 
   private getFrameworkPlanner(target: string): (ctx: ConversionContext, ir: IRDocument) => Promise<CodePlan> {
@@ -101,29 +108,320 @@ export class CodePlanner {
   }
 
   // ── React Native planner ──────────────────────────────
+  // FIX PHASE 21: full implementation — components, stores, router
+  // Previously only generated 4 static files when ir.uiGraph.screens was empty
+  // (which always happened with Groq because JSON parsing failed with 2048 token limit)
+  // Now: generates all files from IR + AST-based fallback when IR is empty
   private async planReactNative(ctx: ConversionContext, ir: IRDocument): Promise<CodePlan> {
     const files: GeneratedFile[] = [];
+    console.log(`[CodePlanner] planReactNative START — projectId=${ctx.projectId}`);
 
+    // ── Static project scaffolding (always generated) ──────
     files.push(
-      this.staticFile('package.json',          this.rnPackageJson(ctx.projectId)),
-      this.staticFile('tsconfig.json',         RN_TSCONFIG),
+      this.staticFile('package.json',           this.rnPackageJson(ctx.projectId)),
+      this.staticFile('tsconfig.json',          RN_TSCONFIG),
+      this.staticFile('app.json',               this.rnAppJson(ctx.projectId)),
+      this.staticFile('babel.config.js',        RN_BABEL_CONFIG),
       this.staticFile('app/(tabs)/_layout.tsx', RN_TAB_LAYOUT),
-      this.staticFile('app/index.tsx',         RN_INDEX),
+      this.staticFile('app/index.tsx',          RN_INDEX),
+      this.staticFile('src/lib/api.ts',         RN_API_CLIENT),
+      this.staticFile('src/lib/storage.ts',     RN_STORAGE),
+      this.staticFile('src/hooks/useApi.ts',    RN_USE_API_HOOK),
+      this.staticFile('src/theme/colors.ts',    RN_THEME_COLORS),
+      this.staticFile('src/theme/spacing.ts',   RN_THEME_SPACING),
+      this.staticFile('src/components/ui/Button.tsx',    RN_BUTTON_COMPONENT),
+      this.staticFile('src/components/ui/TextInput.tsx', RN_TEXT_INPUT_COMPONENT),
+      this.staticFile('src/components/ui/Card.tsx',      RN_CARD_COMPONENT),
+      this.staticFile('src/components/ui/LoadingSpinner.tsx', RN_LOADING_SPINNER),
+      this.staticFile('src/components/ui/ErrorMessage.tsx',   RN_ERROR_MESSAGE),
     );
 
-    const uiGraphRN = ir.uiGraph ?? { screens: [], components: [], stateFlow: [], stateSlices: [], theme: {} };
-    for (const screen of (uiGraphRN.screens ?? [])) {
-      const content = await this.generateScreenFile(ctx, ir, screen.name, screen.components, 'react-native');
+    // ── Defensive: ensure uiGraph exists ──────────────────
+    const uiGraph = ir.uiGraph ?? { screens: [], components: [], stateFlow: [], navigationFlow: [] };
+    const screens   = uiGraph.screens   ?? [];
+    const components = uiGraph.components ?? [];
+    const stateFlow  = uiGraph.stateFlow  ?? [];
+
+    console.log(`[CodePlanner] IR uiGraph — screens=${screens.length} components=${components.length} stateFlows=${stateFlow.length}`);
+
+    // ── Screens from IR ────────────────────────────────────
+    if (screens.length > 0) {
+      for (const screen of screens) {
+        const content = await this.generateScreenFile(ctx, ir, screen.name, screen.components ?? [], 'react-native');
+        files.push({
+          path:     `app/${screen.name.toLowerCase()}.tsx`,
+          content,
+          language: 'typescript',
+          fromPath: screen.path,
+          warnings: [],
+        });
+      }
+      // Generate navigation stack with all screens
       files.push({
-        path:     `app/${screen.name.toLowerCase()}.tsx`,
+        path:     'app/_layout.tsx',
+        content:  this.generateRNRootLayout(screens),
+        language: 'typescript',
+        warnings: [],
+      });
+    } else {
+      // ── Fallback: generate screens from source architecture ─
+      console.log(`[CodePlanner] uiGraph.screens empty — using AST-based fallback to generate screens from source files`);
+      const fallbackScreens = this.inferScreensFromSourceFiles(ir);
+      console.log(`[CodePlanner] Inferred ${fallbackScreens.length} screens from source`);
+      for (const screenName of fallbackScreens) {
+        const content = this.fallbackScreen(screenName, 'react-native');
+        files.push({
+          path:     `app/${screenName.toLowerCase()}.tsx`,
+          content,
+          language: 'typescript',
+          warnings: ['Generated from source analysis — manual review recommended'],
+        });
+      }
+      if (fallbackScreens.length > 0) {
+        files.push({
+          path:     'app/_layout.tsx',
+          content:  this.generateRNRootLayoutFromNames(fallbackScreens),
+          language: 'typescript',
+          warnings: [],
+        });
+      }
+    }
+
+    // ── Feature components from IR ─────────────────────────
+    const featureComponents = components.filter((c) =>
+      c.type === 'feature' || c.type === 'widget' || c.type === 'page' || c.type === 'ui' || c.type === 'shared'
+    );
+    for (const comp of featureComponents) {
+      const content = await this.generateComponentFile(ctx, comp.name, comp.props ?? [], 'react-native');
+      files.push({
+        path:     `src/components/${comp.name}.tsx`,
         content,
         language: 'typescript',
-        fromPath: screen.path,
         warnings: [],
       });
     }
 
+    // ── State stores from IR (Zustand) ─────────────────────
+    for (const sf of stateFlow) {
+      files.push({
+        path:     `src/stores/${sf.store.toLowerCase()}.store.ts`,
+        content:  this.generateZustandStore(sf.store, sf.actions ?? []),
+        language: 'typescript',
+        warnings: [],
+      });
+    }
+    // Always generate a base auth store
+    files.push({
+      path:     'src/stores/auth.store.ts',
+      content:  this.generateRNAuthStore(),
+      language: 'typescript',
+      warnings: [],
+    });
+
+    // ── Data models from IR ────────────────────────────────
+    const dataLayer = ir.dataLayer ?? { models: [], relationships: [], migrations: [] };
+    for (const model of (dataLayer.models ?? [])) {
+      files.push({
+        path:     `src/types/${model.name.toLowerCase()}.types.ts`,
+        content:  this.generateTypeInterface(model),
+        language: 'typescript',
+        warnings: [],
+      });
+    }
+
+    // ── Services from IR backend graph ─────────────────────
+    const backendGraph = ir.backendGraph ?? { routes: [], services: [], entities: [], middlewares: [] };
+    for (const svc of (backendGraph.services ?? []).slice(0, 10)) {
+      files.push({
+        path:     `src/services/${svc.name.toLowerCase()}.service.ts`,
+        content:  this.generateRNService(svc),
+        language: 'typescript',
+        warnings: [],
+      });
+    }
+
+    // ── Constants & config ─────────────────────────────────
+    files.push(
+      this.staticFile('src/constants/index.ts', RN_CONSTANTS),
+      this.staticFile('src/types/index.ts',     RN_TYPES_INDEX),
+      this.staticFile('.env.example',           RN_ENV_EXAMPLE),
+      this.staticFile('README.md',              this.generateRNReadme(ctx, files.length + 3)),
+    );
+
+    console.log(`[CodePlanner] planReactNative DONE — totalFiles=${files.length}`);
     return { files, summary: this.buildSummary(files, ir) };
+  }
+
+  // ── Infer screen names from IR source file paths ────────
+  private inferScreensFromSourceFiles(ir: IRDocument): string[] {
+    const projectMeta = ir.projectMeta;
+    if (!projectMeta) return ['HomeScreen', 'DetailsScreen'];
+
+    // Use architecture modules to infer screens
+    const arch = ir.architecture ?? { modules: [], patterns: [], layers: [] };
+    const moduleNames = (arch.modules ?? [])
+      .filter((m) => m.type === 'feature' || m.type === 'ui')
+      .map((m) => this.pascal(m.name) + 'Screen');
+
+    if (moduleNames.length > 0) return moduleNames.slice(0, 10);
+
+    // Final fallback: generic screens
+    return ['HomeScreen', 'ProfileScreen', 'SettingsScreen'];
+  }
+
+  // ── React Native root layout with navigation ────────────
+  private generateRNRootLayout(screens: IRDocument['uiGraph']['screens']): string {
+    const screenLines = screens
+      .map((s) => `        <Stack.Screen name="${s.name.toLowerCase()}" options={{ title: '${s.name}' }} />`)
+      .join('\n');
+    const importLines = screens
+      .map((s) => `// Screen: ${s.name} → app/${s.name.toLowerCase()}.tsx`)
+      .join('\n');
+
+    return `import React from 'react';
+import { Stack } from 'expo-router';
+
+${importLines}
+
+export default function RootLayout(): React.JSX.Element {
+  return (
+    <Stack>
+      <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
+${screenLines}
+    </Stack>
+  );
+}
+`;
+  }
+
+  private generateRNRootLayoutFromNames(screenNames: string[]): string {
+    const screenLines = screenNames
+      .map((n) => `        <Stack.Screen name="${n.toLowerCase()}" options={{ title: '${n}' }} />`)
+      .join('\n');
+
+    return `import React from 'react';
+import { Stack } from 'expo-router';
+
+export default function RootLayout(): React.JSX.Element {
+  return (
+    <Stack>
+      <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
+${screenLines}
+    </Stack>
+  );
+}
+`;
+  }
+
+  // ── React Native Auth Store ─────────────────────────────
+  private generateRNAuthStore(): string {
+    return `import { create } from 'zustand';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+
+interface User {
+  id: string;
+  email: string;
+  name: string;
+}
+
+interface AuthState {
+  user: User | null;
+  token: string | null;
+  isAuthenticated: boolean;
+  setAuth: (user: User, token: string) => Promise<void>;
+  clearAuth: () => Promise<void>;
+}
+
+export const useAuthStore = create<AuthState>((set) => ({
+  user:            null,
+  token:           null,
+  isAuthenticated: false,
+
+  setAuth: async (user, token) => {
+    await AsyncStorage.setItem('auth_token', token);
+    set({ user, token, isAuthenticated: true });
+  },
+
+  clearAuth: async () => {
+    await AsyncStorage.removeItem('auth_token');
+    set({ user: null, token: null, isAuthenticated: false });
+  },
+}));
+`;
+  }
+
+  // ── React Native Service from backendGraph ──────────────
+  private generateRNService(svc: IRDocument['backendGraph']['services'][0]): string {
+    const methods = (svc.methods ?? []).slice(0, 10).map((m) =>
+      `export async function ${m.name}(${m.params.map((p: { name: string; type: string }) => `${p.name}: ${p.type}`).join(', ')}): Promise<${m.returnType}> {\n  // TODO: implement\n  throw new Error('Not implemented');\n}`
+    ).join('\n\n');
+
+    return `// ${svc.name} service — auto-generated by CodeMorph
+import { apiClient } from '../lib/api';
+
+${methods || `export async function get${this.pascal(svc.name)}(): Promise<unknown[]> {\n  const res = await apiClient.get('/${svc.name.toLowerCase()}');\n  return res.data;\n}`}
+`;
+  }
+
+  // ── TypeScript interface from data model ─────────────────
+  private generateTypeInterface(model: IRDocument['dataLayer']['models'][0]): string {
+    const fields = (model.fields ?? []).map((f: { name: string; type: string; nullable?: boolean }) =>
+      `  ${f.name}${f.nullable ? '?' : ''}: ${this.dartTypeToTS(f.type)};`
+    ).join('\n');
+
+    return `// ${model.name} interface — auto-generated by CodeMorph
+export interface ${model.name} {
+${fields || `  id: string;\n  createdAt: string;\n  updatedAt: string;`}
+}
+
+export interface ${model.name}List {
+  items: ${model.name}[];
+  total: number;
+  page: number;
+}
+`;
+  }
+
+  // ── RN-specific readme ────────────────────────────────────
+  private generateRNReadme(ctx: ConversionContext, fileCount: number): string {
+    return `# ${ctx.projectId} — React Native App
+
+> Auto-generated by **CodeMorph** from ${ctx.sourceFramework} → React Native
+
+## Generated Files
+This project was automatically converted and contains **${fileCount} files**.
+
+## Tech Stack
+- **React Native** + Expo Router
+- **TypeScript** (strict mode)
+- **Zustand** (state management)
+- **Axios** (HTTP client)
+- **AsyncStorage** (local persistence)
+
+## Getting Started
+\`\`\`bash
+npm install
+npx expo start
+\`\`\`
+
+## Project Structure
+\`\`\`
+app/             # Expo Router screens
+src/
+  components/    # Reusable UI components
+  stores/        # Zustand state stores
+  services/      # API service layer
+  types/         # TypeScript interfaces
+  lib/           # Utilities (api client, storage)
+  hooks/         # Custom React hooks
+  theme/         # Design tokens
+\`\`\`
+
+## Notes
+- Review TODOs in generated files for manual implementation items
+- Configure \`src/lib/api.ts\` with your backend URL
+- Update \`.env\` with actual environment variables
+`;
   }
 
   // ── NestJS planner ────────────────────────────────────
@@ -369,6 +667,7 @@ export class ${this.pascal(migration.name)}${Date.now()} implements MigrationInt
   // ── Package.json templates ─────────────────────────────
   private reactPackageJson(name: string): string { return JSON.stringify({ name, version: '0.1.0', private: true, scripts: { dev: 'vite', build: 'tsc && vite build', preview: 'vite preview' }, dependencies: { react: '^18.2.0', 'react-dom': '^18.2.0', 'react-router-dom': '^6.22.0', zustand: '^4.5.0', axios: '^1.6.0', '@tanstack/react-query': '^5.0.0' }, devDependencies: { typescript: '^5.4.0', vite: '^5.0.0', '@vitejs/plugin-react': '^4.0.0', tailwindcss: '^3.4.0', autoprefixer: '^10.4.0', postcss: '^8.4.0', '@types/react': '^18.2.0', '@types/react-dom': '^18.2.0' } }, null, 2); }
   private rnPackageJson(name: string): string { return JSON.stringify({ name, version: '0.1.0', private: true, scripts: { start: 'expo start', android: 'expo run:android', ios: 'expo run:ios' }, dependencies: { expo: '~50.0.0', 'expo-router': '^3.0.0', react: '18.2.0', 'react-native': '0.73.0', '@react-navigation/native': '^6.0.0', zustand: '^4.5.0', axios: '^1.6.0' }, devDependencies: { typescript: '^5.4.0', '@types/react': '^18.2.0', '@types/react-native': '^0.73.0' } }, null, 2); }
+  private rnAppJson(name: string): string { return JSON.stringify({ expo: { name, slug: name.toLowerCase().replace(/\s+/g, '-'), version: '1.0.0', orientation: 'portrait', icon: './assets/icon.png', splash: { image: './assets/splash.png', resizeMode: 'contain', backgroundColor: '#0f172a' }, platforms: ['ios', 'android'], sdkVersion: '50.0.0' } }, null, 2); }
   private nestPackageJson(name: string): string { return JSON.stringify({ name, version: '0.0.1', private: true, scripts: { build: 'nest build', start: 'nest start', 'start:dev': 'nest start --watch', 'start:prod': 'node dist/main' }, dependencies: { '@nestjs/common': '^10.0.0', '@nestjs/core': '^10.0.0', '@nestjs/platform-express': '^10.0.0', '@nestjs/config': '^3.0.0', '@nestjs/jwt': '^10.0.0', '@nestjs/passport': '^10.0.0', '@nestjs/swagger': '^7.0.0', '@nestjs/typeorm': '^10.0.0', typeorm: '^0.3.0', pg: '^8.11.0', 'reflect-metadata': '^0.2.0', rxjs: '^7.8.0', 'class-validator': '^0.14.0', 'class-transformer': '^0.5.0' }, devDependencies: { '@nestjs/cli': '^10.0.0', '@nestjs/schematics': '^10.0.0', '@nestjs/testing': '^10.0.0', typescript: '^5.4.0' } }, null, 2); }
 }
 
@@ -381,6 +680,260 @@ const REACT_APP = `import React from 'react';\nimport { Outlet } from 'react-rou
 const GLOBALS_CSS = `@tailwind base;\n@tailwind components;\n@tailwind utilities;\n:root { --font-sans: 'Inter', system-ui, sans-serif; }\nbody { font-family: var(--font-sans); -webkit-font-smoothing: antialiased; }\n`;
 const API_CLIENT = `import axios from 'axios';\nexport const apiClient = axios.create({ baseURL: import.meta.env['VITE_API_URL'] ?? 'http://localhost:4000/api/v1', headers: { 'Content-Type': 'application/json' } });\napiClient.interceptors.request.use((config) => { const token = localStorage.getItem('cm_token'); if (token) config.headers.Authorization = \`Bearer \${token}\`; return config; });\n`;
 const RN_TSCONFIG = `{"extends":"expo/tsconfig.base","compilerOptions":{"strict":true,"paths":{"@/*":["./src/*"]}}}`;
+const RN_BABEL_CONFIG = `module.exports = function(api) {
+  api.cache(true);
+  return {
+    presets: ['babel-preset-expo'],
+    plugins: ['expo-router/babel'],
+  };
+};
+`;
+const RN_API_CLIENT = `import axios from 'axios';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+
+const BASE_URL = process.env['EXPO_PUBLIC_API_URL'] ?? 'http://localhost:4000/api/v1';
+
+export const apiClient = axios.create({
+  baseURL: BASE_URL,
+  timeout: 10_000,
+  headers: { 'Content-Type': 'application/json' },
+});
+
+apiClient.interceptors.request.use(async (config) => {
+  const token = await AsyncStorage.getItem('auth_token');
+  if (token) config.headers.Authorization = \`Bearer \${token}\`;
+  return config;
+});
+
+apiClient.interceptors.response.use(
+  (res) => res,
+  (err) => Promise.reject(err),
+);
+`;
+const RN_STORAGE = `import AsyncStorage from '@react-native-async-storage/async-storage';
+
+export async function getItem<T>(key: string): Promise<T | null> {
+  try {
+    const val = await AsyncStorage.getItem(key);
+    return val ? JSON.parse(val) as T : null;
+  } catch { return null; }
+}
+
+export async function setItem<T>(key: string, value: T): Promise<void> {
+  await AsyncStorage.setItem(key, JSON.stringify(value));
+}
+
+export async function removeItem(key: string): Promise<void> {
+  await AsyncStorage.removeItem(key);
+}
+`;
+const RN_USE_API_HOOK = `import { useState, useCallback } from 'react';
+
+export function useApi<T, A extends unknown[]>(
+  fn: (...args: A) => Promise<T>
+): { data: T | null; loading: boolean; error: string | null; execute: (...args: A) => Promise<void> } {
+  const [data, setData] = useState<T | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const execute = useCallback(async (...args: A) => {
+    setLoading(true);
+    setError(null);
+    try {
+      const result = await fn(...args);
+      setData(result);
+    } catch (err) {
+      setError((err as Error).message ?? 'An error occurred');
+    } finally {
+      setLoading(false);
+    }
+  }, [fn]);
+
+  return { data, loading, error, execute };
+}
+`;
+const RN_THEME_COLORS = `export const colors = {
+  primary:    '#6366f1',
+  secondary:  '#8b5cf6',
+  background: '#0f172a',
+  surface:    '#1e293b',
+  border:     '#334155',
+  text:       '#f1f5f9',
+  textMuted:  '#94a3b8',
+  success:    '#22c55e',
+  warning:    '#f59e0b',
+  error:      '#ef4444',
+  white:      '#ffffff',
+};
+`;
+const RN_THEME_SPACING = `export const spacing = {
+  xs:  4,
+  sm:  8,
+  md: 16,
+  lg: 24,
+  xl: 32,
+  xxl: 48,
+};
+
+export const borderRadius = {
+  sm:  4,
+  md:  8,
+  lg: 12,
+  xl: 16,
+  full: 9999,
+};
+`;
+const RN_BUTTON_COMPONENT = `import React from 'react';
+import { TouchableOpacity, Text, ActivityIndicator, StyleSheet, type TouchableOpacityProps } from 'react-native';
+import { colors, spacing, borderRadius } from '../../theme';
+
+interface ButtonProps extends TouchableOpacityProps {
+  title: string;
+  variant?: 'primary' | 'secondary' | 'outline';
+  loading?: boolean;
+  size?: 'sm' | 'md' | 'lg';
+}
+
+export function Button({ title, variant = 'primary', loading = false, size = 'md', disabled, ...props }: ButtonProps): React.JSX.Element {
+  return (
+    <TouchableOpacity
+      {...props}
+      disabled={disabled || loading}
+      style={[s.base, s[variant], s[\`size_\${size}\`], (disabled || loading) && s.disabled]}
+    >
+      {loading ? (
+        <ActivityIndicator color={variant === 'outline' ? colors.primary : colors.white} size="small" />
+      ) : (
+        <Text style={[s.text, variant === 'outline' && s.textOutline]}>{title}</Text>
+      )}
+    </TouchableOpacity>
+  );
+}
+
+const s = StyleSheet.create({
+  base:       { borderRadius: borderRadius.md, alignItems: 'center', justifyContent: 'center' },
+  primary:    { backgroundColor: colors.primary },
+  secondary:  { backgroundColor: colors.secondary },
+  outline:    { backgroundColor: 'transparent', borderWidth: 1, borderColor: colors.primary },
+  size_sm:    { paddingVertical: spacing.xs,  paddingHorizontal: spacing.sm },
+  size_md:    { paddingVertical: spacing.sm,  paddingHorizontal: spacing.md },
+  size_lg:    { paddingVertical: spacing.md,  paddingHorizontal: spacing.lg },
+  disabled:   { opacity: 0.5 },
+  text:       { color: colors.white,   fontWeight: '600' },
+  textOutline:{ color: colors.primary, fontWeight: '600' },
+});
+`;
+const RN_TEXT_INPUT_COMPONENT = `import React from 'react';
+import { TextInput as RNTextInput, View, Text, StyleSheet, type TextInputProps } from 'react-native';
+import { colors, spacing, borderRadius } from '../../theme';
+
+interface InputProps extends TextInputProps {
+  label?: string;
+  error?: string;
+}
+
+export function TextInput({ label, error, style, ...props }: InputProps): React.JSX.Element {
+  return (
+    <View style={s.container}>
+      {label ? <Text style={s.label}>{label}</Text> : null}
+      <RNTextInput
+        {...props}
+        style={[s.input, error ? s.inputError : null, style]}
+        placeholderTextColor={colors.textMuted}
+      />
+      {error ? <Text style={s.error}>{error}</Text> : null}
+    </View>
+  );
+}
+
+const s = StyleSheet.create({
+  container: { marginBottom: spacing.sm },
+  label:     { color: colors.text, fontWeight: '500', marginBottom: spacing.xs },
+  input:     { backgroundColor: colors.surface, borderWidth: 1, borderColor: colors.border, borderRadius: borderRadius.md, paddingHorizontal: spacing.md, paddingVertical: spacing.sm, color: colors.text },
+  inputError:{ borderColor: colors.error },
+  error:     { color: colors.error, fontSize: 12, marginTop: spacing.xs },
+});
+`;
+const RN_CARD_COMPONENT = `import React from 'react';
+import { View, StyleSheet, type ViewProps } from 'react-native';
+import { colors, spacing, borderRadius } from '../../theme';
+
+export function Card({ children, style, ...props }: ViewProps): React.JSX.Element {
+  return (
+    <View {...props} style={[s.card, style]}>
+      {children}
+    </View>
+  );
+}
+
+const s = StyleSheet.create({
+  card: {
+    backgroundColor: colors.surface,
+    borderRadius:    borderRadius.lg,
+    padding:         spacing.md,
+    borderWidth:     1,
+    borderColor:     colors.border,
+  },
+});
+`;
+const RN_LOADING_SPINNER = `import React from 'react';
+import { ActivityIndicator, View, StyleSheet } from 'react-native';
+import { colors } from '../../theme';
+
+export function LoadingSpinner({ size = 'large' }: { size?: 'small' | 'large' }): React.JSX.Element {
+  return (
+    <View style={s.container}>
+      <ActivityIndicator size={size} color={colors.primary} />
+    </View>
+  );
+}
+
+const s = StyleSheet.create({
+  container: { flex: 1, alignItems: 'center', justifyContent: 'center' },
+});
+`;
+const RN_ERROR_MESSAGE = `import React from 'react';
+import { View, Text, StyleSheet } from 'react-native';
+import { colors, spacing, borderRadius } from '../../theme';
+
+export function ErrorMessage({ message }: { message: string }): React.JSX.Element {
+  return (
+    <View style={s.container}>
+      <Text style={s.text}>⚠️ {message}</Text>
+    </View>
+  );
+}
+
+const s = StyleSheet.create({
+  container: { backgroundColor: colors.error + '20', borderRadius: borderRadius.md, padding: spacing.md, borderWidth: 1, borderColor: colors.error },
+  text:      { color: colors.error, fontWeight: '500' },
+});
+`;
+const RN_CONSTANTS = `export const APP_NAME   = 'CodeMorph App';
+export const API_URL    = process.env['EXPO_PUBLIC_API_URL'] ?? 'http://localhost:4000/api/v1';
+export const TOKEN_KEY  = 'auth_token';
+export const USER_KEY   = 'auth_user';
+`;
+const RN_TYPES_INDEX = `// Central type exports
+export * from './index';
+
+export interface ApiResponse<T> {
+  data:    T;
+  message: string;
+  success: boolean;
+}
+
+export interface PaginatedResponse<T> {
+  items:   T[];
+  total:   number;
+  page:    number;
+  perPage: number;
+}
+`;
+const RN_ENV_EXAMPLE = `EXPO_PUBLIC_API_URL=http://localhost:4000/api/v1
+EXPO_PUBLIC_APP_NAME=MyApp
+`;
+
 const RN_TAB_LAYOUT = `import { Tabs } from 'expo-router';\nimport React from 'react';\nexport default function TabLayout(): React.JSX.Element { return <Tabs><Tabs.Screen name="index" options={{ title: 'Home' }} /></Tabs>; }\n`;
 const RN_INDEX = `import React from 'react';\nimport { View, Text, StyleSheet } from 'react-native';\nexport default function Home(): React.JSX.Element { return <View style={s.c}><Text style={s.t}>Home</Text></View>; }\nconst s = StyleSheet.create({ c: { flex: 1, alignItems: 'center', justifyContent: 'center' }, t: { fontSize: 24, fontWeight: 'bold' } });\n`;
 const NEST_TSCONFIG = `{"compilerOptions":{"module":"CommonJS","declaration":true,"removeComments":true,"emitDecoratorMetadata":true,"experimentalDecorators":true,"allowSyntheticDefaultImports":true,"target":"ES2021","sourceMap":true,"outDir":"./dist","baseUrl":"./","strict":true,"skipLibCheck":true,"forceConsistentCasingInFileNames":true}}`;
