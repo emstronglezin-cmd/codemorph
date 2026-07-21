@@ -3,14 +3,19 @@
 // ============================================================
 
 export interface IRDocument {
-  projectMeta:    IRProjectMeta;
-  architecture:   IRArchitecture;
-  uiGraph:        IRUIGraph;
-  backendGraph:   IRBackendGraph;
-  dataLayer:      IRDataLayer;
-  dependencyMap:  IRDependencyMap;
-  conversionPlan: IRConversionStep[];
-  validation:     IRValidation;
+  projectMeta:        IRProjectMeta;
+  architecture:       IRArchitecture;
+  uiGraph:            IRUIGraph;
+  backendGraph:       IRBackendGraph;
+  dataLayer:          IRDataLayer;
+  dependencyMap:      IRDependencyMap;
+  conversionPlan:     IRConversionStep[];
+  validation:         IRValidation;
+  // ── PHASE 22: Prompt Maître V2 — enrichissement IR ──────
+  assets?:            IRAssets;
+  permissions?:       IRPermissions;
+  envVars?:           IREnvVar[];
+  externalConnections?: IRExternalConnection[];
 }
 
 export interface IRProjectMeta {
@@ -49,13 +54,23 @@ export interface IRUIGraph {
 }
 
 export interface IRScreen {
-  id:         string;
-  name:       string;
-  path:       string;
-  route?:     string;
-  components: string[];
-  guards?:    string[];
-  params?:    Record<string, string>;
+  id:           string;
+  name:         string;
+  path:         string;
+  route?:       string;
+  components:   string[];
+  guards?:      string[];
+  params?:      Record<string, string>;
+  // ── PHASE 22: Prompt Maître V2 — compréhension métier ──
+  purpose?:     string;             // objectif métier de l'écran
+  businessRole?: string;            // rôle fonctionnel dans l'app
+  dataFields?:  string[];           // données affichées / manipulées
+  businessLogic?: string[];         // règles métier identifiées
+  states?:      string[];           // états UI (loading, error, empty, success…)
+  userEvents?:  string[];           // événements utilisateur (onTap, onChange…)
+  apiCalls?:    string[];           // appels API identifiés
+  validations?: string[];           // règles de validation du formulaire
+  errors?:      string[];           // cas d'erreurs gérés
 }
 
 export interface IRComponent {
@@ -205,6 +220,57 @@ export interface IRValidation {
   warnings?:     string[];
   blockers?:     string[];
   coverage?:     number;
+  // ── PHASE 22: Prompt Maître V2 — métriques source vs généré ──
+  sourceMetrics?: IRSourceMetrics;
+}
+
+// ── PHASE 22: Métriques de fidélité source vs généré ────────────────────────
+export interface IRSourceMetrics {
+  screensCount:   number;
+  modelsCount:    number;
+  servicesCount:  number;
+  endpointsCount: number;
+  storesCount:    number;
+  assetsCount:    number;
+  featuresDetected: string[];
+}
+
+// ── PHASE 22: Enrichissement IR — assets, permissions, env, connexions ──────
+
+export interface IRAssets {
+  images:  IRAsset[];
+  icons:   IRAsset[];
+  fonts:   IRAsset[];
+  other:   IRAsset[];
+}
+
+export interface IRAsset {
+  name:    string;
+  path:    string;
+  type:    string;
+  usedIn?: string[];
+}
+
+export interface IRPermissions {
+  android?: string[];
+  ios?:     string[];
+  web?:     string[];
+}
+
+export interface IREnvVar {
+  key:          string;
+  description:  string;
+  required:     boolean;
+  defaultValue?: string;
+  example?:     string;
+}
+
+export interface IRExternalConnection {
+  name:     string;
+  type:     'rest-api' | 'graphql' | 'websocket' | 'grpc' | 'firebase' | 'supabase' | 'appwrite' | 'database' | 'storage' | 'auth' | 'push-notification' | 'analytics' | 'other';
+  url?:     string;
+  authType?: 'bearer' | 'api-key' | 'oauth2' | 'none';
+  methods?: string[];
 }
 
 // ── Conversion context passed through pipeline ──────────
