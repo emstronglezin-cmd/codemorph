@@ -3,6 +3,8 @@
 // Analyzes source code structure using AI + static analysis
 // PHASE 22: Prompt Maître V2 — extraction complète
 // Détecte: Bloc/Cubit/Riverpod/GetX/MobX/Firebase/Supabase/GraphQL/WebSocket/gRPC/OAuth/JWT
+// PHASE 23: Prompt Architecte Ultime V3 — Phase 1 extraction totale
+// Extrait également: README, Docker, CI/CD, tests, scripts, configs
 // ============================================================
 import OpenAI from 'openai';
 import { appConfig } from '../config/app.config';
@@ -27,6 +29,13 @@ export interface ASTResult {
   apiPatterns:    string[];   // REST/GraphQL/WebSocket/gRPC detected endpoints
   assetFiles:     string[];   // images, icons, fonts detected
   envVarKeys:     string[];   // env variable keys detected in code
+  // ── PHASE 23: Extraction totale Phase 1 ─────────────
+  projectDocs:    ASTProjectDoc[];   // README, docs, markdown files
+  cicdConfigs:    ASTCIConfig[];     // Docker, CI/CD (GitHub Actions, GitLab, CircleCI…)
+  testFiles:      ASTFile[];         // test/spec files
+  configFiles:    ASTConfigFile[];   // .env.example, package.json, pubspec.yaml, etc.
+  scripts:        ASTScript[];       // scripts détectés (Makefile, shell scripts, npm scripts)
+  dependencies:   ASTDependency[];   // dépendances parsées (npm, pub, pip, cargo…)
 }
 
 export interface ASTFile {
@@ -51,6 +60,47 @@ export interface FunctionSignature {
   returnType: string;
   async:      boolean;
   file:       string;
+}
+
+// ── PHASE 23: Nouveaux types pour extraction totale Phase 1 ─────────────────
+
+/** Fichier de documentation (README, CHANGELOG, docs, wiki) */
+export interface ASTProjectDoc {
+  path:    string;
+  content: string;
+  type:    'readme' | 'changelog' | 'docs' | 'license' | 'contributing' | 'other';
+}
+
+/** Fichier CI/CD et Docker */
+export interface ASTCIConfig {
+  path:     string;
+  content:  string;
+  platform: 'docker' | 'docker-compose' | 'github-actions' | 'gitlab-ci' | 'circleci' | 'travis' | 'bitbucket' | 'makefile' | 'other';
+  services?: string[];    // services Docker/CI détectés
+  envVars?:  string[];    // variables d'environnement référencées
+}
+
+/** Fichier de configuration projet */
+export interface ASTConfigFile {
+  path:    string;
+  content: string;
+  type:    'package-json' | 'pubspec' | 'requirements-txt' | 'cargo-toml' | 'pom-xml' | 'build-gradle' | 'env-example' | 'tsconfig' | 'eslint' | 'prettier' | 'other';
+  keys?:   string[];      // clés de configuration détectées
+}
+
+/** Script projet (npm script, Makefile target, shell script) */
+export interface ASTScript {
+  name:     string;       // nom du script (ex. "build", "test", "start")
+  command:  string;       // commande (ex. "vite build")
+  source:   string;       // fichier source (ex. "package.json", "Makefile")
+}
+
+/** Dépendance projet */
+export interface ASTDependency {
+  name:      string;      // ex. "flutter", "react", "express"
+  version?:  string;      // ex. "^18.0.0"
+  type:      'runtime' | 'dev' | 'peer' | 'optional';
+  manager:   'npm' | 'pub' | 'pip' | 'cargo' | 'maven' | 'gradle' | 'other';
 }
 
 export class ASTAnalyzer {
@@ -95,7 +145,21 @@ export class ASTAnalyzer {
     const assetFiles       = this.detectAssetFiles(files);
     const envVarKeys       = this.detectEnvVars(files);
 
+    // ── PHASE 23: Extraction totale Phase 1 ──────────────────
+    const allFiles         = this.parseAllVirtualFiles(sourceCode);
+    const projectDocs      = this.extractProjectDocs(allFiles);
+    const cicdConfigs      = this.extractCICDConfigs(allFiles);
+    const testFiles        = this.extractTestFiles(allFiles);
+    const configFiles      = this.extractConfigFiles(allFiles);
+    const scripts          = this.extractScripts(allFiles);
+    const dependencies     = this.extractDependencies(allFiles);
+
+    // Compléter les envVarKeys depuis les configs CI/CD
+    const ciEnvVars = cicdConfigs.flatMap((c) => c.envVars ?? []);
+    const allEnvVarKeys = [...new Set([...envVarKeys, ...ciEnvVars])];
+
     console.log(`[AST] Phase22 patterns — state=[${statePatterns.join(',')}] ext=[${externalServices.join(',')}] auth=[${authPatterns.join(',')}] nav=${navigationPattern}`);
+    console.log(`[AST] Phase23 extraction — docs=${projectDocs.length} cicd=${cicdConfigs.length} tests=${testFiles.length} configs=${configFiles.length} scripts=${scripts.length} deps=${dependencies.length}`);
     console.log(`[AST] analyze() DONE — files=${files.length} classes=${aiAnalysis.classNames.length} functions=${aiAnalysis.functions.length} tokensUsed=${aiAnalysis.tokensUsed}`);
 
     return {
@@ -116,7 +180,14 @@ export class ASTAnalyzer {
       navigationPattern,
       apiPatterns,
       assetFiles,
-      envVarKeys,
+      envVarKeys: allEnvVarKeys,
+      // ── PHASE 23 ──
+      projectDocs,
+      cicdConfigs,
+      testFiles,
+      configFiles,
+      scripts,
+      dependencies,
     };
   }
 
@@ -180,6 +251,221 @@ export class ASTAnalyzer {
     }
 
     return files;
+  }
+
+  // ── PHASE 23: parseAllVirtualFiles — Version exhaustive (sans filtrage) ──────
+  // Contrairement à parseVirtualFiles qui ne parse que le code source,
+  // cette méthode parse TOUS les fichiers : README, Docker, CI/CD, tests, configs
+  private parseAllVirtualFiles(sourceCode: string): ASTFile[] {
+    const filePattern = /\/\/\s*(?:=+\s*)?FILE:\s*(.+?)(?:\s*=+)?\n([\s\S]*?)(?=\/\/\s*(?:=+\s*)?FILE:|$)/g;
+    const files: ASTFile[] = [];
+    let match: RegExpExecArray | null;
+
+    while ((match = filePattern.exec(sourceCode)) !== null) {
+      const path    = (match[1] ?? '').trim();
+      const content = (match[2] ?? '').trim();
+      if (!path || !content) continue;
+      const lang = this.langFromPath(path);
+      files.push({
+        path, content, language: lang,
+        imports:   this.extractImports(content, lang),
+        exports:   this.extractExports(content, lang),
+        classes:   this.extractClasses(content),
+        functions: this.extractFunctions(content),
+        lines:     content.split('\n').length,
+      });
+    }
+
+    if (files.length === 0) {
+      // Single-file mode — wrapped in one entry
+      const lang = this.detectLanguage(sourceCode, '');
+      files.push({
+        path: `main.${lang}`, content: sourceCode, language: lang,
+        imports: this.extractImports(sourceCode, lang),
+        exports: this.extractExports(sourceCode, lang),
+        classes: this.extractClasses(sourceCode),
+        functions: this.extractFunctions(sourceCode),
+        lines: sourceCode.split('\n').length,
+      });
+    }
+
+    return files;
+  }
+
+  // ── PHASE 23: Extracteurs Phase 1 totale ─────────────────────────────────
+
+  /** Extraire les fichiers de documentation */
+  private extractProjectDocs(files: ASTFile[]): ASTProjectDoc[] {
+    return files
+      .filter((f) => /readme|changelog|license|contributing|authors|history/i.test(f.path) && /\.(md|txt|rst|adoc)$/i.test(f.path))
+      .map((f) => {
+        const type = /readme/i.test(f.path)       ? 'readme'
+          : /changelog/i.test(f.path)             ? 'changelog'
+          : /license/i.test(f.path)               ? 'license'
+          : /contributing/i.test(f.path)          ? 'contributing'
+          : /docs?\//i.test(f.path)               ? 'docs'
+          : 'other';
+        return { path: f.path, content: f.content.slice(0, 3000), type } as ASTProjectDoc;
+      });
+  }
+
+  /** Extraire les fichiers CI/CD et Docker */
+  private extractCICDConfigs(files: ASTFile[]): ASTCIConfig[] {
+    return files
+      .filter((f) =>
+        /dockerfile|docker-compose|\.github\/workflows|\.gitlab-ci|\.circleci|\.travis|bitbucket-pipelines|makefile/i.test(f.path)
+      )
+      .map((f) => {
+        const platform: ASTCIConfig['platform'] =
+          /dockerfile$/i.test(f.path)           ? 'docker'
+          : /docker-compose/i.test(f.path)      ? 'docker-compose'
+          : /github\/workflows/i.test(f.path)   ? 'github-actions'
+          : /gitlab-ci/i.test(f.path)           ? 'gitlab-ci'
+          : /circleci/i.test(f.path)            ? 'circleci'
+          : /travis/i.test(f.path)              ? 'travis'
+          : /bitbucket/i.test(f.path)           ? 'bitbucket'
+          : /makefile/i.test(f.path)            ? 'makefile'
+          : 'other';
+
+        // Extraire les services Docker
+        const services: string[] = [];
+        const serviceMatches = f.content.matchAll(/^  ([a-z][a-z0-9_-]+):\s*$/gm);
+        for (const m of serviceMatches) { if (m[1]) services.push(m[1]); }
+
+        // Extraire les env vars depuis CI/CD
+        const envVars: string[] = [];
+        const envMatches = f.content.matchAll(/\$\{?([A-Z][A-Z0-9_]+)\}?/g);
+        for (const m of envMatches) { if (m[1]) envVars.push(m[1]); }
+
+        return {
+          path: f.path,
+          content: f.content.slice(0, 2000),
+          platform,
+          ...(services.length > 0 ? { services: [...new Set(services)] } : {}),
+          ...(envVars.length  > 0 ? { envVars:  [...new Set(envVars)]  } : {}),
+        };
+      });
+  }
+
+  /** Extraire les fichiers de test */
+  private extractTestFiles(files: ASTFile[]): ASTFile[] {
+    return files.filter((f) =>
+      /\.(test|spec)\.(ts|js|dart|py|rb|java|go)$/i.test(f.path) ||
+      /\/(test|tests|__tests__|spec|specs)\//i.test(f.path)
+    );
+  }
+
+  /** Extraire les fichiers de configuration */
+  private extractConfigFiles(files: ASTFile[]): ASTConfigFile[] {
+    return files
+      .filter((f) =>
+        /package\.json$|pubspec\.yaml$|requirements\.txt$|cargo\.toml$|pom\.xml$|build\.gradle$|\.env\.example$|tsconfig.*\.json$|\.eslintrc|\.prettierrc/i.test(f.path)
+      )
+      .map((f) => {
+        const type: ASTConfigFile['type'] =
+          /package\.json$/.test(f.path)         ? 'package-json'
+          : /pubspec/.test(f.path)              ? 'pubspec'
+          : /requirements\.txt/.test(f.path)   ? 'requirements-txt'
+          : /cargo\.toml/i.test(f.path)        ? 'cargo-toml'
+          : /pom\.xml/i.test(f.path)           ? 'pom-xml'
+          : /build\.gradle/i.test(f.path)      ? 'build-gradle'
+          : /\.env/i.test(f.path)              ? 'env-example'
+          : /tsconfig/i.test(f.path)           ? 'tsconfig'
+          : /eslint/i.test(f.path)             ? 'eslint'
+          : /prettier/i.test(f.path)           ? 'prettier'
+          : 'other';
+
+        // Extraire les clés de premier niveau (JSON)
+        const keys: string[] = [];
+        try {
+          const parsed = JSON.parse(f.content) as Record<string, unknown>;
+          keys.push(...Object.keys(parsed).slice(0, 20));
+        } catch { /* non-JSON config */ }
+
+        return { path: f.path, content: f.content.slice(0, 2000), type, ...(keys.length > 0 ? { keys } : {}) };
+      });
+  }
+
+  /** Extraire les scripts depuis package.json, Makefile, etc. */
+  private extractScripts(files: ASTFile[]): ASTScript[] {
+    const scripts: ASTScript[] = [];
+
+    for (const f of files) {
+      // npm scripts depuis package.json
+      if (/package\.json$/.test(f.path)) {
+        try {
+          const pkg = JSON.parse(f.content) as { scripts?: Record<string, string> };
+          const npmScripts = pkg.scripts ?? {};
+          for (const [name, cmd] of Object.entries(npmScripts)) {
+            scripts.push({ name, command: cmd, source: f.path });
+          }
+        } catch { /* skip malformed */ }
+      }
+
+      // Makefile targets
+      if (/makefile/i.test(f.path)) {
+        const makeTargets = f.content.matchAll(/^([a-z][a-z0-9_-]+):/gm);
+        for (const m of makeTargets) {
+          if (m[1] && !['PHONY', 'all'].includes(m[1])) {
+            scripts.push({ name: m[1], command: `make ${m[1]}`, source: f.path });
+          }
+        }
+      }
+
+      // pubspec scripts (Flutter)
+      if (/pubspec\.yaml$/.test(f.path) && /^flutter:/m.test(f.content)) {
+        scripts.push({ name: 'flutter run', command: 'flutter run', source: f.path });
+        scripts.push({ name: 'flutter build', command: 'flutter build apk', source: f.path });
+      }
+    }
+
+    return scripts.slice(0, 30);
+  }
+
+  /** Extraire les dépendances depuis package.json, pubspec.yaml, requirements.txt */
+  private extractDependencies(files: ASTFile[]): ASTDependency[] {
+    const deps: ASTDependency[] = [];
+
+    for (const f of files) {
+      // npm dependencies
+      if (/package\.json$/.test(f.path)) {
+        try {
+          const pkg = JSON.parse(f.content) as {
+            dependencies?: Record<string, string>;
+            devDependencies?: Record<string, string>;
+            peerDependencies?: Record<string, string>;
+          };
+          for (const [name, version] of Object.entries(pkg.dependencies ?? {})) {
+            deps.push({ name, version, type: 'runtime', manager: 'npm' });
+          }
+          for (const [name, version] of Object.entries(pkg.devDependencies ?? {})) {
+            deps.push({ name, version, type: 'dev', manager: 'npm' });
+          }
+          for (const [name, version] of Object.entries(pkg.peerDependencies ?? {})) {
+            deps.push({ name, version, type: 'peer', manager: 'npm' });
+          }
+        } catch { /* skip */ }
+      }
+
+      // Flutter/Dart pubspec.yaml
+      if (/pubspec\.yaml$/.test(f.path)) {
+        const depSection = f.content.matchAll(/^\s{2}([a-z][a-z0-9_-]+):\s*(\^?[\d.]+|\s*$)/gm);
+        for (const m of depSection) {
+          if (m[1]) { const v = m[2]?.trim(); deps.push({ name: m[1], type: 'runtime', manager: 'pub', ...(v ? { version: v } : {}) }); }
+        }
+      }
+
+      // Python requirements.txt
+      if (/requirements.*\.txt$/i.test(f.path)) {
+        const lines = f.content.split('\n').filter((l) => l.trim() && !l.startsWith('#'));
+        for (const line of lines) {
+          const [name, version] = line.split(/[>=<!/]+/);
+          if (name?.trim()) { const v2 = version?.trim(); deps.push({ name: name.trim(), type: 'runtime', manager: 'pip', ...(v2 ? { version: v2 } : {}) }); }
+        }
+      }
+    }
+
+    return deps.slice(0, 100);
   }
 
   private buildImportGraph(files: ASTFile[]): ImportGraph {

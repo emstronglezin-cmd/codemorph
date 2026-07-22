@@ -3,9 +3,10 @@
 // Transforms IR into a concrete file generation plan
 // AI outputs IR → backend generates actual code files
 // Uses AIProvider — supports Free (Groq), Platform (OpenAI), Pro (user key)
+// PHASE 23: Prompt Architecte Ultime V3 — fidélité visuelle Phase 6, prompts V3
 // ============================================================
 import { AIProvider } from './ai-provider';
-import type { ConversionContext, IRDocument, GeneratedFile, ConversionSummary } from '../models/ir.types';
+import type { ConversionContext, IRDocument, GeneratedFile, ConversionSummary, IRDesignTokens } from '../models/ir.types';
 
 export interface CodePlan {
   files:   GeneratedFile[];
@@ -519,43 +520,97 @@ src/
     return { files, summary: this.buildSummary(files, ir) };
   }
 
-  // ── AI-powered file generators — PHASE 22: Prompt Maître V2 ──────────────
+  // ── AI-powered file generators — PHASE 23: Prompt Architecte Ultime V3 ────
+  // Phase 5 : Reconstruction complète avec fidélité fonctionnelle absolue
+  // Phase 6 : Fidélité visuelle — design tokens injectés dans les prompts
   private async generateScreenFile(ctx: ConversionContext, ir: IRDocument, name: string, components: string[], framework: string): Promise<string> {
     if (this.ai.getTier() === 'static') return this.fallbackScreen(name, framework);
 
     // PHASE 22: Extraire les données métier de l'écran depuis l'IR
-    const screenData = ir.uiGraph?.screens?.find((s) => s.name === name) as Record<string, unknown> | undefined;
-    const purpose    = (screenData?.['purpose'] as string | undefined) ?? '';
-    const bizLogic   = ((screenData?.['businessLogic'] as string[] | undefined) ?? []).join(', ');
-    const apiCalls   = ((screenData?.['apiCalls'] as string[] | undefined) ?? []).join(', ');
-    const states     = ((screenData?.['states'] as string[] | undefined) ?? []).join(', ');
+    const screenData  = ir.uiGraph?.screens?.find((s) => s.name === name) as Record<string, unknown> | undefined;
+    const purpose     = (screenData?.['purpose']       as string   | undefined) ?? '';
+    const bizLogic    = ((screenData?.['businessLogic'] as string[] | undefined) ?? []).join(', ');
+    const apiCalls    = ((screenData?.['apiCalls']      as string[] | undefined) ?? []).join(', ');
+    const states      = ((screenData?.['states']        as string[] | undefined) ?? []).join(', ');
+    const userEvents  = ((screenData?.['userEvents']    as string[] | undefined) ?? []).join(', ');
+    const validations = ((screenData?.['validations']   as string[] | undefined) ?? []).join(', ');
+    const errors      = ((screenData?.['errors']        as string[] | undefined) ?? []).join(', ');
+    const dataFields  = ((screenData?.['dataFields']    as string[] | undefined) ?? []).join(', ');
+
+    // PHASE 23: Design tokens pour fidélité visuelle (Phase 6)
+    const designTokens: IRDesignTokens | undefined = ir.designTokens;
+    const themeBlock = designTokens ? this.buildThemeContext(designTokens) : '';
+
+    // PHASE 23: Knowledge Graph — liens de cet écran
+    const kgNodes = ir.knowledgeGraph?.nodes ?? [];
+    const kgEdges = ir.knowledgeGraph?.edges ?? [];
+    const screenNodeId = `screen-${name.toLowerCase()}`;
+    const relatedStores = kgEdges
+      .filter((e) => e.from === screenNodeId && e.relation === 'uses-store')
+      .map((e) => kgNodes.find((n) => n.id === e.to)?.name ?? e.to);
+    const relatedApis = kgEdges
+      .filter((e) => e.from === screenNodeId && e.relation === 'calls-api')
+      .map((e) => kgNodes.find((n) => n.id === e.to)?.name ?? e.to);
+    const relatedRules = kgEdges
+      .filter((e) => e.from === screenNodeId && e.relation === 'enforces-rule')
+      .map((e) => kgNodes.find((n) => n.id === e.to)?.name ?? e.to);
 
     const ctxLines = [
-      purpose  ? `Screen purpose: ${purpose}` : '',
-      bizLogic ? `Business logic: ${bizLogic}` : '',
-      apiCalls ? `API calls: ${apiCalls}` : '',
-      states   ? `UI states (handle all): ${states}` : '',
-      components.length ? `Sub-components to use: ${components.join(', ')}` : '',
+      purpose      ? `Screen purpose: ${purpose}`                                      : '',
+      bizLogic     ? `Business logic: ${bizLogic}`                                     : '',
+      dataFields   ? `Data to display: ${dataFields}`                                  : '',
+      apiCalls     ? `API calls: ${apiCalls}`                                          : '',
+      states       ? `UI states (implement ALL): ${states}`                            : '',
+      userEvents   ? `User events (handle ALL): ${userEvents}`                        : '',
+      validations  ? `Validations to enforce: ${validations}`                          : '',
+      errors       ? `Error cases to handle: ${errors}`                                : '',
+      components.length    ? `Sub-components: ${components.join(', ')}`               : '',
+      relatedStores.length ? `State stores used: ${relatedStores.join(', ')}`         : '',
+      relatedApis.length   ? `API endpoints (Knowledge Graph): ${relatedApis.join(', ')}` : '',
+      relatedRules.length  ? `Business rules (enforce them): ${relatedRules.join(', ')}` : '',
+      themeBlock           ? `Visual design tokens:\n${themeBlock}`                   : '',
     ].filter(Boolean).join('\n');
 
-    const systemPrompt = `You are a senior ${framework === 'react' ? 'React' : 'React Native'} engineer.
-Generate production-ready TypeScript code. Never use placeholders or TODOs.
-Always implement real loading/error/success states and real API calls.`;
+    // PHASE 23: System Prompt Architecte Ultime V3
+    const systemPrompt = `You are an AI Software Architect specialized in software reconstruction and multi-framework migration.
+
+PHASE 5 — COMPLETE RECONSTRUCTION:
+Generate production-ready ${framework === 'react' ? 'React + TypeScript + TailwindCSS' : 'React Native (Expo Router) + TypeScript'} code.
+Reproduce IDENTICAL behavior from the source application.
+
+PHASE 6 — VISUAL FIDELITY:
+If design tokens are provided, USE THEM EXACTLY:
+- Apply the exact color values for primary/background/text tokens
+- Apply typography tokens (font sizes, font families, weights)
+- Apply spacing tokens for padding/margin consistency
+- The visual result must be immediately recognizable as the same screen
+
+ABSOLUTE RULES:
+- NEVER use placeholders (HomeScreen, DetailsScreen, TODO, Lorem Ipsum, placeholder text)
+- NEVER invent functionality not in the context
+- ALWAYS implement ALL stated UI states (loading, error, empty, success)
+- ALWAYS implement ALL user events and validations
+- ALWAYS implement ALL business logic rules and error cases
+- Return ONLY the complete TypeScript file content — no markdown fences`;
 
     const userPrompt = `Generate a complete ${framework === 'react' ? 'React + TypeScript + TailwindCSS' : 'React Native (Expo Router) + TypeScript'} screen named "${name}".
-${ctxLines ? `\nContext:\n${ctxLines}` : ''}
+
+${ctxLines ? `CONTEXT (from source application analysis):\n${ctxLines}` : ''}
+
 Source: ${ctx.sourceFramework} | Target: ${ctx.targetFramework}
-Requirements: TypeScript strict, real API calls, proper error handling, no TODO, no placeholder text.
-Return ONLY the complete file content, no markdown fences.`;
+
+Requirements: TypeScript strict, all UI states, real API calls via apiClient from '${framework === 'react' ? '../lib/api' : '../src/lib/api'}', proper error handling, no TODO, no placeholder.
+
+Return ONLY the complete file content.`;
 
     try {
       const res = await this.ai.chat(
         [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }],
-        1400,
+        1600,
       );
       const generated = res.content || '';
-      // PHASE 22: Rejeter le contenu interdit
-      if (/HomeScreen|DetailsScreen|\bPlaceholder\b|CodeMorph App|TODO:/i.test(generated)) {
+      // PHASE 22+23: Rejeter tout contenu interdit — placeholders et noms génériques
+      if (/HomeScreen|DetailsScreen|\bPlaceholder\b|CodeMorph App|TODO:|Lorem ipsum/i.test(generated)) {
         console.warn(`[CodePlanner] generateScreenFile: forbidden placeholder detected for ${name} — using structured fallback`);
         return this.fallbackScreen(name, framework);
       }
@@ -565,12 +620,38 @@ Return ONLY the complete file content, no markdown fences.`;
     }
   }
 
+  // ── PHASE 23: Construire le bloc de contexte design tokens pour les prompts ─
+  private buildThemeContext(tokens: IRDesignTokens): string {
+    const lines: string[] = [];
+    if (tokens.colors?.length) {
+      lines.push(`Colors: ${tokens.colors.slice(0, 8).map((c) => `${c.name}=${c.value}`).join(', ')}`);
+    }
+    if (tokens.palette && Object.keys(tokens.palette).length > 0) {
+      lines.push(`Palette: ${Object.entries(tokens.palette).slice(0, 8).map(([k, v]) => `${k}:${v}`).join(', ')}`);
+    }
+    if (tokens.typography?.length) {
+      lines.push(`Typography: ${tokens.typography.slice(0, 5).map((t) => {
+        const parts = [t.fontFamily, t.fontSize ? `${t.fontSize}px` : '', t.fontWeight ? `w=${t.fontWeight}` : ''].filter(Boolean).join('/');
+        return `${t.name}=${parts}`;
+      }).join(', ')}`);
+    }
+    if (tokens.spacing?.length) {
+      lines.push(`Spacing: ${tokens.spacing.slice(0, 6).map((s) => `${s.name}=${s.value}px`).join(', ')}`);
+    }
+    return lines.join('\n');
+  }
+
   private async generateComponentFile(_ctx: ConversionContext, name: string, props: Array<{ name: string; type: string; required: boolean }>, framework: string): Promise<string> {
     if (this.ai.getTier() === 'static') return this.fallbackComponent(name);
     const propTypes = props.map((p) => `${p.name}${p.required ? '' : '?'}: ${p.type}`).join('; ');
-    const prompt = `Generate a ${framework === 'react' ? 'React + TypeScript + TailwindCSS' : 'React Native + TypeScript'} UI component "${name}".\nProps: { ${propTypes} }\nRequirements: TypeScript strict, accessible. Return ONLY the file content.`;
+    // PHASE 23: Prompt V3 pour les composants — vraies props + events depuis l'IR
+    const systemPrompt = `You are an AI Software Architect. Generate production-ready ${framework === 'react' ? 'React + TypeScript + TailwindCSS' : 'React Native + TypeScript'} UI components. NEVER use placeholders or TODOs. Return ONLY the complete file content.`;
+    const prompt = `Generate a ${framework === 'react' ? 'React + TypeScript + TailwindCSS' : 'React Native + TypeScript'} UI component named "${name}".
+Props interface: { ${propTypes || 'children?: React.ReactNode'} }
+Requirements: TypeScript strict, accessible, no TODO, no placeholder.
+Return ONLY the complete file content.`;
     try {
-      const res = await this.ai.chat([{ role: 'user', content: prompt }], 800);
+      const res = await this.ai.chat([{ role: 'system', content: systemPrompt }, { role: 'user', content: prompt }], 900);
       return res.content || this.fallbackComponent(name);
     } catch {
       return this.fallbackComponent(name);

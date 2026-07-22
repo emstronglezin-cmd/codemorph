@@ -3,9 +3,15 @@
 // AI outputs IR ONLY — never final code directly
 // Uses AIProvider — supports Free (Groq), Platform (OpenAI), Pro (user key)
 // PHASE 22: Prompt Maître V2 — system prompts enrichis, extraction métier complète
+// PHASE 23: Prompt Architecte Ultime V3 — Knowledge Graph + Design Tokens
 // ============================================================
 import { AIProvider }  from './ai-provider';
-import type { ConversionContext, IRDocument, IRSourceMetrics } from '../models/ir.types';
+import type {
+  ConversionContext, IRDocument, IRSourceMetrics,
+  IRKnowledgeGraph, IRKnowledgeNode, IRKnowledgeEdge,
+  IRKnowledgeNodeType, IRKnowledgeEdgeRelation,
+  IRDesignTokens, IRColorToken, IRTypographyToken, IRSpacingToken,
+} from '../models/ir.types';
 import type { ASTResult }  from './ast-analyzer';
 import type { ArchResult } from './architecture-detector';
 
@@ -104,6 +110,10 @@ export class IRGenerator {
     const irEnvVars = ast.envVarKeys?.length > 0 ? this.buildEnvVars(ast) : undefined;
     const irExtConnections = ast.externalServices?.length > 0 ? this.buildExternalConnections(ast) : undefined;
 
+    // ── PHASE 23: Knowledge Graph (Phase 3) + Design Tokens (Phase 6) ────────
+    const knowledgeGraph = this.buildKnowledgeGraph(uiGraph.data, backendGraph.data, dataLayer.data, ast);
+    const designTokens   = this.extractDesignTokens(ast);
+
     const ir: IRDocument = {
       projectMeta:   this.buildProjectMeta(ctx, ast, arch),
       architecture:  this.buildArchitecture(arch),
@@ -120,8 +130,12 @@ export class IRGenerator {
       ...(irAssets        ? { assets: irAssets }                       : {}),
       ...(irEnvVars       ? { envVars: irEnvVars }                     : {}),
       ...(irExtConnections ? { externalConnections: irExtConnections } : {}),
+      // ── PHASE 23: Knowledge Graph + Design Tokens ───────────────────────────
+      knowledgeGraph,
+      ...(designTokens ? { designTokens } : {}),
     };
 
+    console.log(`[IRGenerator] Phase 23 — knowledgeGraph: nodes=${knowledgeGraph.nodes.length} edges=${knowledgeGraph.edges.length}`);
     return { ir, tokensUsed: totalTokens };
   }
 
@@ -356,29 +370,67 @@ export class IRGenerator {
 
   // ── AI-powered graph generators ────────────────────────────────────────────
 
-  // ── PHASE 22: Prompt Maître V2 system prompt ──────────────────────────────
-  // Injecté comme message SYSTEM dans tous les appels AI de génération IR
-  // Force l'extraction de logique métier réelle — jamais de placeholders
-  private readonly MASTER_SYSTEM_PROMPT = `You are a senior software engineer specialized in reverse engineering, software architecture, and multi-framework migration.
+  // ── PHASE 23: Prompt Architecte Ultime V3 ───────────────────────────────
+  // Superset du Prompt Maître V2 — 8 phases complètes
+  // Injecté comme message SYSTEM dans tous les appels AI
+  private readonly MASTER_SYSTEM_PROMPT = `You are an AI Software Architect specialized in Reverse Engineering, Software Reconstruction, and Multi-Framework Migration.
 
-YOUR MISSION: Do NOT translate code line by line. Understand the application completely and extract all business knowledge.
+YOUR MISSION:
+You are NOT a code translator. You are a reconstruction architect.
+Your goal is to fully understand an application and rebuild it faithfully in a new technology stack.
+The result must feel like the application was always built in the target technology.
 
-RULES:
-1. NEVER return placeholder content (HomeScreen, DetailsScreen, TODO, placeholder, example data)
-2. NEVER invent functionality that doesn't exist in the source
-3. NEVER remove screens or features from the source
-4. ALWAYS extract real screen names, real API endpoints, real business logic
-5. ALWAYS preserve navigation flows, authentication patterns, data models
-6. If unsure about a value, use the actual file name / class name from source — never invent a generic name
+YOUR 8-PHASE PROCESS:
 
-For each screen you find, identify:
-- Its exact name from the source code
-- Its business purpose (what it does for the user)
-- Data it displays or manipulates
-- User events it handles
-- API calls it makes
+PHASE 1 — TOTAL EXTRACTION:
+Analyze ALL artifacts: source code, widgets, models, stores, services, repositories, routes, middlewares, hooks, providers, blocs, cubits, Riverpod, Redux, Zustand, MobX, GetX, Firebase, Supabase, Appwrite, REST, GraphQL, WebSocket, gRPC, SQLite, Hive, Drift, Prisma, TypeORM, Auth, OAuth, JWT, Notifications, Assets, README, Docker, CI/CD, Tests.
+Also detect: API endpoints, URLs, environment variable names, external configs, dependencies, data schemas, permissions, navigation, assets.
 
-Return ONLY valid JSON. No markdown, no explanation, no code blocks.`;
+PHASE 2 — BUSINESS UNDERSTANDING:
+For each screen: purpose, business role, user actions, displayed data, business rules, validations, errors, API calls, models, stores used.
+For each service: endpoints, HTTP methods, auth, models, cache, pagination.
+For each model: structure, relations, constraints.
+For each store: state shape, actions, mutations, business logic.
+
+PHASE 3 — KNOWLEDGE GRAPH:
+Link all artifacts: Screens ↔ Navigation ↔ Stores ↔ Services ↔ Repositories ↔ API ↔ Models ↔ Assets ↔ EnvVars ↔ ExternalConnections ↔ BusinessRules.
+
+PHASE 4 — IR GENERATION:
+Transform the knowledge graph into a structured document: architecture, modules, navigation, business logic, components, models, stores, services, endpoints, dependencies, assets, permissions, configurations.
+
+PHASE 5 — COMPLETE RECONSTRUCTION:
+Generate code that reproduces IDENTICAL behavior in the target stack.
+Preserve: all features, all business logic, all user flows, all navigation, all API calls, all endpoints, all env vars, all connections, all auth, all models, all stores, all repositories, all services, all assets, all permissions, all workflows, all business rules, all calculations, all validations, all error handling, all offline logic, all sync, all notifications, all uploads, all downloads, all animations, all interactions.
+
+PHASE 6 — VISUAL FIDELITY:
+Reproduce: screen hierarchy, general layout, navigation, main colors, typography, icons, spacing, animations, components, user experience.
+The new app must be immediately recognizable as the same application.
+
+PHASE 7 — VALIDATION:
+Compare source vs generated: screens, navigation, models, stores, services, endpoints, business rules, components, assets, visual fidelity, business logic.
+Calculate fidelity score per axis (0-100): BusinessLogic, Navigation, API, Stores, UIFidelity, Overall.
+
+PHASE 8 — AUTO-CORRECTION:
+Identify all losses. Regenerate missing parts. Revalidate. Recalculate score. Continue until best fidelity.
+
+ABSOLUTE RULES:
+FORBIDDEN:
+- Generating placeholders
+- Generating empty HomeScreen, DetailsScreen, or CodeMorph App
+- Inventing screens that do not exist in the source
+- Removing features
+- Replacing real APIs with fake data
+- Replacing business logic with examples
+
+MANDATORY:
+- Preserve ALL business logic
+- Preserve ALL user flows
+- Preserve navigation, models, stores, services, endpoints, assets
+- Preserve all technical configuration references needed by the app
+- Replace secrets (API keys, passwords, tokens, certificates) with clearly documented environment variables — NEVER hardcode secrets
+- If unsure about a value, use the actual file/class name from source — never invent a generic name
+
+Return ONLY valid JSON. No markdown. No explanation. No code blocks.`;
 
   private async generateUIGraph(
     ctx: ConversionContext, ast: ASTResult, _arch: ArchResult, maxTokens: number,
@@ -543,6 +595,238 @@ Return ONLY valid JSON.`;
       return { data: { keep: [], replace: [], remove: [], add: [] }, tokens: 0 };
     }
   }
+  // ── PHASE 23: Knowledge Graph builder (Phase 3) ──────────────────────────
+  private buildKnowledgeGraph(
+    uiGraph:      IRDocument['uiGraph'],
+    backendGraph: IRDocument['backendGraph'],
+    dataLayer:    IRDocument['dataLayer'],
+    ast:          ASTResult,
+  ): IRKnowledgeGraph {
+    const nodes: IRKnowledgeNode[] = [];
+    const edges: IRKnowledgeEdge[] = [];
+
+    const addNode = (id: string, type: IRKnowledgeNodeType, name: string, path?: string, metadata?: Record<string, unknown>) => {
+      if (!nodes.find((n) => n.id === id)) {
+        nodes.push({ id, type, name, ...(path ? { path } : {}), ...(metadata ? { metadata } : {}) });
+      }
+    };
+    const addEdge = (from: string, to: string, relation: IRKnowledgeEdgeRelation, weight?: number) => {
+      if (!edges.find((e) => e.from === from && e.to === to && e.relation === relation)) {
+        edges.push({ from, to, relation, ...(weight !== undefined ? { weight } : {}) });
+      }
+    };
+
+    // Écrans
+    for (const screen of uiGraph.screens ?? []) {
+      addNode(screen.id, 'screen', screen.name, screen.path);
+    }
+
+    // Composants
+    for (const comp of uiGraph.components ?? []) {
+      addNode(comp.id, 'component', comp.name);
+    }
+
+    // Navigation
+    for (const nav of uiGraph.navigationFlow ?? []) {
+      addEdge(nav.from, nav.to, 'navigates-to', 1);
+      if (nav.guard) {
+        const guardId = `guard-${nav.guard.toLowerCase().replace(/\s+/g, '-')}`;
+        addNode(guardId, 'middleware', nav.guard);
+        addEdge(nav.from, guardId, 'guarded-by');
+      }
+    }
+
+    // Stores (stateFlow)
+    for (const sf of uiGraph.stateFlow ?? []) {
+      const storeId = `store-${sf.store.toLowerCase().replace(/\s+/g, '-')}`;
+      addNode(storeId, 'store', sf.store);
+      for (const screen of uiGraph.screens ?? []) {
+        if (screen.apiCalls?.some((a) => a.toLowerCase().includes(sf.store.toLowerCase()))) {
+          addEdge(screen.id, storeId, 'uses-store', 0.8);
+        }
+      }
+    }
+
+    // Services
+    for (const svc of backendGraph.services ?? []) {
+      const svcId = `service-${svc.name.toLowerCase().replace(/\s+/g, '-')}`;
+      addNode(svcId, 'service', svc.name);
+      for (const dep of svc.dependencies ?? []) {
+        const depId = `service-${dep.toLowerCase().replace(/\s+/g, '-')}`;
+        addNode(depId, 'service', dep);
+        addEdge(svcId, depId, 'depends-on', 0.5);
+      }
+    }
+
+    // Endpoints API
+    for (const route of backendGraph.routes ?? []) {
+      const epId = `api-${route.method.toLowerCase()}-${route.path.replace(/[^a-z0-9]/gi, '-').toLowerCase()}`;
+      addNode(epId, 'api-endpoint', `${route.method} ${route.path}`, route.path, { method: route.method, handler: route.handler });
+      const relatedSvc = backendGraph.services?.find((s) =>
+        route.handler?.toLowerCase().includes(s.name.toLowerCase())
+      );
+      if (relatedSvc) {
+        const svcId = `service-${relatedSvc.name.toLowerCase().replace(/\s+/g, '-')}`;
+        addEdge(svcId, epId, 'calls-api', 0.9);
+      }
+      for (const guard of route.guards ?? []) {
+        const guardId = `middleware-${guard.toLowerCase().replace(/\s+/g, '-')}`;
+        addNode(guardId, 'middleware', guard);
+        addEdge(epId, guardId, 'guarded-by');
+      }
+    }
+
+    // Modèles
+    for (const model of dataLayer.models ?? []) {
+      const modelId = `model-${model.name.toLowerCase()}`;
+      addNode(modelId, 'model', model.name, model.table);
+      for (const rel of model.relations ?? []) {
+        const targetId = `model-${rel.target.toLowerCase()}`;
+        addNode(targetId, 'model', rel.target);
+        addEdge(modelId, targetId, 'depends-on', 0.7);
+      }
+    }
+
+    // Assets
+    for (const assetPath of (ast.assetFiles ?? []).slice(0, 30)) {
+      const assetName = assetPath.split('/').pop() ?? assetPath;
+      const assetId   = `asset-${assetName.toLowerCase().replace(/[^a-z0-9]/gi, '-')}`;
+      addNode(assetId, 'asset', assetName, assetPath);
+    }
+
+    // Variables d'environnement
+    for (const key of ast.envVarKeys ?? []) {
+      const envId = `env-${key.toLowerCase().replace(/[^a-z0-9]/gi, '-')}`;
+      addNode(envId, 'env-var', key);
+    }
+
+    // Connexions externes
+    for (const extSvc of ast.externalServices ?? []) {
+      const extId = `ext-${extSvc.toLowerCase().replace(/[^a-z0-9]/gi, '-')}`;
+      addNode(extId, 'external-connection', extSvc);
+      for (const beSvc of backendGraph.services ?? []) {
+        const svcId = `service-${beSvc.name.toLowerCase().replace(/\s+/g, '-')}`;
+        if (
+          beSvc.name.toLowerCase().includes(extSvc.toLowerCase()) ||
+          beSvc.dependencies.some((d) => d.toLowerCase().includes(extSvc.toLowerCase()))
+        ) {
+          addEdge(svcId, extId, 'connects-to', 0.9);
+        }
+      }
+      for (const envKey of ast.envVarKeys ?? []) {
+        if (envKey.toLowerCase().includes(extSvc.toLowerCase())) {
+          const envId = `env-${envKey.toLowerCase().replace(/[^a-z0-9]/gi, '-')}`;
+          addEdge(extId, envId, 'requires-env', 0.8);
+        }
+      }
+    }
+
+    // Lier screens → apiCalls
+    for (const screen of uiGraph.screens ?? []) {
+      for (const call of screen.apiCalls ?? []) {
+        const matchingRoute = backendGraph.routes?.find((r) =>
+          call.toLowerCase().includes(r.path.toLowerCase().replace(/\/|\{[^}]+\}/g, '').substring(0, 8))
+        );
+        if (matchingRoute) {
+          const epId = `api-${matchingRoute.method.toLowerCase()}-${matchingRoute.path.replace(/[^a-z0-9]/gi, '-').toLowerCase()}`;
+          addEdge(screen.id, epId, 'calls-api', 0.9);
+        }
+      }
+    }
+
+    return {
+      nodes,
+      edges,
+      metadata: {
+        totalNodes:     nodes.length,
+        totalEdges:     edges.length,
+        buildTimestamp: new Date().toISOString(),
+        version:        '3.0',
+      },
+    };
+  }
+
+  // ── PHASE 23: Design Token extractor (Phase 6 — fidélité visuelle) ────────
+  private extractDesignTokens(ast: ASTResult): IRDesignTokens | undefined {
+    const colors:     IRColorToken[]      = [];
+    const typography: IRTypographyToken[] = [];
+    const spacing:    IRSpacingToken[]    = [];
+
+    const hexPattern      = /#([0-9A-Fa-f]{6}|[0-9A-Fa-f]{3})\b/g;
+    const argbPattern     = /0[xX][Ff]{2}([0-9A-Fa-f]{6})/g;
+    const fontSizePattern = /fontSize\s*[:=]\s*(\d+(?:\.\d+)?)/g;
+    const fontFamilyPat   = /fontFamily\s*[:=]\s*['"`]([^'"`]+)['"`]/g;
+    const spacingPattern  = /(?:padding|margin|spacing|gap)\s*[:=]\s*(\d+(?:\.\d+)?)/gi;
+
+    const colorMap = new Map<string, number>();
+
+    for (const file of ast.files.slice(0, 25)) {
+      const content = file.content;
+
+      hexPattern.lastIndex = 0;
+      let m: RegExpExecArray | null;
+      while ((m = hexPattern.exec(content)) !== null) {
+        const raw = m[1]!;
+        const hex = raw.length === 3
+          ? `#${raw[0]!}${raw[0]!}${raw[1]!}${raw[1]!}${raw[2]!}${raw[2]!}`.toUpperCase()
+          : `#${raw.toUpperCase()}`;
+        colorMap.set(hex, (colorMap.get(hex) ?? 0) + 1);
+      }
+
+      argbPattern.lastIndex = 0;
+      while ((m = argbPattern.exec(content)) !== null) {
+        const hex = `#${m[1]!.toUpperCase()}`;
+        colorMap.set(hex, (colorMap.get(hex) ?? 0) + 1);
+      }
+
+      fontSizePattern.lastIndex = 0;
+      while ((m = fontSizePattern.exec(content)) !== null) {
+        const size = parseFloat(m[1]!);
+        if (size >= 8 && size <= 96 && !typography.find((t) => t.fontSize === size)) {
+          typography.push({ name: `text-${size}`, fontSize: size });
+        }
+      }
+
+      fontFamilyPat.lastIndex = 0;
+      while ((m = fontFamilyPat.exec(content)) !== null) {
+        const family = m[1]!.trim();
+        if (family.length > 1 && !typography.find((t) => t.fontFamily === family)) {
+          typography.push({ name: `font-${family.toLowerCase().replace(/\s+/g, '-')}`, fontFamily: family });
+        }
+      }
+
+      spacingPattern.lastIndex = 0;
+      while ((m = spacingPattern.exec(content)) !== null) {
+        const val = parseFloat(m[1]!);
+        if (val >= 2 && val <= 128 && !spacing.find((s) => s.value === val)) {
+          const name = val <= 4 ? 'xs' : val <= 8 ? 'sm' : val <= 16 ? 'md' : val <= 24 ? 'lg' : val <= 32 ? 'xl' : `space-${val}`;
+          spacing.push({ name, value: val });
+        }
+      }
+    }
+
+    const colorRoles = ['primary', 'secondary', 'accent', 'surface', 'background', 'error', 'warning', 'info', 'success'];
+    const palette: Record<string, string> = {};
+    const sortedColors = [...colorMap.entries()].sort((a, b) => b[1] - a[1]).slice(0, 20);
+
+    let roleIdx = 0;
+    for (const [hex] of sortedColors) {
+      if (hex === '#FFFFFF' || hex === '#000000') { palette[hex === '#FFFFFF' ? 'white' : 'black'] = hex; continue; }
+      const role = colorRoles[roleIdx] ?? `color-${roleIdx + 1}`;
+      colors.push({ name: role, value: hex, usedIn: [] });
+      palette[role] = hex;
+      roleIdx++;
+    }
+
+    spacing.sort((a, b) => a.value - b.value);
+    const uniqueTypo = typography.filter((t, i, arr) => arr.findIndex((x) => x.name === t.name) === i).slice(0, 15);
+
+    if (colors.length === 0 && uniqueTypo.length === 0 && spacing.length === 0) return undefined;
+
+    console.log(`[IRGenerator] extractDesignTokens — colors=${colors.length} typography=${uniqueTypo.length} spacing=${spacing.length}`);
+    return { colors, typography: uniqueTypo, spacing, ...(Object.keys(palette).length > 0 ? { palette } : {}) };
+  }
+
   // ── PHASE 22: Builders pour assets, envVars, externalConnections ─────────
 
   private buildAssets(ast: ASTResult): IRDocument['assets'] {
