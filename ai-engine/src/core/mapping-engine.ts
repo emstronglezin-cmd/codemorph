@@ -11,14 +11,35 @@ export class MappingEngine {
   }
 
   private getMapper(src: string, tgt: string): (ir: IRDocument, ctx: ConversionContext) => IRDocument {
-    const key = `${src}->${tgt}`;
+    // FIX PHASE 24 — BUG #6 CRITIQUE: clés case-sensitive
+    // Le backend envoie sourceFramework="flutter" (lowercase) mais les clés étaient PascalCase.
+    // Résultat: JAMAIS de match → mappeur identity (ir => ir) → IR non mappé → screens paths incorrects.
+    // Fix: normaliser src et tgt en lowercase puis matcher sur des clés normalisées.
+    const srcNorm = src.toLowerCase().replace(/[\s_.-]/g, '');
+    const tgtNorm = tgt.toLowerCase().replace(/[\s_.-]/g, '');
+    const key = `${srcNorm}->${tgtNorm}`;
+
+    // Log pour tracer quel mappeur est sélectionné
+    console.log(`[MappingEngine] getMapper: src="${src}"→norm="${srcNorm}" tgt="${tgt}"→norm="${tgtNorm}" key="${key}"`);
+
     const mappers: Record<string, (ir: IRDocument, ctx: ConversionContext) => IRDocument> = {
-      'Flutter->React':          this.flutterToReact.bind(this),
-      'Flutter->React Native':   this.flutterToReactNative.bind(this),
-      'Express->NestJS':         this.expressToNestJS.bind(this),
-      'Node.js->NestJS':         this.nodeToNestJS.bind(this),
+      'flutter->react':          this.flutterToReact.bind(this),
+      'flutter->reactnative':    this.flutterToReactNative.bind(this),
+      'flutter->rn':             this.flutterToReactNative.bind(this),
+      'dart->react':             this.flutterToReact.bind(this),
+      'dart->reactnative':       this.flutterToReactNative.bind(this),
+      'express->nestjs':         this.expressToNestJS.bind(this),
+      'nodejs->nestjs':          this.nodeToNestJS.bind(this),
+      'node->nestjs':            this.nodeToNestJS.bind(this),
     };
-    return mappers[key] ?? ((ir) => ir);
+
+    const mapper = mappers[key];
+    if (!mapper) {
+      console.warn(`[MappingEngine] No mapper found for key="${key}" — using identity (IR unchanged). Available: ${Object.keys(mappers).join(', ')}`);
+    } else {
+      console.log(`[MappingEngine] Mapper selected for key="${key}" ✓`);
+    }
+    return mapper ?? ((ir) => ir);
   }
 
   // ── Flutter → React ──────────────────────────────────

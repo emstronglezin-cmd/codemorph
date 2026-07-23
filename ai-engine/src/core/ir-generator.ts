@@ -443,6 +443,25 @@ Return ONLY valid JSON. No markdown. No explanation. No code blocks.`;
       return { data: fallback, tokens: 0 };
     }
 
+    // ── FIX PHASE 24 — BUG #2 CRITIQUE ──────────────────────────────────────
+    // AVANT: uiFiles.slice(0, 8) × content.slice(0, 200) = 1600 chars de contexte
+    // Un projet Flutter 221 fichiers → 95% du code ignoré → 0 screens extraits
+    //
+    // Fix:
+    //   - Groq (2048 tokens): 15 fichiers × 500 chars = 7500 chars
+    //   - Platform/Pro (4096+): 25 fichiers × 1000 chars = 25 000 chars
+    // Priorité: fichiers screen avant widgets
+    const isGroq       = maxTokens <= 2048;
+    const maxFiles     = isGroq ? 15 : 25;
+    const maxPerFile   = isGroq ? 500 : 1000;
+
+    // Trier: fichiers screens/pages d'abord, puis widgets
+    const sortedUiFiles = [...uiFiles].sort((a, b) => {
+      const aScreen = /screen|page/i.test(a.path) ? 0 : 1;
+      const bScreen = /screen|page/i.test(b.path) ? 0 : 1;
+      return aScreen - bScreen;
+    });
+
     // ── PHASE 22: contexte enrichi — inclure patterns détectés par AST ──────
     const stateInfo   = ast.statePatterns?.length   ? `State management: ${ast.statePatterns.join(', ')}` : '';
     const navInfo     = ast.navigationPattern && ast.navigationPattern !== 'unknown' ? `Navigation: ${ast.navigationPattern}` : '';
@@ -450,15 +469,17 @@ Return ONLY valid JSON. No markdown. No explanation. No code blocks.`;
     const extInfo     = ast.externalServices?.length ? `External services: ${ast.externalServices.join(', ')}` : '';
     const contextBlock = [stateInfo, navInfo, authInfo, extInfo].filter(Boolean).join(' | ');
 
-    // Prendre plus de fichiers et plus de contenu pour une meilleure extraction
-    const filesCtx = uiFiles.slice(0, 8).map((f) =>
-      `FILE: ${f.path}\nCLASSES: ${f.classes.slice(0, 5).join(', ')}\nFUNCS: ${f.functions.slice(0, 5).join(', ')}\nCONTENT:\n${f.content.slice(0, 200)}`
+    // FIX BUG #2: Plus de fichiers, plus de contenu par fichier
+    const filesCtx = sortedUiFiles.slice(0, maxFiles).map((f) =>
+      `FILE: ${f.path}\nCLASSES: ${f.classes.slice(0, 8).join(', ')}\nFUNCS: ${f.functions.slice(0, 8).join(', ')}\nCONTENT:\n${f.content.slice(0, maxPerFile)}`
     ).join('\n---\n');
+
+    console.log(`[IRGenerator] generateUIGraph: using ${Math.min(uiFiles.length, maxFiles)}/${uiFiles.length} UI files, ${maxPerFile} chars/file, isGroq=${isGroq}`);
 
     const prompt = `Framework: ${ctx.sourceFramework} → Target: ${ctx.targetFramework}
 ${contextBlock ? `Context: ${contextBlock}` : ''}
 
-SOURCE UI FILES (${uiFiles.length} total):
+SOURCE UI FILES (${uiFiles.length} total, showing ${Math.min(uiFiles.length, maxFiles)}):
 ${filesCtx}
 
 Extract ALL screens and components from these files.
@@ -474,18 +495,40 @@ Return JSON:
 
 RULES: Use REAL names from source. Max 15 screens, 20 components. ONLY valid JSON.`;
 
+    // FIX BUG #4 + #10: Utiliser plus de tokens pour la réponse + log prompt
+    // AVANT: Math.min(1400, maxTokens) — avec MASTER_SYSTEM_PROMPT ~600 tokens, reste ~800 pour JSON
+    // FIX: augmenter à min(1800, maxTokens) pour permettre plus d'écrans dans la réponse
+    const promptChars = this.MASTER_SYSTEM_PROMPT.length + prompt.length;
+    const estimatedPromptTokens = Math.ceil(promptChars / 4);
+    console.log(`\n================ PROMPT (generateUIGraph) ================`);
+    console.log(`Characters         : ${promptChars}`);
+    console.log(`Estimated tokens   : ~${estimatedPromptTokens}`);
+    console.log(`Max response tokens: ${Math.min(1800, maxTokens)}`);
+    console.log(`UI files in prompt : ${Math.min(uiFiles.length, maxFiles)}/${uiFiles.length}`);
+    console.log(`Contains:`);
+    console.log(`  ✓ Screen file paths (${sortedUiFiles.slice(0, maxFiles).filter((f) => /screen|page/i.test(f.path)).length} screens)`);
+    console.log(`  ✓ Widget file paths (${sortedUiFiles.slice(0, maxFiles).filter((f) => /widget|component/i.test(f.path)).length} widgets)`);
+    console.log(`  ${stateInfo ? '✓' : '✗'} State management: ${stateInfo || '(none)'}`);
+    console.log(`  ${navInfo ? '✓' : '✗'} Navigation: ${navInfo || '(none)'}`);
+    console.log(`  ${authInfo ? '✓' : '✗'} Auth: ${authInfo || '(none)'}`);
+    console.log(`  ${extInfo ? '✓' : '✗'} External services: ${extInfo || '(none)'}`);
+    console.log(`==============================\n`);
+
     try {
       const res = await this.ai.chat(
         [
           { role: 'system', content: this.MASTER_SYSTEM_PROMPT },
           { role: 'user',   content: prompt },
         ],
-        Math.min(1400, maxTokens),
+        Math.min(1800, maxTokens), // FIX BUG #4: 1800 au lieu de 1400
       );
       const data = this.tryParseJSON<IRDocument['uiGraph']>(res.content || '{}', fallback);
       data.screens = data.screens ?? []; data.components = data.components ?? [];
       data.navigationFlow = data.navigationFlow ?? []; data.stateFlow = data.stateFlow ?? [];
-      console.log(`[IRGenerator] generateUIGraph: screens=${data.screens.length} components=${data.components.length} tokens=${res.tokensUsed}`);
+      console.log(`[IRGenerator] generateUIGraph RESULT: screens=${data.screens.length} components=${data.components.length} navFlows=${data.navigationFlow.length} stateFlows=${data.stateFlow.length} tokens=${res.tokensUsed}`);
+      if (data.screens.length === 0) {
+        console.warn(`[IRGenerator] ⚠️  generateUIGraph: AI returned 0 screens from ${uiFiles.length} UI files. Raw response length=${res.content?.length ?? 0}. Will fallback to AST inference.`);
+      }
       return { data, tokens: res.tokensUsed };
     } catch (err) {
       console.warn(`[IRGenerator] generateUIGraph FAILED: ${(err as Error).message}`);
@@ -504,13 +547,17 @@ RULES: Use REAL names from source. Max 15 screens, 20 components. ONLY valid JSO
     const apiCtx  = ast.apiPatterns?.length > 0 ? `\nDetected API patterns: ${ast.apiPatterns.slice(0, 10).join(', ')}` : '';
     const authCtx = ast.authPatterns?.length > 0 ? `\nAuth patterns: ${ast.authPatterns.join(', ')}` : '';
 
-    const filesCtx = beFiles.slice(0, 6).map((f) =>
-      `FILE: ${f.path}\nCLASSES: ${f.classes.slice(0, 4).join(', ')}\nCONTENT:\n${f.content.slice(0, 200)}`
+    // FIX PHASE 24 — BUG #2: Plus de fichiers backend, plus de contexte
+    const isGroq    = maxTokens <= 2048;
+    const maxBEFiles = isGroq ? 8 : 12;
+    const maxBEChars = isGroq ? 300 : 500;
+    const filesCtx = beFiles.slice(0, maxBEFiles).map((f) =>
+      `FILE: ${f.path}\nCLASSES: ${f.classes.slice(0, 6).join(', ')}\nCONTENT:\n${f.content.slice(0, maxBEChars)}`
     ).join('\n---\n');
 
     const prompt = `Framework: ${ctx.sourceFramework} → Target: ${ctx.targetFramework}${apiCtx}${authCtx}
 
-SOURCE BACKEND FILES (${beFiles.length} total):
+SOURCE BACKEND FILES (${beFiles.length} total, showing ${Math.min(beFiles.length, maxBEFiles)}):
 ${filesCtx}
 
 Extract ALL routes, services, entities from these files.
@@ -533,7 +580,7 @@ Rules: Use REAL names. Max 10 routes, 8 services. ONLY valid JSON.`;
           { role: 'system', content: this.MASTER_SYSTEM_PROMPT },
           { role: 'user',   content: prompt },
         ],
-        Math.min(1200, maxTokens),
+        Math.min(1400, maxTokens), // FIX: 1400 au lieu de 1200
       );
       const data = this.tryParseJSON<IRDocument['backendGraph']>(res.content || '{}', fallback);
       data.routes = data.routes ?? []; data.services = data.services ?? [];
@@ -553,11 +600,21 @@ Rules: Use REAL names. Max 10 routes, 8 services. ONLY valid JSON.`;
     const fallback: IRDocument['dataLayer'] = { models: [], relationships: [], migrations: [] };
     if (dataFiles.length === 0) return { data: fallback, tokens: 0 };
 
-    const filesCtx = dataFiles.slice(0, 4).map((f) => `${f.path}:${f.content.slice(0, 150)}`).join('\n---\n');
-    const prompt = `Analyze data files → JSON dataLayer:\n{"models":[{"name":"User","table":"users","fields":[{"name":"id","type":"String","nullable":false,"unique":true,"primary":true}],"relations":[]}],"relationships":[],"migrations":[]}\n\nFiles:\n${filesCtx}\n\nMax 5 models. ONLY valid JSON.`;
+    // FIX PHASE 24 — BUG #2: Plus de fichiers modèles, plus de contenu
+    const isGroq    = maxTokens <= 2048;
+    const maxDLFiles = isGroq ? 5 : 8;
+    const maxDLChars = isGroq ? 250 : 400;
+    const filesCtx = dataFiles.slice(0, maxDLFiles).map((f) =>
+      `${f.path}:\nCLASSES: ${f.classes.join(', ')}\n${f.content.slice(0, maxDLChars)}`
+    ).join('\n---\n');
+
+    const prompt = `Analyze data files → JSON dataLayer:\n{"models":[{"name":"User","table":"users","fields":[{"name":"id","type":"String","nullable":false,"unique":true,"primary":true}],"relations":[]}],"relationships":[],"migrations":[]}\n\nFiles (${dataFiles.length} total, showing ${Math.min(dataFiles.length, maxDLFiles)}):\n${filesCtx}\n\nMax 8 models. ONLY valid JSON.`;
 
     try {
-      const res = await this.ai.chat([{ role: 'user', content: prompt }], Math.min(800, maxTokens));
+      const res = await this.ai.chat([
+        { role: 'system', content: this.MASTER_SYSTEM_PROMPT },
+        { role: 'user', content: prompt },
+      ], Math.min(1000, maxTokens)); // FIX: 1000 au lieu de 800
       const data = this.tryParseJSON<IRDocument['dataLayer']>(res.content || '{}', fallback);
       data.models = data.models ?? []; data.relationships = data.relationships ?? []; data.migrations = data.migrations ?? [];
       console.log(`[IRGenerator] generateDataLayer: models=${data.models.length} tokens=${res.tokensUsed}`);

@@ -5,6 +5,12 @@
 // Supports: Free (Groq), Platform (OpenAI), Pro (user keys)
 // PHASE 22: Prompt Maître V2 — Phase 7 Auto-correction ajoutée
 // PHASE 23: Prompt Architecte Ultime V3 — Score fidélité multi-axes + boucle Phase 8
+// PHASE 24: Audit Architecture + Correction Définitive
+//   - FIX BUG #1: Groq 15 000 chars tronquait TOUT — désormais truncation intelligente par fichier
+//   - FIX BUG #6: MappingEngine clés case-sensitive (voir mapping-engine.ts)
+//   - FIX BUG #10: Logs structurés complets (=== AST ===, === KG ===, === IR ===, etc.)
+//   - FIX BUG #12: Vérification cohérence des comptages Flutter→IR→Planned→Generated
+//   - FIX BUG #7: autoCorrectLoop activé pour Groq (max 1 itération)
 // ============================================================
 import pino from 'pino';
 
@@ -47,13 +53,93 @@ export class ConversionPipeline {
   }
 
   // ── Enforce free-tier limits ─────────────────────────────
+  // FIX PHASE 24 — BUG #1 CRITIQUE:
+  // AVANT: ctx.sourceCode.slice(0, 15_000) → TOUT le projet tronqué à 15 000 chars
+  // PROBLÈME: Un projet Flutter 221 fichiers ≈ 500 000+ chars.
+  //   Avec slice(0, 15_000), seuls les 2-3 premiers fichiers sont transmis.
+  //   L'AST reçoit 15 000 chars → parse 2-3 fichiers → 0 screens détectés → template générique.
+  //
+  // Fix: troncature intelligente par fichier
+  //   1. Compter les fichiers dans sourceCode
+  //   2. Distribuer le budget (15 000 chars) sur tous les fichiers équitablement
+  //   3. Prioriser les fichiers screens/pages/views (les plus importants pour la reconstruction)
+  //   4. Logger le nombre de fichiers gardés vs total
+  //
+  // IMPORTANT: Cette limite est contournée pour les tiers payants (platform/pro).
   private enforceLimits(ctx: ConversionContext, tier: AITier): void {
-    if (tier === 'static' || tier === 'free-groq') {
+    if (tier === 'static') {
       const limits = AIProvider.getLimits(tier);
       if (ctx.sourceCode.length > limits.maxInputChars) {
         ctx.sourceCode = ctx.sourceCode.slice(0, limits.maxInputChars);
-        logger.warn({ jobId: ctx.jobId, tier }, `⚠️  Source code truncated to ${limits.maxInputChars} chars (free tier limit)`);
+        logger.warn({ jobId: ctx.jobId, tier }, `⚠️  Source code truncated to ${limits.maxInputChars} chars (static tier limit)`);
       }
+      return;
+    }
+
+    if (tier === 'free-groq') {
+      const limits = AIProvider.getLimits(tier);
+      const totalChars = ctx.sourceCode.length;
+
+      if (totalChars <= limits.maxInputChars) return; // No truncation needed
+
+      // ── Troncature intelligente par fichier ────────────────────────────────
+      // Extraire tous les blocs fichiers
+      const filePattern = /\/\/\s*(?:=+\s*)?FILE:\s*(.+?)(?:\s*=+)?\n([\s\S]*?)(?=\/\/\s*(?:=+\s*)?FILE:|$)/g;
+      type FileBlock = { path: string; content: string; header: string; priority: number };
+      const allFileBlocks: FileBlock[] = [];
+      let match: RegExpExecArray | null;
+
+      while ((match = filePattern.exec(ctx.sourceCode)) !== null) {
+        const path    = (match[1] ?? '').trim();
+        const content = (match[2] ?? '').trim();
+        if (!path || !content) continue;
+        const header  = `// === FILE: ${path} ===\n`;
+        // Priorité: screens/pages/views/widgets/services d'abord
+        const priority = /screen|page|view|widget|service|repository|store|provider|bloc|cubit|model/i.test(path) ? 0 : 1;
+        allFileBlocks.push({ path, content, header, priority });
+      }
+
+      if (allFileBlocks.length === 0) {
+        // Pas de marqueurs fichiers → troncature classique
+        ctx.sourceCode = ctx.sourceCode.slice(0, limits.maxInputChars);
+        logger.warn({ jobId: ctx.jobId, tier }, `⚠️  Source code (no file markers) truncated to ${limits.maxInputChars} chars`);
+        return;
+      }
+
+      // Trier par priorité : fichiers métier d'abord
+      allFileBlocks.sort((a, b) => a.priority - b.priority);
+
+      // Distribuer le budget chars sur les fichiers
+      const CHARS_PER_FILE_GROQ = Math.floor(limits.maxInputChars / Math.min(allFileBlocks.length, 30));
+      const HEADER_BUDGET = 50; // chars pour le header "// === FILE: path ==="
+
+      let budget = limits.maxInputChars;
+      const keptBlocks: string[] = [];
+      let keptCount = 0;
+
+      for (const block of allFileBlocks) {
+        if (budget <= 0) break;
+        const maxContent = Math.min(CHARS_PER_FILE_GROQ - HEADER_BUDGET, budget - HEADER_BUDGET);
+        if (maxContent <= 50) break; // trop peu de place
+        const truncContent = block.content.slice(0, maxContent);
+        const entry = `${block.header}${truncContent}\n\n`;
+        keptBlocks.push(entry);
+        budget -= entry.length;
+        keptCount++;
+      }
+
+      const newSourceCode = keptBlocks.join('');
+      logger.warn({
+        jobId:     ctx.jobId,
+        tier,
+        totalFiles: allFileBlocks.length,
+        keptFiles:  keptCount,
+        originalChars: totalChars,
+        finalChars: newSourceCode.length,
+      }, `⚠️  FIX BUG#1: Smart file truncation: ${keptCount}/${allFileBlocks.length} files kept (${newSourceCode.length}/${totalChars} chars)`);
+
+      console.log(`[PIPELINE] FIX BUG#1 smart truncation — totalFiles=${allFileBlocks.length} keptFiles=${keptCount} chars=${newSourceCode.length}/${totalChars}`);
+      ctx.sourceCode = newSourceCode;
     }
   }
 
@@ -75,6 +161,33 @@ export class ConversionPipeline {
     logger.info({ jobId: ctx.jobId }, '📊 Phase 1: AST Analysis');
     const astResult = await this.astAnalyzer.analyze(ctx);
 
+    // ── LOG STRUCTURÉ: AST ────────────────────────────────
+    console.log(`\n================ AST ================`);
+    console.log(`Files found      : ${astResult.files.length}`);
+    console.log(`Dart/source files: ${astResult.files.filter((f) => /\.(dart|tsx?|jsx?)$/.test(f.path)).length}`);
+    console.log(`Screens files    : ${astResult.files.filter((f) => /screen|page|view/i.test(f.path)).length}`);
+    console.log(`Widget files     : ${astResult.files.filter((f) => /widget|component/i.test(f.path)).length}`);
+    console.log(`Service files    : ${astResult.files.filter((f) => /service|repository|repo/i.test(f.path)).length}`);
+    console.log(`Model files      : ${astResult.files.filter((f) => /model|entity|dto/i.test(f.path)).length}`);
+    console.log(`Store files      : ${astResult.files.filter((f) => /store|bloc|cubit|provider|riverpod|getx|redux|zustand/i.test(f.path)).length}`);
+    console.log(`State patterns   : ${astResult.statePatterns.join(', ') || '(none)'}`);
+    console.log(`Auth patterns    : ${astResult.authPatterns.join(', ') || '(none)'}`);
+    console.log(`External services: ${astResult.externalServices.join(', ') || '(none)'}`);
+    console.log(`Navigation       : ${astResult.navigationPattern || '(none)'}`);
+    console.log(`API patterns     : ${astResult.apiPatterns.join(', ') || '(none)'}`);
+    console.log(`Assets detected  : ${astResult.assetFiles.length}`);
+    console.log(`Env vars detected: ${astResult.envVarKeys.length} [${astResult.envVarKeys.slice(0, 5).join(', ')}${astResult.envVarKeys.length > 5 ? '...' : ''}]`);
+    console.log(`Docs             : ${astResult.projectDocs.length}`);
+    console.log(`CI/CD configs    : ${astResult.cicdConfigs.length}`);
+    console.log(`Test files       : ${astResult.testFiles.length}`);
+    console.log(`Config files     : ${astResult.configFiles.length}`);
+    console.log(`Scripts          : ${astResult.scripts.length}`);
+    console.log(`Dependencies     : ${astResult.dependencies.length}`);
+    console.log(`Classes total    : ${astResult.classNames.length}`);
+    console.log(`Functions total  : ${astResult.functions.length}`);
+    console.log(`Tokens used      : ${astResult.tokensUsed}`);
+    console.log(`==============================\n`);
+
     // ── PHASE 2: Architecture Detection ───────────────────
     logger.info({ jobId: ctx.jobId, tier }, '🏗️  Phase 2: Architecture Detection');
     const archResult = await architectureDetector.detect(ctx, astResult);
@@ -83,13 +196,81 @@ export class ConversionPipeline {
     logger.info({ jobId: ctx.jobId, tier }, '⚙️  Phase 3: IR Generation + Knowledge Graph');
     const irDocument = await irGenerator.generate(ctx, astResult, archResult);
 
+    // ── LOG STRUCTURÉ: KNOWLEDGE GRAPH ───────────────────
+    const kg = irDocument.ir.knowledgeGraph;
+    console.log(`\n================ KNOWLEDGE GRAPH ================`);
+    console.log(`Nodes     : ${kg?.nodes.length ?? 0}`);
+    console.log(`Edges     : ${kg?.edges.length ?? 0}`);
+    console.log(`Screens   : ${kg?.nodes.filter((n) => n.type === 'screen').length ?? 0}`);
+    console.log(`Models    : ${kg?.nodes.filter((n) => n.type === 'model').length ?? 0}`);
+    console.log(`Services  : ${kg?.nodes.filter((n) => n.type === 'service').length ?? 0}`);
+    console.log(`Stores    : ${kg?.nodes.filter((n) => n.type === 'store').length ?? 0}`);
+    console.log(`API       : ${kg?.nodes.filter((n) => n.type === 'api-endpoint').length ?? 0}`);
+    console.log(`Assets    : ${kg?.nodes.filter((n) => n.type === 'asset').length ?? 0}`);
+    console.log(`Bus. Rules: ${kg?.nodes.filter((n) => n.type === 'business-rule').length ?? 0}`);
+    if ((kg?.nodes.length ?? 0) === 0) {
+      console.warn(`[PIPELINE] ⚠️  WARNING BUG#3: Knowledge Graph has 0 nodes — KG was built from empty IR. Screens must be populated first.`);
+    }
+    console.log(`==============================\n`);
+
+    // ── LOG STRUCTURÉ: IR ─────────────────────────────────
+    const ir = irDocument.ir;
+    const irScreens    = ir.uiGraph?.screens?.length ?? 0;
+    const irComponents = ir.uiGraph?.components?.length ?? 0;
+    const irStores     = ir.uiGraph?.stateFlow?.length ?? 0;
+    const irRoutes     = ir.backendGraph?.routes?.length ?? 0;
+    const irServices   = ir.backendGraph?.services?.length ?? 0;
+    const irModels     = ir.dataLayer?.models?.length ?? 0;
+    const irNavFlows   = ir.uiGraph?.navigationFlow?.length ?? 0;
+    const irAssets     = (ir.assets?.images?.length ?? 0) + (ir.assets?.icons?.length ?? 0) + (ir.assets?.fonts?.length ?? 0);
+    const irEnvVars    = ir.envVars?.length ?? 0;
+    console.log(`\n================ IR ================`);
+    console.log(`Screens    : ${irScreens}`);
+    console.log(`Components : ${irComponents}`);
+    console.log(`Stores     : ${irStores}`);
+    console.log(`Nav Flows  : ${irNavFlows}`);
+    console.log(`Routes     : ${irRoutes}`);
+    console.log(`Services   : ${irServices}`);
+    console.log(`Models     : ${irModels}`);
+    console.log(`Assets     : ${irAssets}`);
+    console.log(`Env Vars   : ${irEnvVars}`);
+    console.log(`ExtConns   : ${ir.externalConnections?.length ?? 0}`);
+    console.log(`Design Tkns: ${ir.designTokens ? `yes (${ir.designTokens.colors?.length ?? 0} colors)` : 'no'}`);
+    console.log(`KG nodes   : ${ir.knowledgeGraph?.nodes.length ?? 0}`);
+    if (irScreens === 0) {
+      console.warn(`[PIPELINE] ⚠️  CRITICAL: IR has 0 screens from ${astResult.files.length} source files. Code planning will generate scaffold only.`);
+    }
+    console.log(`==============================\n`);
+
     // ── PHASE 4: Mapping Engine ────────────────────────────
     logger.info({ jobId: ctx.jobId }, '🗺️  Phase 4: Mapping Engine');
-    const mappedIR = await this.mappingEngine.map(ctx, irDocument as never);
+    const mappedIR = await this.mappingEngine.map(ctx, irDocument.ir as never);
 
     // ── PHASE 5: Target Code Plan ──────────────────────────
     logger.info({ jobId: ctx.jobId, tier }, '📋 Phase 5: Code Planning (Reconstruction + Visual Fidelity)');
     const plan = await codePlanner.plan(ctx, mappedIR);
+
+    // ── LOG STRUCTURÉ: RESULT (après planning) ────────────
+    const genScreens    = plan.files.filter((f) => /\/(screens?|pages?|app)\/[^/]+\.(tsx?|jsx?)$/.test(f.path) && !/_layout|index|tabs/.test(f.path)).length;
+    const genComponents = plan.files.filter((f) => /\/components\/[^/]+\.(tsx?|jsx?)$/.test(f.path)).length;
+    const genStores     = plan.files.filter((f) => /\.store\.(ts|js)$/.test(f.path)).length;
+    const genServices   = plan.files.filter((f) => /\.service\.(ts|js)$/.test(f.path)).length;
+    const genModels     = plan.files.filter((f) => /\.types\.(ts|js)$/.test(f.path) || /\/types\//.test(f.path)).length;
+    const genRouter     = plan.files.filter((f) => /router|navigation|_layout/.test(f.path)).length;
+    console.log(`\n================ RESULT (after Code Planning) ================`);
+    console.log(`Generated Screens    : ${genScreens}`);
+    console.log(`Generated Components : ${genComponents}`);
+    console.log(`Generated Stores     : ${genStores}`);
+    console.log(`Generated Services   : ${genServices}`);
+    console.log(`Generated Models     : ${genModels}`);
+    console.log(`Generated Router     : ${genRouter}`);
+    console.log(`Total Files          : ${plan.files.length}`);
+    console.log(`Total Lines          : ${plan.summary.totalLines}`);
+    console.log(`==============================\n`);
+
+    // ── FIX BUG #12: VÉRIFICATION DE COHÉRENCE ────────────
+    // Comparer: Flutter→AST files → IR screens → planned screens → generated screens
+    this.logCoherenceCheck(astResult, mappedIR, plan.files, ctx.jobId);
 
     // ── PHASE 6: IR Validation ─────────────────────────────
     logger.info({ jobId: ctx.jobId }, '✅ Phase 6: IR Validation');
@@ -295,7 +476,9 @@ export class ConversionPipeline {
     tier: AITier,
     codePlanner: CodePlanner,
   ): Promise<{ correctedPlan: typeof initialPlan; autoCorrectionReport: IRAutoCorrectReport }> {
-    const MAX_ITERATIONS = tier === 'free-groq' || tier === 'static' ? 0 : 3;
+    const MAX_ITERATIONS = tier === 'static' ? 0 : tier === 'free-groq' ? 1 : 3;
+    // FIX PHASE 24 — BUG #8: Groq avait MAX_ITERATIONS=0 → aucune auto-correction
+    // Fix: Groq autorisé à faire 1 itération pour rattraper les écrans manquants
     const IMPROVEMENT_THRESHOLD = 3; // minimum gain (%) pour continuer
 
     const scoreHistory: IRScoreSnapshot[] = [
@@ -434,6 +617,63 @@ export class ConversionPipeline {
         completedAt:     new Date().toISOString(),
       },
     };
+  }
+
+  // ── FIX BUG #12: Vérification de cohérence des comptages ────────────────
+  // Flutter source files → IR screens → planned screens → generated screens
+  // Les nombres DOIVENT être cohérents. Si pas, logger des avertissements critiques.
+  private logCoherenceCheck(
+    ast:         Awaited<ReturnType<ASTAnalyzer['analyze']>>,
+    ir:          IRDocument,
+    files:       GeneratedFile[],
+    jobId:       string,
+  ): void {
+    const flutterScreenFiles = ast.files.filter((f) => /screen|page|view/i.test(f.path)).length;
+    const flutterModelFiles  = ast.files.filter((f) => /model|entity|dto/i.test(f.path)).length;
+    const flutterServiceFiles = ast.files.filter((f) => /service|repository/i.test(f.path)).length;
+    const flutterStoreFiles  = ast.files.filter((f) => /bloc|cubit|store|provider|getx/i.test(f.path)).length;
+
+    const irScreens   = ir.uiGraph?.screens?.length ?? 0;
+    const irModels    = ir.dataLayer?.models?.length ?? 0;
+    const irServices  = ir.backendGraph?.services?.length ?? 0;
+    const irStores    = ir.uiGraph?.stateFlow?.length ?? 0;
+    const irEndpoints = ir.backendGraph?.routes?.length ?? 0;
+
+    const genScreens  = files.filter((f) => /\/(screens?|pages?|app)\/[^/]+\.(tsx?|jsx?)$/.test(f.path) && !/_layout|index|tabs/.test(f.path)).length;
+    const genModels   = files.filter((f) => /\.types\.(ts|js)$/.test(f.path) || /\/types\//.test(f.path)).length;
+    const genServices = files.filter((f) => /\.service\.(ts|js)$/.test(f.path)).length;
+    const genStores   = files.filter((f) => /\.store\.(ts|js)$/.test(f.path)).length;
+
+    console.log(`\n================ COHERENCE CHECK ================`);
+    console.log(`                     | Flutter | IR      | Generated`);
+    console.log(`---------------------|---------|---------|----------`);
+    console.log(`Screens              | ${String(flutterScreenFiles).padStart(7)} | ${String(irScreens).padStart(7)} | ${String(genScreens).padStart(9)}`);
+    console.log(`Models               | ${String(flutterModelFiles).padStart(7)} | ${String(irModels).padStart(7)} | ${String(genModels).padStart(9)}`);
+    console.log(`Services             | ${String(flutterServiceFiles).padStart(7)} | ${String(irServices).padStart(7)} | ${String(genServices).padStart(9)}`);
+    console.log(`Stores               | ${String(flutterStoreFiles).padStart(7)} | ${String(irStores).padStart(7)} | ${String(genStores).padStart(9)}`);
+    console.log(`Endpoints            | ${String(ast.apiPatterns.length).padStart(7)} | ${String(irEndpoints).padStart(7)} | ${String(genServices).padStart(9)}`);
+    console.log(`Total source files   : ${ast.files.length}`);
+    console.log(`Total gen files      : ${files.length}`);
+
+    // Avertissements critiques
+    if (flutterScreenFiles > 0 && irScreens === 0) {
+      console.warn(`[COHERENCE] ❌ CRITICAL: Flutter has ${flutterScreenFiles} screen files but IR has 0 screens. IR generation failed. Check Groq token limits.`);
+      logger.warn({ jobId, flutterScreenFiles, irScreens }, '❌ COHERENCE: Flutter screens → IR screens MISMATCH');
+    }
+    if (irScreens > 0 && genScreens === 0) {
+      console.warn(`[COHERENCE] ❌ CRITICAL: IR has ${irScreens} screens but 0 were generated. Code planning failed. Check generateScreenFile() errors.`);
+      logger.warn({ jobId, irScreens, genScreens }, '❌ COHERENCE: IR screens → Generated screens MISMATCH');
+    }
+    if (irScreens > 0 && genScreens < irScreens * 0.5) {
+      console.warn(`[COHERENCE] ⚠️  WARNING: IR has ${irScreens} screens but only ${genScreens} generated (${Math.round(genScreens/irScreens*100)}%). Low fidelity.`);
+    }
+    if (irModels > 0 && genModels === 0) {
+      console.warn(`[COHERENCE] ⚠️  WARNING: IR has ${irModels} models but 0 types files generated.`);
+    }
+    if (ast.files.length > 50 && files.length <= 20) {
+      console.warn(`[COHERENCE] ❌ CRITICAL: Source has ${ast.files.length} files but only ${files.length} generated. Likely a template (expected 50+ files for 221 source files).`);
+    }
+    console.log(`==============================\n`);
   }
 
 }

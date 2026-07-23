@@ -571,6 +571,13 @@ src/
       themeBlock           ? `Visual design tokens:\n${themeBlock}`                   : '',
     ].filter(Boolean).join('\n');
 
+    // FIX PHASE 24 — BUG #6 (vérification IR injecté) + BUG #10 (logs)
+    // Vérifier que des données IR réelles sont présentes dans le prompt
+    const hasRealIRData = !!(purpose || bizLogic || apiCalls || states || relatedStores.length || relatedApis.length);
+    if (!hasRealIRData) {
+      console.warn(`[CodePlanner] ⚠️  BUG#6 WARNING: generateScreenFile("${name}") has NO real IR data (purpose/bizLogic/apiCalls/states/stores/apis all empty). Prompt will be generic.`);
+    }
+
     // PHASE 23: System Prompt Architecte Ultime V3
     const systemPrompt = `You are an AI Software Architect specialized in software reconstruction and multi-framework migration.
 
@@ -603,19 +610,62 @@ Requirements: TypeScript strict, all UI states, real API calls via apiClient fro
 
 Return ONLY the complete file content.`;
 
+    // FIX PHASE 24 — BUG #10: Log structuré PROMPT pour generateScreenFile
+    const promptChars = systemPrompt.length + userPrompt.length;
+    console.log(`\n================ PROMPT (generateScreenFile: ${name}) ================`);
+    console.log(`Characters        : ${promptChars}`);
+    console.log(`Est. tokens       : ~${Math.ceil(promptChars / 4)}`);
+    console.log(`Max response tok  : 1600`);
+    console.log(`Has real IR data  : ${hasRealIRData ? '✓ YES' : '✗ NO (generic risk!)'}`);
+    console.log(`Contains:`);
+    console.log(`  ${purpose      ? '✓' : '✗'} Screen purpose`);
+    console.log(`  ${bizLogic     ? '✓' : '✗'} Business logic`);
+    console.log(`  ${apiCalls     ? '✓' : '✗'} API calls`);
+    console.log(`  ${states       ? '✓' : '✗'} UI states`);
+    console.log(`  ${components.length ? '✓' : '✗'} Sub-components (${components.length})`);
+    console.log(`  ${relatedStores.length ? '✓' : '✗'} Related stores (${relatedStores.length})`);
+    console.log(`  ${relatedApis.length   ? '✓' : '✗'} KG API endpoints (${relatedApis.length})`);
+    console.log(`  ${relatedRules.length  ? '✓' : '✗'} Business rules (${relatedRules.length})`);
+    console.log(`  ${themeBlock    ? '✓' : '✗'} Design tokens`);
+    console.log(`==============================\n`);
+
     try {
       const res = await this.ai.chat(
         [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }],
         1600,
       );
       const generated = res.content || '';
-      // PHASE 22+23: Rejeter tout contenu interdit — placeholders et noms génériques
-      if (/HomeScreen|DetailsScreen|\bPlaceholder\b|CodeMorph App|TODO:|Lorem ipsum/i.test(generated)) {
-        console.warn(`[CodePlanner] generateScreenFile: forbidden placeholder detected for ${name} — using structured fallback`);
+
+      // FIX PHASE 24 — BUG #7 RENFORCÉ: Détecter et interdire toute génération générique
+      // Liste élargie: HomeScreen, DetailsScreen, Example, Demo, Template, Sample, TODO,
+      //                CodeMorph App, Placeholder, Skeleton, Mock Data
+      // ATTENTION: ne pas rejeter "TODO" dans les commentaires de logique métier réelle
+      // — rejeter seulement si le NOM de l'écran est générique ou si c'est un template vide
+      const FORBIDDEN_GENERIC_PATTERNS = [
+        /\bCodeMorph\s+App\b/i,         // "CodeMorph App" — template générique
+        /\bPlaceholder Screen\b/i,        // placeholder explicit
+        /\bSkeleton Screen\b/i,           // skeleton template
+        /\bMock Data\b/i,                 // données fictives
+        /Lorem ipsum/i,                   // texte fictif
+        /\bExample Component\b/i,         // composant exemple
+        /\bDemo Screen\b/i,               // demo
+        /\bTemplate Screen\b/i,           // template
+        /\bSample Screen\b/i,             // sample
+        /\bHomeScreen\b.*\bPlaceholder\b/i, // HomeScreen+Placeholder ensemble
+      ];
+
+      // Rejeter si le contenu correspond à un pattern générique strict
+      const isForbidden = FORBIDDEN_GENERIC_PATTERNS.some((p) => p.test(generated));
+      if (isForbidden) {
+        console.warn(`[CodePlanner] ⚠️  BUG#7: Forbidden generic content detected for screen "${name}" — using structured fallback`);
         return this.fallbackScreen(name, framework);
       }
+
+      // Log du résultat
+      console.log(`[CodePlanner] generateScreenFile("${name}") DONE — generated ${generated.length} chars, tokens=${res.tokensUsed}`);
       return generated || this.fallbackScreen(name, framework);
-    } catch {
+    } catch (err) {
+      console.warn(`[CodePlanner] generateScreenFile("${name}") FAILED: ${(err as Error).message} — using fallback`);
       return this.fallbackScreen(name, framework);
     }
   }
