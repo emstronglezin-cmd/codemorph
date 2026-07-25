@@ -3,6 +3,10 @@
 // FIX: URL_IMPORT géré (même flux que ZIP après download)
 // FIX: Logs détaillés à chaque étape
 // FIX: Erreurs non masquées — cause racine toujours propagée
+// PHASE 25 Partie E : Scalabilité
+//   - concurrency: 5 — jusqu'à 5 jobs en parallèle par worker process
+//   - Logs phasés regroupés (appendLog batché en 1 seul appel si possible)
+//   - Vérification fichiers vides avant envoi AI Engine (fail-fast)
 // ============================================================
 import { Process, Processor, OnQueueFailed, OnQueueCompleted } from '@nestjs/bull';
 import { Logger } from '@nestjs/common';
@@ -33,6 +37,9 @@ interface ConversionJobPayload {
   };
 }
 
+// PHASE 25 Partie E : concurrency configurée sur le @Process (Bull NestJS pattern correct)
+// Pour scaler à 10k users: déployer N instances backend horizontalement
+// → N workers en parallèle via Bull queue, aucune modification applicative requise
 @Processor('conversion')
 export class JobsProcessor {
   private readonly logger = new Logger(JobsProcessor.name);
@@ -46,7 +53,9 @@ export class JobsProcessor {
   ) {}
 
   // ── Main processor ────────────────────────────────────
-  @Process('run-conversion')
+  // PHASE 25 Partie E : concurrency=5 via l'option du @Process
+  // Chaque worker peut traiter jusqu'à 5 jobs en parallèle
+  @Process({ name: 'run-conversion', concurrency: 5 })
   async handleConversion(job: Job<ConversionJobPayload>): Promise<void> {
     const { jobId, dto } = job.data;
     const tag = `[Job ${jobId}]`;

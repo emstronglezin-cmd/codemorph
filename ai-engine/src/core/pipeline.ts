@@ -11,8 +11,14 @@
 //   - FIX BUG #10: Logs structurés complets (=== AST ===, === KG ===, === IR ===, etc.)
 //   - FIX BUG #12: Vérification cohérence des comptages Flutter→IR→Planned→Generated
 //   - FIX BUG #7: autoCorrectLoop activé pour Groq (max 1 itération)
+// PHASE 25: Optimisation Infrastructure + Coûts + Scalabilité
+//   - PARTIE B: Tokens IA — contexte partagé, MASTER_SYSTEM_PROMPT dédupliqué
+//   - PARTIE C: Cache LRU — AST/Arch/IR/Mapping/Plan (hit = 0 token consommé)
+//   - PARTIE D: Génération incrémentale — skip fichiers déjà corrects
+//   - PARTIE F: Métriques — timing par phase, tokens, coût estimé
 // ============================================================
 import pino from 'pino';
+import { pipelineCache, buildCacheKey } from './pipeline-cache';
 
 import type {
   ConversionContext, ConversionResult,
@@ -149,6 +155,16 @@ export class ConversionPipeline {
     const tier = ConversionPipeline.resolveTier(opts);
     logger.info({ jobId: ctx.jobId, tier }, '🚀 Pipeline started');
 
+    // ── PHASE 25 Partie F : Métriques timing par phase ───────
+    const phaseTimings: Record<string, number> = {};
+    const phaseStart = (phase: string) => { phaseTimings[`${phase}_start`] = Date.now(); };
+    const phaseEnd   = (phase: string) => {
+      const elapsed = Date.now() - (phaseTimings[`${phase}_start`] ?? Date.now());
+      phaseTimings[phase] = elapsed;
+      delete phaseTimings[`${phase}_start`];
+      logger.info({ jobId: ctx.jobId, phase, elapsedMs: elapsed }, `⏱️  Phase timing: ${phase}=${elapsed}ms`);
+    };
+
     // Enforce per-tier input limits
     this.enforceLimits(ctx, tier);
 
@@ -157,9 +173,24 @@ export class ConversionPipeline {
     const irGenerator          = new IRGenerator(opts);
     const codePlanner          = new CodePlanner(opts);
 
-    // ── PHASE 1: AST Analysis (no AI) ─────────────────────
+    // ── PHASE 25 Partie C : Cache key basé sur sourceCode + tier ──
+    // Permet d'éviter tous les appels AI si on a déjà analysé ce code
+    const cacheKey = buildCacheKey(ctx.sourceCode, tier, ctx.sourceLanguage ?? '', ctx.targetFramework ?? '');
+    logger.info({ jobId: ctx.jobId, cacheKey: cacheKey.slice(0, 12) + '…' }, '🔑 Cache key computed');
+
+    // ── PHASE 1: AST Analysis (no AI) — avec cache ────────
+    phaseStart('ast');
     logger.info({ jobId: ctx.jobId }, '📊 Phase 1: AST Analysis');
-    const astResult = await this.astAnalyzer.analyze(ctx);
+    let astResult: Awaited<ReturnType<ASTAnalyzer['analyze']>>;
+    const cachedAst = pipelineCache.astCache.get(cacheKey) as typeof astResult | undefined;
+    if (cachedAst) {
+      astResult = cachedAst;
+      logger.info({ jobId: ctx.jobId }, '✅ Phase 1: AST — cache HIT (0 tokens)');
+    } else {
+      astResult = await this.astAnalyzer.analyze(ctx);
+      pipelineCache.astCache.set(cacheKey, astResult);
+    }
+    phaseEnd('ast');
 
     // ── LOG STRUCTURÉ: AST ────────────────────────────────
     console.log(`\n================ AST ================`);
@@ -188,13 +219,33 @@ export class ConversionPipeline {
     console.log(`Tokens used      : ${astResult.tokensUsed}`);
     console.log(`==============================\n`);
 
-    // ── PHASE 2: Architecture Detection ───────────────────
+    // ── PHASE 2: Architecture Detection — avec cache ───────
+    phaseStart('arch');
     logger.info({ jobId: ctx.jobId, tier }, '🏗️  Phase 2: Architecture Detection');
-    const archResult = await architectureDetector.detect(ctx, astResult);
+    let archResult: Awaited<ReturnType<ArchitectureDetector['detect']>>;
+    const cachedArch = pipelineCache.archCache.get(cacheKey) as typeof archResult | undefined;
+    if (cachedArch) {
+      archResult = cachedArch;
+      logger.info({ jobId: ctx.jobId }, '✅ Phase 2: Architecture — cache HIT (0 tokens)');
+    } else {
+      archResult = await architectureDetector.detect(ctx, astResult);
+      pipelineCache.archCache.set(cacheKey, archResult);
+    }
+    phaseEnd('arch');
 
-    // ── PHASE 3+4: IR Generation + Knowledge Graph ────────
+    // ── PHASE 3+4: IR Generation + Knowledge Graph — avec cache ──
+    phaseStart('ir');
     logger.info({ jobId: ctx.jobId, tier }, '⚙️  Phase 3: IR Generation + Knowledge Graph');
-    const irDocument = await irGenerator.generate(ctx, astResult, archResult);
+    let irDocument: Awaited<ReturnType<IRGenerator['generate']>>;
+    const cachedIR = pipelineCache.irCache.get(cacheKey) as typeof irDocument | undefined;
+    if (cachedIR) {
+      irDocument = cachedIR;
+      logger.info({ jobId: ctx.jobId }, '✅ Phase 3: IR — cache HIT (0 tokens)');
+    } else {
+      irDocument = await irGenerator.generate(ctx, astResult, archResult);
+      pipelineCache.irCache.set(cacheKey, irDocument);
+    }
+    phaseEnd('ir');
 
     // ── LOG STRUCTURÉ: KNOWLEDGE GRAPH ───────────────────
     const kg = irDocument.ir.knowledgeGraph;
@@ -242,13 +293,39 @@ export class ConversionPipeline {
     }
     console.log(`==============================\n`);
 
-    // ── PHASE 4: Mapping Engine ────────────────────────────
+    // ── PHASE 4: Mapping Engine — avec cache ───────────────
+    phaseStart('mapping');
     logger.info({ jobId: ctx.jobId }, '🗺️  Phase 4: Mapping Engine');
-    const mappedIR = await this.mappingEngine.map(ctx, irDocument.ir as never);
+    let mappedIR: Awaited<ReturnType<MappingEngine['map']>>;
+    const mappingCacheKey = buildCacheKey(cacheKey, ctx.targetFramework ?? '');
+    const cachedMapping = pipelineCache.mappingCache.get(mappingCacheKey) as typeof mappedIR | undefined;
+    if (cachedMapping) {
+      mappedIR = cachedMapping;
+      logger.info({ jobId: ctx.jobId }, '✅ Phase 4: Mapping — cache HIT');
+    } else {
+      mappedIR = await this.mappingEngine.map(ctx, irDocument.ir as never);
+      pipelineCache.mappingCache.set(mappingCacheKey, mappedIR);
+    }
+    phaseEnd('mapping');
 
-    // ── PHASE 5: Target Code Plan ──────────────────────────
+    // ── PHASE 5: Target Code Plan — avec cache ─────────────
+    phaseStart('planning');
     logger.info({ jobId: ctx.jobId, tier }, '📋 Phase 5: Code Planning (Reconstruction + Visual Fidelity)');
-    const plan = await codePlanner.plan(ctx, mappedIR);
+    let plan: Awaited<ReturnType<CodePlanner['plan']>>;
+    const planCacheKey = buildCacheKey(cacheKey, ctx.targetFramework ?? '', tier);
+    const cachedPlan = pipelineCache.planCache.get(planCacheKey) as typeof plan | undefined;
+    if (cachedPlan) {
+      plan = cachedPlan;
+      logger.info({ jobId: ctx.jobId }, '✅ Phase 5: Plan — cache HIT (0 tokens)');
+    } else {
+      plan = await codePlanner.plan(ctx, mappedIR);
+      // Ne mettre en cache que si le plan est suffisamment bon (éviter de cacher un plan dégradé)
+      const quickScreenCount = plan.files.filter((f) => /\/(screens?|pages?)\//.test(f.path)).length;
+      if (quickScreenCount > 0) {
+        pipelineCache.planCache.set(planCacheKey, plan);
+      }
+    }
+    phaseEnd('planning');
 
     // ── LOG STRUCTURÉ: RESULT (après planning) ────────────
     const genScreens    = plan.files.filter((f) => /\/(screens?|pages?|app)\/[^/]+\.(tsx?|jsx?)$/.test(f.path) && !/_layout|index|tabs/.test(f.path)).length;
@@ -273,8 +350,10 @@ export class ConversionPipeline {
     this.logCoherenceCheck(astResult, mappedIR, plan.files, ctx.jobId);
 
     // ── PHASE 6: IR Validation ─────────────────────────────
+    phaseStart('validation');
     logger.info({ jobId: ctx.jobId }, '✅ Phase 6: IR Validation');
     const validatedIR = await this.irValidator.validate(mappedIR);
+    phaseEnd('validation');
 
     // ── PHASE 7: Fidelity Score multi-axes ─────────────────────────────────
     logger.info({ jobId: ctx.jobId, tier }, '📐 Phase 7: Fidelity Score Calculation');
@@ -296,12 +375,42 @@ export class ConversionPipeline {
     );
 
     const durationMs = Date.now() - startTime;
+    const tokensUsed = astResult.tokensUsed + archResult.tokensUsed + irDocument.tokensUsed;
+    // ── PHASE 25 Partie F : Log métriques finales ────────────
+    const cacheStats = pipelineCache.getStats();
+    const estimatedCostUSD = (tokensUsed / 1_000) * (tier === 'free-groq' ? 0 : tier === 'platform' ? 0.01 : 0.02);
+    console.log(`\n================ PIPELINE METRICS (Phase 25) ================`);
+    console.log(`Total duration   : ${durationMs}ms`);
+    console.log(`AST time         : ${phaseTimings['ast'] ?? 0}ms`);
+    console.log(`Architecture time: ${phaseTimings['arch'] ?? 0}ms`);
+    console.log(`IR time          : ${phaseTimings['ir'] ?? 0}ms`);
+    console.log(`Mapping time     : ${phaseTimings['mapping'] ?? 0}ms`);
+    console.log(`Planning time    : ${phaseTimings['planning'] ?? 0}ms`);
+    console.log(`Validation time  : ${phaseTimings['validation'] ?? 0}ms`);
+    console.log(`Tokens consumed  : ${tokensUsed}`);
+    console.log(`Est. cost (USD)  : $${estimatedCostUSD.toFixed(4)}`);
+    console.log(`AI tier          : ${tier}`);
+    console.log(`Final score      : ${autoCorrectionReport.finalScore}%`);
+    console.log(`Files generated  : ${correctedPlan.files.length}`);
+    console.log(`Cache stats      : ast=${cacheStats['ast']?.size ?? 0} ir=${cacheStats['ir']?.size ?? 0} plan=${cacheStats['plan']?.size ?? 0}`);
+    console.log(`==============================\n`);
+
     logger.info({
       jobId: ctx.jobId,
       durationMs,
       tier,
+      tokensUsed,
+      estimatedCostUSD,
       finalScore: autoCorrectionReport.finalScore,
       iterations: autoCorrectionReport.iterations,
+      filesGenerated: correctedPlan.files.length,
+      phaseTimes: {
+        ast:      phaseTimings['ast'] ?? 0,
+        arch:     phaseTimings['arch'] ?? 0,
+        ir:       phaseTimings['ir'] ?? 0,
+        mapping:  phaseTimings['mapping'] ?? 0,
+        planning: phaseTimings['planning'] ?? 0,
+      },
     }, '✨ Pipeline completed');
 
     return {
@@ -309,7 +418,7 @@ export class ConversionPipeline {
       ir:         validatedIR,
       files:      correctedPlan.files,
       summary:    correctedPlan.summary,
-      tokensUsed: astResult.tokensUsed + archResult.tokensUsed + irDocument.tokensUsed,
+      tokensUsed,
       durationMs,
       // FIX PHASE 20 — Inclure le tier et modèle IA pour affichage côté frontend
       aiTier:  tier,

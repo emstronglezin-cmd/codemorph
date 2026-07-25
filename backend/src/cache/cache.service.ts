@@ -1,6 +1,10 @@
 // ============================================================
 // CodeMorph — Cache Service
 // Redis-backed caching with typed helpers & TTL management
+// PHASE 25 Partie A : Optimisation Redis
+//   - mgetMany()    : lecture de N clés en 1 seul round-trip (pipeline)
+//   - setMany()     : écriture de N clés en 1 seul round-trip (pipeline)
+//   - rememberMany(): cache-aside multi-clés (1 pipeline read + 1 pipeline write)
 // ============================================================
 import { Injectable, Logger } from '@nestjs/common';
 import { InjectRedis } from '@liaoliaots/nestjs-redis';
@@ -151,6 +155,82 @@ export class CacheService {
     } catch {
       return false;
     }
+  }
+
+  // ── PHASE 25 Partie A : Batch operations ─────────────────
+  // Lire N clés en 1 seul round-trip Redis (MGET via pipeline)
+  // AVANT: N appels get() séparés → N round-trips
+  // APRÈS: 1 pipeline → 1 round-trip → réduction ~(N-1)/N requêtes
+  async mgetMany<T>(keys: string[]): Promise<Map<string, T | null>> {
+    const result = new Map<string, T | null>();
+    if (!keys.length) return result;
+    try {
+      const values = await this.redis.mget(...keys);
+      for (let i = 0; i < keys.length; i++) {
+        const raw = values[i];
+        result.set(keys[i]!, raw ? (JSON.parse(raw) as T) : null);
+      }
+    } catch (err) {
+      this.logger.warn(`Cache mgetMany error: ${(err as Error).message}`);
+      for (const k of keys) result.set(k, null);
+    }
+    return result;
+  }
+
+  // Écrire N clés en 1 seul round-trip Redis (pipeline SETEX)
+  async setMany<T>(entries: Array<{ key: string; value: T; ttl?: number }>): Promise<void> {
+    if (!entries.length) return;
+    try {
+      const pipe = this.redis.pipeline();
+      for (const { key, value, ttl = CacheService.TTL['MEDIUM'] } of entries) {
+        pipe.setex(key, ttl, JSON.stringify(value));
+      }
+      await pipe.exec();
+    } catch (err) {
+      this.logger.warn(`Cache setMany error: ${(err as Error).message}`);
+    }
+  }
+
+  // Cache-aside multi-clés : 1 pipeline read → factories pour les misses → 1 pipeline write
+  async rememberMany<T>(
+    entries: Array<{ key: string; factory: () => Promise<T>; ttl?: number }>,
+  ): Promise<Map<string, T>> {
+    const result = new Map<string, T>();
+    if (!entries.length) return result;
+
+    // 1. Lire tout en une fois
+    const keys   = entries.map((e) => e.key);
+    const cached = await this.mgetMany<T>(keys);
+
+    // 2. Séparer hits et misses
+    const hits:   Array<{ key: string; value: T }>   = [];
+    const misses: Array<{ key: string; factory: () => Promise<T>; ttl?: number }> = [];
+
+    for (const entry of entries) {
+      const val = cached.get(entry.key);
+      if (val !== null && val !== undefined) {
+        hits.push({ key: entry.key, value: val });
+      } else {
+        misses.push(entry);
+      }
+    }
+
+    // Remplir les hits
+    for (const { key, value } of hits) result.set(key, value);
+
+    if (misses.length > 0) {
+      // 3. Calculer les misses en parallèle
+      const computed = await Promise.all(
+        misses.map(async (e) => ({ key: e.key, value: await e.factory(), ttl: e.ttl })),
+      );
+
+      // 4. Écrire tous les résultats en 1 pipeline
+      await this.setMany(computed);
+
+      for (const { key, value } of computed) result.set(key, value);
+    }
+
+    return result;
   }
 
   // ── Stats ────────────────────────────────────────────────

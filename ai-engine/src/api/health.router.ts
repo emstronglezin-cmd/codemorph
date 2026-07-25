@@ -1,5 +1,8 @@
+// PHASE 25 Partie F: Health router enrichi avec métriques pipeline + cache stats
 import { Router, Request, Response } from 'express';
 import os from 'os';
+import { metricsRegistry } from '../core/metrics-tracker';
+import { pipelineCache }   from '../core/pipeline-cache';
 
 export const healthRouter = Router();
 
@@ -56,5 +59,38 @@ healthRouter.get('/readiness', (_req: Request, res: Response): void => {
     checks: {
       openai: ready ? 'ok' : 'missing-api-key',
     },
+  });
+});
+
+// ── PHASE 25 Partie F : GET /api/health/metrics ──────────────
+// Expose métriques pipeline : conversions, tokens, coût, cache, mémoire
+healthRouter.get('/metrics', (_req: Request, res: Response): void => {
+  const summary    = metricsRegistry.getSummary();
+  const recentJobs = metricsRegistry.getHistory(10);
+  const cacheStats = pipelineCache.getStats();
+  const memUsage   = process.memoryUsage();
+
+  res.json({
+    summary,
+    cacheStats,
+    recentJobs: recentJobs.map((j) => ({
+      jobId:          j.jobId,
+      tier:           j.tier,
+      totalMs:        j.timings.total,
+      tokens:         j.tokens.total,
+      costUSD:        j.costUSD,
+      filesGenerated: j.filesGenerated,
+      fidelityScore:  j.fidelityScore,
+      cacheHits:      j.cacheHits,
+    })),
+    process: {
+      heapUsedMB:  Math.round(memUsage.heapUsed / 1024 / 1024),
+      heapTotalMB: Math.round(memUsage.heapTotal / 1024 / 1024),
+      rssMB:       Math.round(memUsage.rss / 1024 / 1024),
+      uptimeS:     Math.round(process.uptime()),
+      cpus:        os.cpus().length,
+      loadAvg1m:   (os.loadavg()[0] ?? 0).toFixed(2),
+    },
+    timestamp: new Date().toISOString(),
   });
 });

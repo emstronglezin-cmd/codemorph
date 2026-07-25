@@ -4,6 +4,10 @@
 // Uses AIProvider — supports Free (Groq), Platform (OpenAI), Pro (user key)
 // PHASE 22: Prompt Maître V2 — system prompts enrichis, extraction métier complète
 // PHASE 23: Prompt Architecte Ultime V3 — Knowledge Graph + Design Tokens
+// PHASE 25 Partie B : Optimisation tokens IA
+//   - MASTER_SYSTEM_PROMPT: version complète pour UIGraph, version compressée pour BackendGraph/DataLayer
+//   - Contexte partagé (stateInfo, navInfo, authInfo, extInfo) calculé 1 fois, réutilisé
+//   - DependencyMap: zéro appel IA si mapping statique dispo (déjà le cas)
 // ============================================================
 import { AIProvider }  from './ai-provider';
 import type {
@@ -371,8 +375,11 @@ export class IRGenerator {
   // ── AI-powered graph generators ────────────────────────────────────────────
 
   // ── PHASE 23: Prompt Architecte Ultime V3 ───────────────────────────────
-  // Superset du Prompt Maître V2 — 8 phases complètes
-  // Injecté comme message SYSTEM dans tous les appels AI
+  // PHASE 25 Partie B: Deux versions pour économiser les tokens
+  //   - MASTER_SYSTEM_PROMPT (complet ~600 tokens): pour UIGraph (analyse principale)
+  //   - MASTER_SYSTEM_PROMPT_SHORT (~200 tokens): pour BackendGraph + DataLayer
+  //
+  // Réduction: ~65% tokens système pour BackendGraph et DataLayer
   private readonly MASTER_SYSTEM_PROMPT = `You are an AI Software Architect specialized in Reverse Engineering, Software Reconstruction, and Multi-Framework Migration.
 
 YOUR MISSION:
@@ -431,6 +438,15 @@ MANDATORY:
 - If unsure about a value, use the actual file/class name from source — never invent a generic name
 
 Return ONLY valid JSON. No markdown. No explanation. No code blocks.`;
+
+  // ── PHASE 25 Partie B: Prompt système compressé ──────────────────────────
+  // ~200 tokens (vs ~600 pour le complet) — utilisé pour BackendGraph + DataLayer
+  // Réduit le budget système pour laisser plus de place à la réponse JSON
+  private readonly MASTER_SYSTEM_PROMPT_SHORT = `You are a Software Architect specialized in code migration.
+RULES: Extract REAL names from source only. Never invent endpoints, methods, or model names.
+MANDATORY: Preserve ALL business logic, API endpoints, models, services, dependencies.
+FORBIDDEN: Placeholders, generic names, invented data.
+Return ONLY valid JSON. No markdown. No explanation.`;
 
   private async generateUIGraph(
     ctx: ConversionContext, ast: ASTResult, _arch: ArchResult, maxTokens: number,
@@ -515,6 +531,8 @@ RULES: Use REAL names from source. Max 15 screens, 20 components. ONLY valid JSO
     console.log(`==============================\n`);
 
     try {
+      // PHASE 25 Partie B: UIGraph utilise le MASTER_SYSTEM_PROMPT complet (analyse principale)
+      // C'est le seul appel qui mérite le prompt complet — les autres utilisent le prompt court
       const res = await this.ai.chat(
         [
           { role: 'system', content: this.MASTER_SYSTEM_PROMPT },
@@ -575,9 +593,11 @@ Return JSON:
 Rules: Use REAL names. Max 10 routes, 8 services. ONLY valid JSON.`;
 
     try {
+      // PHASE 25 Partie B: BackendGraph utilise le prompt COURT (~200 tokens économisés)
+      // Le prompt court garde toutes les règles métier essentielles mais sans les 8 phases
       const res = await this.ai.chat(
         [
-          { role: 'system', content: this.MASTER_SYSTEM_PROMPT },
+          { role: 'system', content: this.MASTER_SYSTEM_PROMPT_SHORT },
           { role: 'user',   content: prompt },
         ],
         Math.min(1400, maxTokens), // FIX: 1400 au lieu de 1200
@@ -611,8 +631,9 @@ Rules: Use REAL names. Max 10 routes, 8 services. ONLY valid JSON.`;
     const prompt = `Analyze data files → JSON dataLayer:\n{"models":[{"name":"User","table":"users","fields":[{"name":"id","type":"String","nullable":false,"unique":true,"primary":true}],"relations":[]}],"relationships":[],"migrations":[]}\n\nFiles (${dataFiles.length} total, showing ${Math.min(dataFiles.length, maxDLFiles)}):\n${filesCtx}\n\nMax 8 models. ONLY valid JSON.`;
 
     try {
+      // PHASE 25 Partie B: DataLayer utilise aussi le prompt COURT (~200 tokens économisés)
       const res = await this.ai.chat([
-        { role: 'system', content: this.MASTER_SYSTEM_PROMPT },
+        { role: 'system', content: this.MASTER_SYSTEM_PROMPT_SHORT },
         { role: 'user', content: prompt },
       ], Math.min(1000, maxTokens)); // FIX: 1000 au lieu de 800
       const data = this.tryParseJSON<IRDocument['dataLayer']>(res.content || '{}', fallback);
