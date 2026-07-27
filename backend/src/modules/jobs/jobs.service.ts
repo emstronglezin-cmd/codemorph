@@ -10,6 +10,11 @@
 //   - CONVERTING jobs watchdog séparé : seuil 5min (au lieu de 15min)
 //   - Un job CONVERTING zombie depuis >5min → FAILED automatiquement
 //   - Après crash Render : tous les CONVERTING → FAILED au démarrage
+// PHASE 26 FIX:
+//   - Redis devient OPTIONNEL : jamais de FAILED sur erreur Redis
+//   - @InjectQueue remplacé par QueueAdapterService
+//   - enqueueJobFireAndForget() bascule sur MemoryQueue si Redis KO
+//   - Dégradation élégante : "Redis unavailable. Using Memory Queue."
 // ============================================================
 import {
   Injectable,
@@ -20,10 +25,10 @@ import {
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, In, LessThan } from 'typeorm';
-import { InjectQueue }       from '@nestjs/bull';
-import { Queue }             from 'bull';
 import { ConfigService }     from '@nestjs/config';
 import { Cron, CronExpression } from '@nestjs/schedule';
+
+import { QueueAdapterService } from '../../queue/queue-adapter.service';
 
 import { JobEntity, JobStatus, JobType } from './jobs.entity';
 import { AiEngineClient }                from './ai-engine.client';
@@ -64,8 +69,9 @@ export class JobsService implements OnModuleInit {
     @InjectRepository(JobEntity)
     private readonly jobRepo: Repository<JobEntity>,
 
-    @InjectQueue('conversion')
-    private readonly conversionQueue: Queue,
+    // PHASE 26 — QueueAdapterService remplace @InjectQueue('conversion')
+    // Auto-sélectionne Redis ou Memory selon disponibilité
+    private readonly queueAdapter: QueueAdapterService,
 
     private readonly aiEngineClient:  AiEngineClient,
     private readonly quotaService:    QuotaService,
@@ -307,10 +313,13 @@ export class JobsService implements OnModuleInit {
     return saved;
   }
 
-  // ── Enqueue Bull (fire-and-forget, jamais awaité par createJob) ──
+  // ── Enqueue (fire-and-forget, jamais awaité par createJob) ──
   // PHASE 15 — cette méthode est appelée sans await.
-  // Toute erreur est capturée ici et marque le job FAILED en DB,
-  // sans jamais bloquer la réponse HTTP ni crasher le process.
+  // PHASE 26 — Redis est OPTIONNEL :
+  //   • Si Redis OK → RedisQueueProvider (Bull)
+  //   • Si Redis KO → MemoryQueueProvider (fallback automatique)
+  //   • Jamais de FAILED pour une erreur d'infrastructure queue
+  //   • L'utilisateur ne voit aucune différence
   private enqueueJobFireAndForget(
     jobId:  string,
     dto:    StartConversionDto,
@@ -323,9 +332,15 @@ export class JobsService implements OnModuleInit {
     // (donc après que NestJS ait sérialisé et envoyé la réponse HTTP)
     setImmediate(() => {
       void (async () => {
-        this.logger.log(`${tag} Fire-and-forget: adding to Bull queue (priority=${limits.queuePriority}) plan=${plan}…`);
+        const provider = this.queueAdapter.providerName;
+        this.logger.log(
+          `${tag} Fire-and-forget: ajout à la file ` +
+          `(provider=${provider}, priority=${limits.queuePriority}, plan=${plan})…`,
+        );
+
         try {
-          await this.conversionQueue.add(
+          // PHASE 26 — QueueAdapterService bascule automatiquement Redis→Memory si besoin
+          await this.queueAdapter.add(
             'run-conversion',
             { jobId, dto },
             {
@@ -334,30 +349,50 @@ export class JobsService implements OnModuleInit {
               backoff:          { type: 'exponential', delay: 2_000 },
               removeOnComplete: 100,
               removeOnFail:     200,
+              plan,
             },
           );
-          this.logger.log(`[PIPELINE] Queue add OK — jobId=${jobId} plan=${plan}`);
-        } catch (queueErr: unknown) {
-          const qMsg = queueErr instanceof Error ? queueErr.message : String(queueErr);
-          this.logger.error(`${tag} ❌ Queue unavailable (Redis?): ${qMsg} — marking job FAILED`);
 
-          // Marquer le job FAILED en DB — le frontend verra l'erreur via polling
+          const activeProvider = this.queueAdapter.providerName;
+          this.logger.log(
+            `[PIPELINE] Queue add OK — jobId=${jobId} plan=${plan} ` +
+            `provider=${activeProvider}`,
+          );
+
+          // PHASE 26 — Log informatif si basculement vers Memory
+          if (activeProvider === 'memory') {
+            this.logger.warn(
+              `[PIPELINE] Redis unavailable. Switching to Local Queue. ` +
+              `Conversion continues. jobId=${jobId}`,
+            );
+          }
+
+        } catch (queueErr: unknown) {
+          // PHASE 26 — Seule la saturation MemoryQueue ou une erreur irrémédiable
+          // atteint ce catch. QueueAdapterService a déjà tenté le fallback Memory.
+          const qMsg = queueErr instanceof Error ? queueErr.message : String(queueErr);
+          this.logger.error(
+            `${tag} ❌ Queue totalement indisponible (Redis ET Memory): ${qMsg} — ` +
+            `marquage FAILED en DB`,
+          );
+
+          // Dernière chance : marquer FAILED uniquement si aucun provider n'a fonctionné
           try {
             await this.jobRepo.update(jobId, {
               status:       JobStatus.FAILED,
-              errorMessage: `Conversion queue unavailable: ${qMsg}. ` +
-                            `Redis may not be configured. Contact support.`,
+              errorMessage: `Impossible d'enqueuer la conversion: ${qMsg}. ` +
+                            `Redis et MemoryQueue sont tous les deux indisponibles.`,
               errorDetails: {
                 cause:     qMsg,
-                hint:      'Set REDIS_URL environment variable or contact support.',
+                hint:      'MemoryQueue saturée (500 jobs max). Réessayez dans quelques minutes.',
                 timestamp: new Date().toISOString(),
               },
               completedAt: new Date(),
             });
-            this.logger.log(`${tag} Job marked FAILED in DB after queue error`);
+            this.logger.log(`${tag} Job marqué FAILED en DB (queue totalement indisponible)`);
           } catch (dbErr: unknown) {
             const dbMsg = dbErr instanceof Error ? dbErr.message : String(dbErr);
-            this.logger.error(`${tag} Also failed to update DB after queue error: ${dbMsg}`);
+            this.logger.error(`${tag} Échec mise à jour DB après erreur queue: ${dbMsg}`);
           }
         }
       })();
