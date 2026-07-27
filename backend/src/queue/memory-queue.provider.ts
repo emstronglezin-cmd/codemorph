@@ -15,12 +15,31 @@
 //   • Jobs terminés supprimés après COMPLETED_TTL_MS
 //   • Payload limité (pas de stockage des fichiers en RAM)
 //
+// NOTE ARCHITECTURE (Phase 26.1) :
+//   ConversionProcessorService est injecté via setProcessor() (setter injection)
+//   pour éviter la dépendance circulaire :
+//   QueueModule → MemoryQueueProvider → ConversionProcessorService (JobsModule) ← JobsModule
+//   La setter injection est appelée par JobsModule après la construction des providers.
+//
 // L'utilisateur ne voit AUCUNE différence avec le chemin Redis.
 // ============================================================
 import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
 
-import { IQueueProvider, JobOptions }         from './queue.provider.interface';
-import { ConversionProcessorService, ConversionJobPayload } from './conversion-processor.service';
+import { IQueueProvider, JobOptions } from './queue.provider.interface';
+
+/** Interface minimale du processeur (évite import circulaire) */
+export interface IConversionProcessor {
+  processConversionJob(
+    payload:     { jobId: string; dto: Record<string, unknown> },
+    attemptInfo: { attemptsMade: number },
+  ): Promise<void>;
+}
+
+/** Payload d'un job de conversion */
+export interface MemoryJobPayload {
+  jobId: string;
+  dto:   Record<string, unknown>;
+}
 
 /** Nombre max de jobs en attente dans la file mémoire */
 const MAX_QUEUE_SIZE = 500;
@@ -78,9 +97,25 @@ export class MemoryQueueProvider implements IQueueProvider, OnModuleDestroy {
   /** Compteur auto-incrémenté pour les IDs */
   private jobCounter = 0;
 
-  constructor(private readonly processorService: ConversionProcessorService) {
+  /**
+   * Processeur injecté via setter (évite circularité avec JobsModule).
+   * Initialisé par JobsModule.registerProcessor() après construction.
+   */
+  private processor: IConversionProcessor | null = null;
+
+  constructor() {
     // Nettoyage toutes les 2 minutes
     this.cleanupTimer = setInterval(() => this.cleanupCompletedJobs(), COMPLETED_TTL_MS);
+  }
+
+  /**
+   * Setter injection du processeur de conversion.
+   * Appelé par JobsModule après la construction de tous les providers
+   * pour éviter la dépendance circulaire.
+   */
+  setProcessor(processor: IConversionProcessor): void {
+    this.processor = processor;
+    this.logger.log('[MemoryQueue] ConversionProcessorService injecté ✓');
   }
 
   onModuleDestroy(): void {
@@ -102,6 +137,13 @@ export class MemoryQueueProvider implements IQueueProvider, OnModuleDestroy {
   async add(name: string, data: unknown, opts?: JobOptions): Promise<void> {
     if (this.shuttingDown) {
       throw new Error('MemoryQueue: module en cours d\'arrêt, rejet du job');
+    }
+
+    if (!this.processor) {
+      throw new Error(
+        'MemoryQueue: processeur non initialisé. ' +
+        'JobsModule.setMemoryQueueProcessor() doit être appelé au démarrage.',
+      );
     }
 
     if (this.waitingQueue.length >= MAX_QUEUE_SIZE) {
@@ -132,16 +174,17 @@ export class MemoryQueueProvider implements IQueueProvider, OnModuleDestroy {
   }
 
   isHealthy(): boolean {
-    return !this.shuttingDown && this.waitingQueue.length < MAX_QUEUE_SIZE;
+    return !this.shuttingDown && this.waitingQueue.length < MAX_QUEUE_SIZE && this.processor !== null;
   }
 
   // ── Statistiques (pour monitoring) ────────────────────────
   getStats(): {
-    waiting: number;
-    active:  number;
-    completed: number;
-    workers:   number;
+    waiting:    number;
+    active:     number;
+    completed:  number;
+    workers:    number;
     maxWorkers: number;
+    processorReady: boolean;
   } {
     return {
       waiting:    this.waitingQueue.length,
@@ -149,12 +192,12 @@ export class MemoryQueueProvider implements IQueueProvider, OnModuleDestroy {
       completed:  this.completedJobs.size,
       workers:    this.activeWorkerCount,
       maxWorkers: DEFAULT_CONCURRENCY,
+      processorReady: this.processor !== null,
     };
   }
 
   // ── Planifier le prochain worker ──────────────────────────
   private scheduleNextWorker(): void {
-    // Pas de setImmediate si shutdown ou concurrence max atteinte
     if (this.shuttingDown) return;
     if (this.activeWorkerCount >= DEFAULT_CONCURRENCY) return;
     if (this.waitingQueue.length === 0) return;
@@ -249,10 +292,15 @@ export class MemoryQueueProvider implements IQueueProvider, OnModuleDestroy {
       throw new Error(`MemoryQueue: job name inconnu: ${job.name}`);
     }
 
-    const payload = job.data as ConversionJobPayload;
-    await this.processorService.processConversionJob(payload, {
-      attemptsMade: job.attemptsMade,
-    });
+    if (!this.processor) {
+      throw new Error('MemoryQueue: processeur non disponible');
+    }
+
+    const payload = job.data as MemoryJobPayload;
+    await this.processor.processConversionJob(
+      payload as Parameters<IConversionProcessor['processConversionJob']>[0],
+      { attemptsMade: job.attemptsMade },
+    );
   }
 
   // ── Calcul du backoff exponentiel ─────────────────────────
@@ -261,7 +309,6 @@ export class MemoryQueueProvider implements IQueueProvider, OnModuleDestroy {
     const delay = job.opts.backoff?.delay ?? INITIAL_BACKOFF_MS;
 
     if (type === 'fixed') return delay;
-    // Exponentiel: delay * 2^(attempt-1), plafonné à 30s
     return Math.min(delay * Math.pow(2, job.attemptsMade - 1), 30_000);
   }
 

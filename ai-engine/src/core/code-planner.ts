@@ -274,21 +274,12 @@ export class CodePlanner {
       return moduleNames.slice(0, 10);
     }
 
-    // Use projectMeta source files count as signal
-    const projectMeta = ir.projectMeta;
-    if (projectMeta?.description) {
-      // Extract meaningful screen name from project description
-      const words = projectMeta.description.split(' ').filter((w) => w.length > 3);
-      if (words.length > 0) {
-        const name = this.pascal(words[0] ?? '');
-        console.log(`[CodePlanner] inferScreensFromSourceFiles: inferred from project description — ${name}Screen`);
-        return [`${name}Screen`];
-      }
-    }
-
-    // STRICT: no generic names allowed — log warning and return empty
-    // The caller must handle the empty case without generating HomeScreen/DetailsScreen
-    console.warn(`[CodePlanner] inferScreensFromSourceFiles: no source data available — skipping generic fallback (Prompt Maître V2 prohibition)`);
+    // PHASE 26.1 AUDIT — Suppression du fallback basé sur projectMeta.description.
+    // Ce fallback générait des noms comme "TodoScreen" (depuis "Todo app description")
+    // qui sont sémantiquement arbitraires et non basés sur la structure réelle.
+    // STRICT: si les modules UI ne contiennent pas de données réelles → retourner []
+    // Le caller DOIT gérer le cas vide sans générer HomeScreen/DetailsScreen.
+    console.warn(`[CodePlanner] inferScreensFromSourceFiles: no source module data available — returning [] (Phase 26.1 prohibition: no description-based inference)`);
     return [];
   }
 
@@ -641,17 +632,29 @@ Return ONLY the complete file content.`;
       //                CodeMorph App, Placeholder, Skeleton, Mock Data
       // ATTENTION: ne pas rejeter "TODO" dans les commentaires de logique métier réelle
       // — rejeter seulement si le NOM de l'écran est générique ou si c'est un template vide
+      // PHASE 26.1 AUDIT — Liste COMPLÈTE des patterns génériques interdits.
+      // Chaque entrée protège contre un vecteur de dégradation spécifique.
+      // IMPORTANT: ne pas bloque "HomeScreen" s'il est un vrai nom de classe de l'appli
+      // source — mais bloquer tous les écrans purement génériques / de démonstration.
       const FORBIDDEN_GENERIC_PATTERNS = [
-        /\bCodeMorph\s+App\b/i,         // "CodeMorph App" — template générique
-        /\bPlaceholder Screen\b/i,        // placeholder explicit
-        /\bSkeleton Screen\b/i,           // skeleton template
-        /\bMock Data\b/i,                 // données fictives
-        /Lorem ipsum/i,                   // texte fictif
-        /\bExample Component\b/i,         // composant exemple
-        /\bDemo Screen\b/i,               // demo
-        /\bTemplate Screen\b/i,           // template
-        /\bSample Screen\b/i,             // sample
-        /\bHomeScreen\b.*\bPlaceholder\b/i, // HomeScreen+Placeholder ensemble
+        /\bCodeMorph\s+App\b/i,               // template CodeMorph générique
+        /\bPlaceholder\s+Screen\b/i,           // placeholder explicite
+        /\bSkeleton\s+Screen\b/i,              // skeleton template
+        /\bMock\s+Data\b/i,                    // données fictives
+        /Lorem ipsum/i,                        // texte fictif
+        /\bExample\s+Component\b/i,            // composant exemple
+        /\bDemo\s+Screen\b/i,                  // démo
+        /\bTemplate\s+Screen\b/i,              // template
+        /\bSample\s+Screen\b/i,                // sample
+        /\bHomeScreen\b.*\bPlaceholder\b/i,    // HomeScreen + Placeholder ensemble
+        /\bDetailsScreen\b.*\bPlaceholder\b/i, // DetailsScreen + Placeholder ensemble
+        // Contenu générique: fonctions/commentaires 100% inventés
+        /\/\/\s*TODO:\s*implement/i,           // TODO implement sans contenu
+        /\/\/\s*Add\s+your\s+content\s+here/i, // placeholder content
+        /\/\/\s*Your\s+content\s+here/i,       // placeholder content variant
+        /This is a\s+\w+\s+screen/i,          // description générique "This is a X screen"
+        /Replace\s+this\s+with\s+your/i,      // instruction placeholder
+        /\bcoming\s+soon\b/i,                  // coming soon placeholder
       ];
 
       // Rejeter si le contenu correspond à un pattern générique strict

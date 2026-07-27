@@ -1,19 +1,24 @@
 // ============================================================
 // CodeMorph — Jobs Module
-// PHASE 26 — Bull/Redis devient OPTIONNEL
+// PHASE 26.1 — Architecture DI correcte
 //
-// Architecture Phase 26 :
-//   • BullModule.registerQueue() est TOUJOURS enregistré
-//     (NestJS Bull en a besoin même si Redis est KO, grâce à lazyConnect)
-//   • QueueAdapterService détecte Redis au démarrage et bascule
-//     automatiquement vers MemoryQueueProvider si indisponible
-//   • JobsProcessor (Bull) fonctionne si Redis est disponible
-//   • MemoryQueueProvider fonctionne si Redis est indisponible
-//   • ConversionProcessorService est la logique partagée des deux
+// Providers dans CE module (scope correct pour éviter problèmes DI) :
+//   • JobsService            — logique métier jobs
+//   • JobsProcessor          — adaptateur Bull → ConversionProcessorService
+//   • ConversionProcessorService — logique partagée Bull/Memory
+//   • QueueAdapterService    — ICI (accès à BullModule dans ce scope)
+//   • AiEngineClient         — HTTP vers AI Engine
+//   • JobsModuleInit         — setter injection post-construction
 //
-// PRIORITÉ 9 : Aucun changement fonctionnel — API et frontend inchangés
+// Modules importés :
+//   • QueueModule            — fournit MemoryQueueProvider uniquement
+//
+// Flux DI (résolution circulaire) :
+//   1. Tous les providers construits par NestJS
+//   2. JobsModuleInit.onModuleInit() → memoryProvider.setProcessor(convProcessor)
+//   3. MemoryQueueProvider peut maintenant exécuter des jobs
 // ============================================================
-import { Module }        from '@nestjs/common';
+import { Module, Injectable, OnModuleInit } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { BullModule }    from '@nestjs/bull';
 import { HttpModule }    from '@nestjs/axios';
@@ -28,16 +33,32 @@ import { UploadsModule }   from '../uploads/uploads.module';
 import { QuotaModule }     from '../quota/quota.module';
 import { SubscriptionModule } from '../subscription/subscription.module';
 
-// PHASE 26 — Module d'abstraction de file (Redis + Memory fallback)
-import { QueueModule } from '../../queue/queue.module';
+import { ConversionProcessorService } from '../../queue/conversion-processor.service';
+import { MemoryQueueProvider }        from '../../queue/memory-queue.provider';
+import { QueueAdapterService }        from '../../queue/queue-adapter.service';
+import { QueueModule }                from '../../queue/queue.module';
+
+/**
+ * Initialisation post-construction — résout la circularité.
+ * Injecte ConversionProcessorService dans MemoryQueueProvider.
+ */
+@Injectable()
+class JobsModuleInit implements OnModuleInit {
+  constructor(
+    private readonly memoryProvider: MemoryQueueProvider,
+    private readonly convProcessor:  ConversionProcessorService,
+  ) {}
+
+  onModuleInit(): void {
+    this.memoryProvider.setProcessor(this.convProcessor);
+  }
+}
 
 @Module({
   imports: [
     TypeOrmModule.forFeature([JobEntity]),
 
-    // Bull queue — toujours enregistré.
-    // Si Redis est KO, lazyConnect=true (configuré dans app.module.ts BullModule.forRootAsync)
-    // empêche le crash au démarrage. QueueAdapterService gère le fallback Memory.
+    // Bull queue — lazyConnect=true dans app.module.ts évite crash si Redis KO
     BullModule.registerQueue({
       name: 'conversion',
       defaultJobOptions: {
@@ -54,16 +75,19 @@ import { QueueModule } from '../../queue/queue.module';
     QuotaModule,
     SubscriptionModule,
 
-    // PHASE 26 — QueueModule fournit QueueAdapterService + MemoryQueueProvider
-    // + ConversionProcessorService (logique partagée Bull/Memory)
+    // QueueModule fournit uniquement MemoryQueueProvider
     QueueModule,
   ],
   providers: [
     JobsService,
-    // JobsProcessor gère le chemin Bull (Redis disponible)
-    // MemoryQueueProvider gère le chemin Memory (Redis KO), fourni par QueueModule
     JobsProcessor,
+    ConversionProcessorService,
+    // QueueAdapterService ICI — accède à BullModule.registerQueue('conversion')
+    // via le scope de ce module (injection @InjectQueue fonctionne correctement)
+    QueueAdapterService,
     AiEngineClient,
+    // Initialisation post-construction
+    JobsModuleInit,
   ],
   controllers: [JobsController],
   exports:     [JobsService, AiEngineClient],

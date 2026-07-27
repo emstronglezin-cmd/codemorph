@@ -1,45 +1,18 @@
 // ============================================================
 // CodeMorph — QueueModule
-// PHASE 26 — Module NestJS pour l'abstraction de file
+// PHASE 26.1 — MemoryQueueProvider uniquement
 //
-// Exporte :
-//   • QueueAdapterService (IQueueProvider actif)
-//   • MemoryQueueProvider (fallback mémoire)
-//   • ConversionProcessorService (logique partagée Bull/Memory)
+// Ce module fournit uniquement MemoryQueueProvider.
+// QueueAdapterService est dans JobsModule (qui a accès à BullModule).
 //
-// Ce module est importé par JobsModule.
-// JobsModule importe optionnellement BullModule.registerQueue().
+// Évite la dépendance circulaire et les problèmes de scope NestJS.
 // ============================================================
-import { Module }  from '@nestjs/common';
-import { HttpModule } from '@nestjs/axios';
+import { Module } from '@nestjs/common';
 
-import { QueueAdapterService }       from './queue-adapter.service';
-import { MemoryQueueProvider }       from './memory-queue.provider';
-import { ConversionProcessorService } from './conversion-processor.service';
-
-// Imports nécessaires pour ConversionProcessorService
-import { GitHubModule }      from '../modules/github/github.module';
-import { UploadsModule }     from '../modules/uploads/uploads.module';
-import { QuotaModule }       from '../modules/quota/quota.module';
-import { SubscriptionModule } from '../modules/subscription/subscription.module';
+import { MemoryQueueProvider } from './memory-queue.provider';
 
 @Module({
-  imports: [
-    HttpModule.register({ timeout: 130_000, maxRedirects: 3 }),
-    GitHubModule,
-    UploadsModule,
-    QuotaModule,
-    SubscriptionModule,
-  ],
-  providers: [
-    MemoryQueueProvider,
-    ConversionProcessorService,
-    QueueAdapterService,
-  ],
-  exports: [
-    QueueAdapterService,
-    MemoryQueueProvider,
-    ConversionProcessorService,
-  ],
+  providers: [MemoryQueueProvider],
+  exports:   [MemoryQueueProvider],
 })
 export class QueueModule {}
