@@ -124,7 +124,7 @@ export class CodePlanner {
       this.staticFile('app.json',               this.rnAppJson(ctx.projectId)),
       this.staticFile('babel.config.js',        RN_BABEL_CONFIG),
       this.staticFile('app/(tabs)/_layout.tsx', RN_TAB_LAYOUT),
-      this.staticFile('app/index.tsx',          RN_INDEX),
+      // BUG-P27-09: index.tsx injecté plus bas avec le nom du premier écran réel
       this.staticFile('src/lib/api.ts',         RN_API_CLIENT),
       this.staticFile('src/lib/storage.ts',     RN_STORAGE),
       this.staticFile('src/hooks/useApi.ts',    RN_USE_API_HOOK),
@@ -147,16 +147,21 @@ export class CodePlanner {
 
     // ── Screens from IR ────────────────────────────────────
     if (screens.length > 0) {
+      let firstScreenSlug = '';
       for (const screen of screens) {
         const content = await this.generateScreenFile(ctx, ir, screen.name, screen.components ?? [], 'react-native');
+        const screenSlug = screen.name.toLowerCase().replace(/screen$/i, '');
+        if (!firstScreenSlug) firstScreenSlug = screenSlug;
         files.push({
-          path:     `app/${screen.name.toLowerCase()}.tsx`,
+          path:     `app/${screenSlug}.tsx`,
           content,
           language: 'typescript',
           fromPath: screen.path,
           warnings: [],
         });
       }
+      // BUG-P27-09 FIX: index.tsx redirige vers le premier écran réel
+      files.push(this.staticFile('app/index.tsx', RN_INDEX_TEMPLATE(firstScreenSlug || screens[0]!.name)));
       // Generate navigation stack with all screens
       files.push({
         path:     'app/_layout.tsx',
@@ -173,15 +178,18 @@ export class CodePlanner {
       console.log(`[CodePlanner] Inferred ${fallbackScreens.length} screens from source architecture`);
 
       if (fallbackScreens.length > 0) {
+        const firstFallbackSlug = fallbackScreens[0]!.replace(/Screen$/i, '').toLowerCase();
         for (const screenName of fallbackScreens) {
           const content = this.fallbackScreen(screenName, 'react-native');
           files.push({
-            path:     `app/${screenName.replace(/Screen$/, '').toLowerCase()}.tsx`,
+            path:     `app/${screenName.replace(/Screen$/i, '').toLowerCase()}.tsx`,
             content,
             language: 'typescript',
             warnings: ['Generated from source module analysis — review recommended'],
           });
         }
+        // BUG-P27-09 FIX: index.tsx avec nom du vrai écran inféré
+        files.push(this.staticFile('app/index.tsx', RN_INDEX_TEMPLATE(firstFallbackSlug)));
         files.push({
           path:     'app/_layout.tsx',
           content:  this.generateRNRootLayoutFromNames(fallbackScreens),
@@ -190,7 +198,8 @@ export class CodePlanner {
         });
       } else {
         // Aucune donnée source disponible — log uniquement, aucun fichier générique
-        console.warn(`[CodePlanner] PHASE22: No screens could be inferred from IR. No generic screens generated (Prompt Maître V2 prohibition). Check IR quality.`);
+        // BUG-P27-09 FIX: même sans écrans inférés, pas d'index générique
+        console.warn(`[CodePlanner] PHASE22/27: No screens could be inferred from IR. No generic screens generated. Check IR quality and Groq token budget.`);
       }
     }
 
@@ -456,15 +465,19 @@ src/
   private async planNestJS(ctx: ConversionContext, ir: IRDocument): Promise<CodePlan> {
     const files: GeneratedFile[] = [];
 
+    // BUG-P27-10 FIX: NEST_APP_MODULE généré dynamiquement avec les vrais modules
+    const architecture = ir.architecture ?? { modules: [], patterns: [], layers: [] };
+    const featureModules = (architecture.modules ?? []).filter((m) => m.type === 'feature');
+    const dynamicAppModule = this.generateNestAppModule(featureModules.map((m) => m.name));
+
     files.push(
       this.staticFile('package.json',          this.nestPackageJson(ctx.projectId)),
       this.staticFile('tsconfig.json',         NEST_TSCONFIG),
       this.staticFile('src/main.ts',           NEST_MAIN),
-      this.staticFile('src/app.module.ts',     NEST_APP_MODULE),
+      this.staticFile('src/app.module.ts',     dynamicAppModule),
     );
 
     // Generate modules from IR architecture (defensive guards — ir.architecture may be undefined without OpenAI key)
-    const architecture = ir.architecture ?? { modules: [], patterns: [], layers: [] };
     const backendGraph = ir.backendGraph ?? { routes: [], services: [], middlewares: [], entities: [] };
     const dataLayer = ir.dataLayer ?? { models: [], migrations: [], seeders: [] };
 
@@ -780,6 +793,34 @@ ${routes}
 `;
   }
 
+  // BUG-P27-10 FIX: AppModule dynamique avec vrais modules injectés
+  private generateNestAppModule(moduleNames: string[]): string {
+    const importLines = moduleNames.map((n) => {
+      const pascal = this.pascal(n);
+      return `import { ${pascal}Module } from './modules/${n.toLowerCase()}/${n.toLowerCase()}.module';`;
+    }).join('\n');
+    const moduleList = moduleNames.map((n) => `    ${this.pascal(n)}Module,`).join('\n');
+    return `import { Module } from '@nestjs/common';
+import { ConfigModule } from '@nestjs/config';
+import { TypeOrmModule } from '@nestjs/typeorm';
+${importLines}
+
+@Module({
+  imports: [
+    ConfigModule.forRoot({ isGlobal: true }),
+    TypeOrmModule.forRoot({
+      type: 'postgres',
+      url: process.env['DATABASE_URL'],
+      autoLoadEntities: true,
+      synchronize: process.env['NODE_ENV'] !== 'production',
+    }),
+${moduleList}
+  ],
+})
+export class AppModule {}
+`;
+  }
+
   private generateNestModule(name: string): string {
     const n = this.pascal(name);
     return `import { Module } from '@nestjs/common';
@@ -885,13 +926,19 @@ export class ${this.pascal(migration.name)}${Date.now()} implements MigrationInt
 `;
   }
 
-  // ── PHASE 22: Prompt Maître V2 — Plus de fallbacks avec templates vides ─
-  // fallbackScreen() appelé uniquement quand l'AI échoue complètement
-  // Le contenu généré doit être un VRAI squelette fonctionnel, pas un placeholder
-  private fallbackScreen(name: string, framework: string): string {
-    // PHASE 22: Générer un squelette fonctionnel minimal — jamais un écran vide
+  // ── PHASE 27: fallbackScreen() — squelette fonctionnel basé sur l'IR ────
+  // BUG-P27-11 FIX: l'endpoint API n'est plus inventé génériquement
+  // Il est tiré du nom de l'écran + patterns du projet source
+  private fallbackScreen(name: string, framework: string, irContext?: IRDocument): string {
     // Utiliser le vrai nom de l'écran avec un layout professionnel
-    const cleanName = name.replace(/Screen$/, '');
+    const cleanName = name.replace(/Screen$/i, '');
+    // BUG-P27-11 FIX: chercher un endpoint réel dans l'IR
+    const screenRoutes = irContext?.backendGraph?.routes?.filter((r) =>
+      r.path.toLowerCase().includes(cleanName.toLowerCase())
+    ) ?? [];
+    const apiEndpoint = screenRoutes.length > 0
+      ? screenRoutes[0]!.path
+      : `/${cleanName.toLowerCase()}`;
     if (framework === 'react') {
       return `import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
@@ -911,8 +958,8 @@ export function ${name}(): React.JSX.Element {
     const load = async () => {
       try {
         setLoading(true);
-        // Configure API endpoint based on screen purpose
-        const res = await apiClient.get('/${cleanName.toLowerCase()}');
+        // API endpoint derived from source analysis
+        const res = await apiClient.get('${apiEndpoint}');
         setData(res.data);
       } catch (err) {
         setError((err as Error).message);
@@ -958,7 +1005,7 @@ export default function ${cleanName}(): React.JSX.Element {
   useEffect(() => {
     void (async () => {
       try {
-        const res = await apiClient.get<unknown[]>('/${cleanName.toLowerCase()}');
+        const res = await apiClient.get<unknown[]>('${apiEndpoint}');
         setData(res.data);
       } catch (err) {
         setError((err as Error).message);
@@ -1322,7 +1369,12 @@ EXPO_PUBLIC_APP_NAME=MyApp
 `;
 
 const RN_TAB_LAYOUT = `import { Tabs } from 'expo-router';\nimport React from 'react';\nexport default function TabLayout(): React.JSX.Element { return <Tabs><Tabs.Screen name="index" options={{ title: 'Home' }} /></Tabs>; }\n`;
-const RN_INDEX = `import React from 'react';\nimport { View, Text, StyleSheet } from 'react-native';\nexport default function Home(): React.JSX.Element { return <View style={s.c}><Text style={s.t}>Home</Text></View>; }\nconst s = StyleSheet.create({ c: { flex: 1, alignItems: 'center', justifyContent: 'center' }, t: { fontSize: 24, fontWeight: 'bold' } });\n`;
+// BUG-P27-09 FIX: RN_INDEX ne doit PAS être un écran générique "Home" vide.
+// Il sert de point d'entrée qui redirige vers le premier écran réel de l'appli.
+// Le nom de l'écran initial est injecté dynamiquement par generateRNRootLayoutFromNames().
+const RN_INDEX_TEMPLATE = (firstScreen: string): string =>
+  `import React, { useEffect } from 'react';\nimport { useRouter } from 'expo-router';\n\n/**\n * Entry point — redirects to the first app screen after initialization\n */\nexport default function Index(): React.JSX.Element {\n  const router = useRouter();\n  useEffect(() => {\n    // Redirect to main screen immediately\n    router.replace('/${firstScreen.toLowerCase().replace(/screen$/i, '')}');\n  }, [router]);\n  return <></>;\n}\n`;
 const NEST_TSCONFIG = `{"compilerOptions":{"module":"CommonJS","declaration":true,"removeComments":true,"emitDecoratorMetadata":true,"experimentalDecorators":true,"allowSyntheticDefaultImports":true,"target":"ES2021","sourceMap":true,"outDir":"./dist","baseUrl":"./","strict":true,"skipLibCheck":true,"forceConsistentCasingInFileNames":true}}`;
 const NEST_MAIN = `import { NestFactory } from '@nestjs/core';\nimport { ValidationPipe } from '@nestjs/common';\nimport { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';\nimport { AppModule } from './app.module';\nasync function bootstrap(): Promise<void> {\n  const app = await NestFactory.create(AppModule);\n  app.setGlobalPrefix('api/v1');\n  app.useGlobalPipes(new ValidationPipe({ whitelist: true, transform: true }));\n  const config = new DocumentBuilder().setTitle('API').setVersion('1.0').addBearerAuth().build();\n  SwaggerModule.setup('api/docs', app, SwaggerModule.createDocument(app, config));\n  await app.listen(4000);\n  console.log('🚀 NestJS running on http://localhost:4000');\n}\nboostrap();\n`;
-const NEST_APP_MODULE = `import { Module } from '@nestjs/common';\nimport { ConfigModule } from '@nestjs/config';\n\n@Module({\n  imports: [\n    ConfigModule.forRoot({ isGlobal: true }),\n    // Auto-generated NestJS modules\n  ],\n})\nexport class AppModule {}\n`;
+// BUG-P27-10 FIX: NEST_APP_MODULE remplacé par CodePlanner.generateNestAppModule() dynamique
+// (constante statique supprimée — utiliser la méthode de classe qui injecte les vrais modules)

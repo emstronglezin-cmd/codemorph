@@ -166,15 +166,37 @@ export class ConversionProcessorService {
       }
 
       // ── Phase 4: Envoi à l'AI Engine ──────────────────────
+      // PHASE 27 — BUG-P27-12 FIX: Observabilité renforcée à chaque étape
+      const totalChars = files.reduce((acc, f) => acc + (f.content?.length ?? 0), 0);
+      const screenFiles = files.filter((f) => /screen|page|view/i.test(f.path)).length;
+      const serviceFiles = files.filter((f) => /service|repository/i.test(f.path)).length;
+      const modelFiles = files.filter((f) => /model|entity|dto/i.test(f.path)).length;
+      const storeFiles = files.filter((f) => /bloc|cubit|store|provider|getx/i.test(f.path)).length;
+
       this.logger.log(
-        `[PIPELINE] AI request sent — ${files.length} fichiers, ` +
-        `${dto.sourceLanguage}→${dto.targetLanguage}`,
+        `[PIPELINE] ═══════════════════════════════════════════════`,
       );
+      this.logger.log(
+        `[PIPELINE] DISPATCH TO AI ENGINE — jobId=${jobId}`,
+      );
+      this.logger.log(
+        `[PIPELINE] Source: ${dto.sourceLanguage} → Target: ${dto.targetLanguage}`,
+      );
+      this.logger.log(
+        `[PIPELINE] Files: total=${files.length} screens=${screenFiles} services=${serviceFiles} models=${modelFiles} stores=${storeFiles}`,
+      );
+      this.logger.log(
+        `[PIPELINE] Source code: ${totalChars.toLocaleString()} chars (${Math.round(totalChars / 1000)}K)`,
+      );
+      this.logger.log(
+        `[PIPELINE] Plan: ${plan} | Goal: ${dto.goalPrompt ? dto.goalPrompt.slice(0, 80) + '…' : '(none)'}`,
+      );
+
       await this.jobsService.updateStatus(jobId, JobStatus.CONVERTING);
       await this.jobsService.appendLog(
         jobId, 'ir-generation', 'running',
-        `Envoi de ${files.length} fichiers à l'AI Engine ` +
-        `(${dto.sourceLanguage}→${dto.targetLanguage}, plan=${plan})…`,
+        `[Phase 27] Envoi de ${files.length} fichiers (${Math.round(totalChars/1000)}K chars) à l'AI Engine ` +
+        `(${dto.sourceLanguage}→${dto.targetLanguage}, plan=${plan}) — screens=${screenFiles} services=${serviceFiles}…`,
       );
 
       const dbJob   = await this.jobsService.findById(jobId);
@@ -185,10 +207,11 @@ export class ConversionProcessorService {
       });
       await this.jobsService.appendLog(
         jobId, 'ir-generation', 'running',
-        `AI Engine job ${aiJobId} démarré — en attente du callback…`,
+        `AI Engine job ${aiJobId} démarré — en attente du callback (Phase 27: pipeline 10-axes actif)…`,
       );
 
-      this.logger.log(`[PIPELINE] AI réponse reçue — aiJobId=${aiJobId}, en attente callback`);
+      this.logger.log(`[PIPELINE] ✅ AI dispatch OK — aiJobId=${aiJobId}, en attente du callback Phase 27`);
+      this.logger.log(`[PIPELINE] ═══════════════════════════════════════════════`);
 
       // Comptabiliser l'utilisation AI
       await this.quotaService.incrementConversions(dto.userId, plan);

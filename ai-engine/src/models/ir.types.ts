@@ -451,7 +451,7 @@ export interface IRAnimationToken {
 // ── Phase 7 : Score de fidélité multi-axes ────────────────────────────────────
 
 export interface IRFidelityScore {
-  // Axes de mesure (0-100 chacun)
+  // Axes de mesure (0-100 chacun) — PHASE 27: 10 axes
   businessLogic: number;  // couverture règles métier
   navigation:    number;  // routes / transitions conservées
   api:           number;  // endpoints + méthodes HTTP conservés
@@ -459,6 +459,10 @@ export interface IRFidelityScore {
   components:    number;  // composants UI conservés
   models:        number;  // modèles de données conservés
   uiFidelity:    number;  // fidélité visuelle (tokens + layout)
+  // ── PHASE 27: 3 axes supplémentaires ────────────────────────
+  dataLayer:     number;  // couverture couche données (entités, migrations, relations)
+  assets:        number;  // assets recréés (images, fonts, icons)
+  functional:    number;  // fonctionnalités testables (auth, navigation, formulaires)
   overall:       number;  // moyenne pondérée — indicateur principal
   // Détail par axe
   details:       IRFidelityDetail[];

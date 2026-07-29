@@ -5,10 +5,12 @@
 // Détecte: Bloc/Cubit/Riverpod/GetX/MobX/Firebase/Supabase/GraphQL/WebSocket/gRPC/OAuth/JWT
 // PHASE 23: Prompt Architecte Ultime V3 — Phase 1 extraction totale
 // Extrait également: README, Docker, CI/CD, tests, scripts, configs
+// PHASE 27: BUG-P27-08 FIX — utilise AIProvider au lieu d'OpenAI direct
+//   OpenAI direct échouait silencieusement sur free-groq (pas d'openaiApiKey)
+//   → classNames=[] → IR sans données → génération de templates génériques
 // ============================================================
-import OpenAI from 'openai';
-import { appConfig } from '../config/app.config';
 import type { ConversionContext } from '../models/ir.types';
+import { AIProvider } from './ai-provider';
 
 export interface ASTResult {
   files:        ASTFile[];
@@ -104,10 +106,12 @@ export interface ASTDependency {
 }
 
 export class ASTAnalyzer {
-  private readonly openai: OpenAI;
+  // BUG-P27-08 FIX: AIProvider au lieu d'OpenAI direct
+  // Fonctionne sur tous les tiers (groq, platform, pro, static)
+  private readonly ai: AIProvider;
 
-  constructor() {
-    this.openai = new OpenAI({ apiKey: appConfig.openaiApiKey });
+  constructor(opts?: { userOpenAIKey?: string; userAnthropicKey?: string }) {
+    this.ai = new AIProvider(opts);
   }
 
   async analyze(ctx: ConversionContext): Promise<ASTResult> {
@@ -518,31 +522,38 @@ Rules:
 - Include ALL exported functions, even arrow functions
 - Return ONLY valid JSON, no markdown, no explanation`;
 
+    // BUG-P27-08 FIX: utiliser AIProvider.chat() au lieu d'OpenAI direct
+    // Sur free-groq: appConfig.openaiApiKey absent → OpenAI direct = 401 silent fail
+    // AIProvider.chat() route vers Groq si openaiApiKey absent
+    if (this.ai.getTier() === 'static') {
+      // Tier static: aucun AI disponible → extraction statique seulement (acceptable)
+      console.log(`[AST] runAIAnalysis: static tier — skipping AI, relying on static analysis only`);
+      return { exports: [], classNames: [], functions: [], variables: [], tokensUsed: 0 };
+    }
     try {
-      const response = await this.openai.chat.completions.create({
-        model:       appConfig.defaultModel,
-        temperature: 0.1,
-        max_tokens:  1000,
-        messages:    [{ role: 'user', content: prompt }],
-      });
+      console.log(`[AST] runAIAnalysis: tier=${this.ai.getTier()} model=${this.ai.getModel()}`);
+      const response = await this.ai.chat([{ role: 'user', content: prompt }], 1000);
 
-      const content = response.choices[0]?.message?.content ?? '{}';
+      const content = response.content ?? '{}';
       let data: { exports?: string[]; classNames?: string[]; functions?: FunctionSignature[]; variables?: string[] };
       try {
         data = JSON.parse(content) as typeof data;
       } catch {
-        // Fallback: extract from static analysis
+        // Fallback: tryParseJSON partiel
         data = {};
+        console.warn(`[AST] runAIAnalysis: JSON.parse failed (content length=${content.length}) — using empty data`);
       }
 
+      console.log(`[AST] runAIAnalysis DONE — classNames=${data.classNames?.length ?? 0} functions=${data.functions?.length ?? 0} tokens=${response.tokensUsed}`);
       return {
         exports:    data.exports    ?? [],
         classNames: data.classNames ?? [],
         functions:  data.functions  ?? [],
         variables:  data.variables  ?? [],
-        tokensUsed: response.usage?.total_tokens ?? 0,
+        tokensUsed: response.tokensUsed,
       };
-    } catch {
+    } catch (err) {
+      console.error(`[AST] runAIAnalysis FAILED: ${(err as Error).message} — falling back to static analysis`);
       return { exports: [], classNames: [], functions: [], variables: [], tokensUsed: 0 };
     }
   }

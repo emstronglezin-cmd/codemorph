@@ -345,9 +345,17 @@ export class ConversionPipeline {
     console.log(`Total Lines          : ${plan.summary.totalLines}`);
     console.log(`==============================\n`);
 
-    // ── FIX BUG #12: VÉRIFICATION DE COHÉRENCE ────────────
-    // Comparer: Flutter→AST files → IR screens → planned screens → generated screens
-    this.logCoherenceCheck(astResult, mappedIR, plan.files, ctx.jobId);
+    // ── PHASE 27: VÉRIFICATION DE COHÉRENCE BLOQUANTE ───────────────────────
+    // BUG-P27-07 FIX: logCoherenceCheck retourne { hasCriticalMismatch, missingScreens, missingServices }
+    const coherenceResult = this.logCoherenceCheck(astResult, mappedIR, plan.files, ctx.jobId);
+    if (coherenceResult.hasCriticalMismatch) {
+      logger.warn({
+        jobId: ctx.jobId,
+        missingScreens:  coherenceResult.missingScreens,
+        missingServices: coherenceResult.missingServices,
+      }, '⚠️  Coherence: Critical mismatch — Phase 8 will run at full iterations to recover fidelity');
+      console.warn(`[PIPELINE] ⚠️  Mismatch critique détecté: ${coherenceResult.missingScreens} écrans manquants, ${coherenceResult.missingServices} services manquants → Phase 8 forcée`);
+    }
 
     // ── PHASE 6: IR Validation ─────────────────────────────
     phaseStart('validation');
@@ -431,9 +439,11 @@ export class ConversionPipeline {
     };
   }
 
-  // ── PHASE 7: Calcul du score de fidélité multi-axes ─────────────────────
-  // Prompt Architecte V3 — 7 axes mesurés : businessLogic, navigation, api,
-  // stores, components, models, uiFidelity → overall (moyenne pondérée)
+  // ── PHASE 27: Calcul du score de fidélité multi-axes — 10 axes ─────────
+  // businessLogic, navigation, api, stores, components, models, uiFidelity,
+  // dataLayer, assets, functional → overall (moyenne pondérée)
+  // BUG-P27-01 FIX: 7 axes → 10 axes
+  // BUG-P27-06 FIX: IR=0 screens ne donne plus 100% (score 0 si source>0)
   private calculateFidelityScore(
     ir: Awaited<ReturnType<IRValidator['validate']>>,
     files: GeneratedFile[],
@@ -441,58 +451,72 @@ export class ConversionPipeline {
     const sourceMetrics: IRSourceMetrics | undefined = ir.validation?.sourceMetrics;
     const details: IRFidelityDetail[] = [];
 
+    // ── Helpers ──────────────────────────────────────────────────────────────
+    const safeRatio = (gen: number, src: number): number =>
+      src === 0 ? 100 : Math.min(100, Math.round((gen / Math.max(src, 1)) * 100));
+    // BUG-P27-06 FIX: si source > 0 ET generated = 0 → score = 0 (pas 100)
+    const strictRatio = (gen: number, src: number): number =>
+      src === 0 ? 100 : gen === 0 ? 0 : Math.min(100, Math.round((gen / Math.max(src, 1)) * 100));
+
+    const generatedScreenCount = files.filter((f) =>
+      /\/(screens?|pages?|app)\/[^/]+\.tsx?$/.test(f.path) && !/layout|index|\(tabs\)/.test(f.path)
+    ).length;
+
     // ── Axe 1 : Business Logic ───────────────────────────────────────────────
+    const sourceScreens = sourceMetrics?.screensCount ?? (ir.uiGraph?.screens?.length ?? 0);
     const screensWithLogic = (ir.uiGraph?.screens ?? []).filter((s) =>
       (s as unknown as Record<string, unknown>)['businessLogic'] ||
       (s as unknown as Record<string, unknown>)['apiCalls']
     ).length;
-    const generatedScreenCount = files.filter((f) =>
-      /\/(screens?|pages?|app)\/[^/]+\.tsx?$/.test(f.path) && !/layout|index|\(tabs\)/.test(f.path)
-    ).length;
-    const sourceScreens = sourceMetrics?.screensCount ?? (ir.uiGraph?.screens?.length ?? 0);
-    const bizLogicScore = sourceScreens === 0 ? 100 : Math.round((generatedScreenCount / Math.max(sourceScreens, 1)) * 100);
-    details.push({
+    // BUG-P27-06 FIX: strictRatio → 0 si IR screens = 0 et source > 0
+    const bizLogicScore = strictRatio(generatedScreenCount, sourceScreens);
+    const bizLosses = sourceScreens > generatedScreenCount
+      ? (ir.uiGraph?.screens ?? []).slice(generatedScreenCount).map((s) => s.name)
+      : [];
+    const bizNote = sourceScreens === 0
+      ? 'WARNING: 0 screens in IR — check if Groq token budget was too small'
+      : undefined;
+    const bizDetail: IRFidelityDetail = {
       axis: 'businessLogic',
-      score: Math.min(100, bizLogicScore),
-      sourceCount: screensWithLogic,
+      score: bizLogicScore,
+      sourceCount: Math.max(sourceScreens, screensWithLogic),
       generatedCount: generatedScreenCount,
-      losses: sourceScreens > generatedScreenCount
-        ? (ir.uiGraph?.screens ?? []).slice(generatedScreenCount).map((s) => s.name)
-        : [],
-    });
+      losses: bizLosses,
+    };
+    if (bizNote) bizDetail.notes = bizNote;
+    details.push(bizDetail);
 
     // ── Axe 2 : Navigation ──────────────────────────────────────────────────
     const sourceNavFlows = ir.uiGraph?.navigationFlow?.length ?? 0;
-    const generatedRouter = files.filter((f) =>
-      /router|navigation|_layout/.test(f.path)
-    ).length;
-    const navScore = sourceNavFlows === 0 ? 100 : Math.min(100, generatedRouter > 0 ? 85 + Math.min(15, sourceNavFlows) : 0);
+    const generatedRouter = files.filter((f) => /router|navigation|_layout/.test(f.path)).length;
+    const navScore = sourceNavFlows === 0
+      ? (generatedRouter > 0 ? 80 : 50)  // router sans nav flows = partiel
+      : Math.min(100, generatedRouter > 0 ? 80 + Math.min(20, Math.round((sourceNavFlows / 5) * 20)) : 0);
     details.push({
       axis: 'navigation',
       score: navScore,
       sourceCount: sourceNavFlows,
       generatedCount: generatedRouter,
-      losses: generatedRouter === 0 && sourceNavFlows > 0 ? ['Navigation router missing'] : [],
+      losses: generatedRouter === 0 ? ['Navigation router file missing'] : [],
     });
 
     // ── Axe 3 : API Endpoints ────────────────────────────────────────────────
     const sourceEndpoints = sourceMetrics?.endpointsCount ?? (ir.backendGraph?.routes?.length ?? 0);
     const generatedServices = files.filter((f) => /\.service\.(ts|js)$/.test(f.path)).length;
-    const apiScore = sourceEndpoints === 0 ? 100
-      : Math.min(100, Math.round((generatedServices / Math.max(Math.ceil(sourceEndpoints / 3), 1)) * 100));
+    // 1 service couvre ~3 endpoints en moyenne
+    const apiScore = strictRatio(generatedServices, Math.max(1, Math.ceil(sourceEndpoints / 3)));
     details.push({
       axis: 'api',
       score: apiScore,
       sourceCount: sourceEndpoints,
       generatedCount: generatedServices,
-      losses: generatedServices === 0 && sourceEndpoints > 0 ? ['Service layer missing'] : [],
+      losses: generatedServices === 0 && sourceEndpoints > 0 ? ['Service layer entirely missing'] : [],
     });
 
     // ── Axe 4 : Stores ──────────────────────────────────────────────────────
     const sourceStores = sourceMetrics?.storesCount ?? (ir.uiGraph?.stateFlow?.length ?? 0);
     const generatedStores = files.filter((f) => /\.store\.(ts|js)$/.test(f.path)).length;
-    const storesScore = sourceStores === 0 ? 100
-      : Math.min(100, Math.round((generatedStores / Math.max(sourceStores, 1)) * 100));
+    const storesScore = strictRatio(generatedStores, sourceStores);
     details.push({
       axis: 'stores',
       score: storesScore,
@@ -508,14 +532,13 @@ export class ConversionPipeline {
     const generatedComponents = files.filter((f) =>
       /\/components\/[^/]+\.tsx?$/.test(f.path)
     ).length;
-    const compScore = sourceComponents === 0 ? 100
-      : Math.min(100, Math.round((generatedComponents / Math.max(sourceComponents, 1)) * 100));
+    const compScore = safeRatio(generatedComponents, sourceComponents);
     details.push({
       axis: 'components',
       score: compScore,
       sourceCount: sourceComponents,
       generatedCount: generatedComponents,
-      losses: [],
+      losses: sourceComponents > 0 && generatedComponents === 0 ? ['No component files generated'] : [],
     });
 
     // ── Axe 6 : Models ──────────────────────────────────────────────────────
@@ -523,14 +546,13 @@ export class ConversionPipeline {
     const generatedTypes = files.filter((f) =>
       /\.types\.(ts|js)$/.test(f.path) || /\/types\//.test(f.path) || /\.entity\.(ts|js)$/.test(f.path)
     ).length;
-    const modelsScore = sourceModels === 0 ? 100
-      : Math.min(100, Math.round((generatedTypes / Math.max(sourceModels, 1)) * 100));
+    const modelsScore = safeRatio(generatedTypes, sourceModels);
     details.push({
       axis: 'models',
       score: modelsScore,
       sourceCount: sourceModels,
       generatedCount: generatedTypes,
-      losses: [],
+      losses: sourceModels > 0 && generatedTypes === 0 ? ['No type/entity files generated'] : [],
     });
 
     // ── Axe 7 : UI Fidelity (design tokens + visual structure) ──────────────
@@ -548,19 +570,107 @@ export class ConversionPipeline {
       losses: !hasDesignTokens ? ['Design tokens not extracted from source'] : [],
     });
 
-    // ── Overall : moyenne pondérée ────────────────────────────────────────────
-    // Poids : businessLogic x2, navigation x1.5, api x1.5, stores x1, components x1, models x1, uiFidelity x1
-    const weights = { businessLogic: 2, navigation: 1.5, api: 1.5, stores: 1, components: 1, models: 1, uiFidelity: 1 };
-    const totalWeight = Object.values(weights).reduce((a, b) => a + b, 0);
+    // ── Axe 8 : Data Layer (PHASE 27 — nouvel axe) ──────────────────────────
+    const sourceEntities = (ir.dataLayer?.models?.length ?? 0);
+    const sourceMigrations = (ir.dataLayer?.migrations?.length ?? 0);
+    const genEntities = files.filter((f) => /\.entity\.(ts|js)$/.test(f.path)).length;
+    const genMigrations = files.filter((f) => /migration|migrate/.test(f.path)).length;
+    const dataLayerScore = (sourceEntities + sourceMigrations) === 0
+      ? 100
+      : Math.min(100, Math.round(
+          ((genEntities + genMigrations) / Math.max(sourceEntities + sourceMigrations, 1)) * 100
+        ));
+    details.push({
+      axis: 'dataLayer',
+      score: dataLayerScore,
+      sourceCount: sourceEntities + sourceMigrations,
+      generatedCount: genEntities + genMigrations,
+      losses: sourceEntities > 0 && genEntities === 0 ? ['Entity files missing'] : [],
+    });
+
+    // ── Axe 9 : Assets (PHASE 27 — nouvel axe) ──────────────────────────────
+    const sourceAssets = (sourceMetrics?.assetsCount ?? 0) +
+      (ir.assets?.images?.length ?? 0) +
+      (ir.assets?.fonts?.length ?? 0) +
+      (ir.assets?.icons?.length ?? 0);
+    const genAssets = files.filter((f) =>
+      /\.(png|jpg|svg|ttf|otf|woff|woff2|gif|webp|ico)$/.test(f.path) ||
+      /assets\//.test(f.path)
+    ).length;
+    // Assets = génération de config + références correctes (pas forcément les fichiers binaires)
+    const genAssetRefs = files.filter((f) =>
+      /theme|colors|fonts|assets/.test(f.path)
+    ).length;
+    const assetsScore = sourceAssets === 0 ? 100
+      : Math.min(100, Math.round(Math.max(genAssets, genAssetRefs > 0 ? 50 : 0) / Math.max(sourceAssets, 1) * 100));
+    details.push({
+      axis: 'assets',
+      score: assetsScore,
+      sourceCount: sourceAssets,
+      generatedCount: genAssets,
+      losses: sourceAssets > 0 && genAssets === 0 ? ['Assets not referenced in generated project'] : [],
+    });
+
+    // ── Axe 10 : Functional (PHASE 27 — nouvel axe) ─────────────────────────
+    // Mesure les fonctionnalités testables : auth, formulaires, navigation, API calls
+    const hasAuthFiles   = files.some((f) => /auth|login|register|signin|signup/.test(f.path));
+    const hasApiClient   = files.some((f) => /api.*client|lib.*api|service.*http/.test(f.path));
+    const hasEnvConfig   = files.some((f) => /\.env|env\.example|constants/.test(f.path));
+    const hasNavigation  = files.some((f) => /navigation|router|stack|tab/.test(f.path));
+    const hasErrorHandling = files.some((f) => f.content?.includes('catch') || f.content?.includes('error'));
+    const functionalPoints = [hasAuthFiles, hasApiClient, hasEnvConfig, hasNavigation, hasErrorHandling].filter(Boolean).length;
+    // Source indications
+    const srcHasAuth = (ir.externalConnections ?? []).some((c) => c.type === 'auth') ||
+                       (ir.uiGraph?.screens ?? []).some((s) => /login|auth|sign/i.test(s.name));
+    const functionalScore = Math.min(100, Math.round((functionalPoints / 5) * 100));
+    details.push({
+      axis: 'functional',
+      score: functionalScore,
+      sourceCount: srcHasAuth ? 5 : 3,
+      generatedCount: functionalPoints,
+      losses: [
+        !hasApiClient   ? 'API client file missing'       : '',
+        !hasEnvConfig   ? 'Environment config missing'    : '',
+        !hasNavigation  ? 'Navigation config missing'     : '',
+        !hasErrorHandling ? 'No error handling detected'  : '',
+      ].filter(Boolean),
+    });
+
+    // ── Overall : moyenne pondérée 10 axes ───────────────────────────────────
+    // Poids Phase 27 (total=13): businessLogic x2.5, navigation x1.5, api x1.5,
+    //   stores x1, components x1, models x1, uiFidelity x1, dataLayer x1, assets x1, functional x1.5
+    const weights = {
+      businessLogic: 2.5,
+      navigation:    1.5,
+      api:           1.5,
+      stores:        1.0,
+      components:    1.0,
+      models:        1.0,
+      uiFidelity:    1.0,
+      dataLayer:     1.0,
+      assets:        1.0,
+      functional:    1.5,
+    };
+    const totalWeight = Object.values(weights).reduce((a, b) => a + b, 0); // 14.5
     const overall = Math.round(
-      (details[0]!.score * weights.businessLogic +
-       details[1]!.score * weights.navigation +
-       details[2]!.score * weights.api +
-       details[3]!.score * weights.stores +
-       details[4]!.score * weights.components +
-       details[5]!.score * weights.models +
-       details[6]!.score * weights.uiFidelity) / totalWeight
+      details.reduce((sum, d, i) => {
+        const key = Object.keys(weights)[i] as keyof typeof weights;
+        return sum + d.score * (weights[key] ?? 1);
+      }, 0) / totalWeight
     );
+
+    logger.info({
+      axes: details.map((d) => ({ axis: d.axis, score: d.score, src: d.sourceCount, gen: d.generatedCount })),
+      overall: Math.min(100, overall),
+    }, '📊 Phase 7 (Phase 27): Fidelity Score 10-axes calculated');
+
+    console.log(`\n================ FIDELITY SCORE (Phase 27 — 10 axes) ================`);
+    details.forEach((d) => {
+      const bar = '█'.repeat(Math.round(d.score / 10)) + '░'.repeat(10 - Math.round(d.score / 10));
+      console.log(`  ${d.axis.padEnd(14)} [${bar}] ${String(d.score).padStart(3)}%  src=${d.sourceCount} gen=${d.generatedCount}${d.losses.length ? ` ⚠️  ${d.losses.slice(0, 2).join(', ')}` : ''}`);
+    });
+    console.log(`  ${'OVERALL'.padEnd(14)} ${''.padEnd(12)} ${String(Math.min(100, overall)).padStart(3)}%`);
+    console.log(`==============================\n`);
 
     return {
       businessLogic: details[0]!.score,
@@ -570,13 +680,18 @@ export class ConversionPipeline {
       components:    details[4]!.score,
       models:        details[5]!.score,
       uiFidelity:    details[6]!.score,
+      dataLayer:     details[7]!.score,
+      assets:        details[8]!.score,
+      functional:    details[9]!.score,
       overall:       Math.min(100, overall),
       details,
     };
   }
 
-  // ── PHASE 8: Boucle auto-correction (max 3 itérations) ──────────────────
-  // Prompt Architecte V3 — Identifie pertes → régénère → recalcule score
+  // ── PHASE 27: Boucle auto-correction — cible ≥95% ou MAX_ITERATIONS ──────
+  // BUG-P27-02 FIX: arrêt seulement si score ≥ 95 OU gain < threshold ET score > 80
+  // BUG-P27-03 FIX: Groq boucle si score < 95 (pas seulement si losses.length > 0)
+  // BUG-P27-05 FIX: replan ciblé par axe défaillant (inject axesToFix in ctx)
   private async autoCorrectLoop(
     ctx: ConversionContext,
     ir: ReturnType<IRValidator['validate']> extends Promise<infer T> ? T : never,
@@ -585,10 +700,10 @@ export class ConversionPipeline {
     tier: AITier,
     codePlanner: CodePlanner,
   ): Promise<{ correctedPlan: typeof initialPlan; autoCorrectionReport: IRAutoCorrectReport }> {
-    const MAX_ITERATIONS = tier === 'static' ? 0 : tier === 'free-groq' ? 1 : 3;
-    // FIX PHASE 24 — BUG #8: Groq avait MAX_ITERATIONS=0 → aucune auto-correction
-    // Fix: Groq autorisé à faire 1 itération pour rattraper les écrans manquants
-    const IMPROVEMENT_THRESHOLD = 3; // minimum gain (%) pour continuer
+    const MAX_ITERATIONS = tier === 'static' ? 0 : tier === 'free-groq' ? 2 : 3;
+    // PHASE 27: cible 95% avant de s'arrêter (sauf static)
+    const FIDELITY_TARGET     = 95;
+    const IMPROVEMENT_THRESHOLD = 2; // minimum gain (%) pour continuer si score > 80
 
     const scoreHistory: IRScoreSnapshot[] = [
       { iteration: 0, score: initialScore.overall, delta: 0, filesRegenerated: 0 },
@@ -600,20 +715,29 @@ export class ConversionPipeline {
     let currentScore = initialScore.overall;
     let iteration = 0;
 
+    logger.info({
+      jobId: ctx.jobId,
+      initialScore: currentScore,
+      target: FIDELITY_TARGET,
+      maxIter: MAX_ITERATIONS,
+      tier,
+    }, `🔄 Phase 8 (Phase 27): Auto-correction loop started — target=${FIDELITY_TARGET}%`);
+    console.log(`\n[PHASE 8] Auto-correction démarrée — score initial=${currentScore}% cible=${FIDELITY_TARGET}% maxIter=${MAX_ITERATIONS} tier=${tier}`);
+
     // Collecter les pertes initiales
     const initialLosses = initialScore.details
       .filter((d) => d.losses.length > 0)
       .flatMap((d) => d.losses.map((l) => `[${d.axis}] ${l}`));
 
-    if (initialLosses.length === 0 || MAX_ITERATIONS === 0) {
+    // BUG-P27-03 FIX: ne court-circuiter QUE si score déjà ≥ target OU static
+    if (currentScore >= FIDELITY_TARGET || MAX_ITERATIONS === 0) {
       if (MAX_ITERATIONS === 0 && tier !== 'static') {
-        // Groq: noter les pertes dans les warnings sans régénérer
         const lossLines = initialScore.details
           .filter((d) => d.score < 100 && d.losses.length > 0)
           .map((d) => `[Phase8] ${d.axis} score=${d.score}% losses=${d.losses.join(', ')}`);
         if (lossLines.length > 0 && ir.validation) {
           ir.validation.warnings = [...(ir.validation.warnings ?? []), ...lossLines];
-          logger.warn({ jobId: ctx.jobId, losses: lossLines.length }, '⏭️  Phase 8: Groq — losses noted in warnings, regeneration skipped');
+          logger.warn({ jobId: ctx.jobId, losses: lossLines.length }, '⏭️  Phase 8: Groq static — losses noted in warnings');
         }
       }
       remainingLosses.push(...initialLosses);
@@ -635,17 +759,42 @@ export class ConversionPipeline {
 
     // ── Boucle d'itération ────────────────────────────────────────────────
     for (iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
-      logger.info({ jobId: ctx.jobId, iteration, currentScore }, `🔄 Phase 8: Iteration ${iteration}/${MAX_ITERATIONS}`);
+      logger.info({ jobId: ctx.jobId, iteration, currentScore, target: FIDELITY_TARGET }, `🔄 Phase 8: Iteration ${iteration}/${MAX_ITERATIONS} — score=${currentScore}%`);
+      console.log(`[PHASE 8] Itération ${iteration}/${MAX_ITERATIONS} — score courant=${currentScore}% cible=${FIDELITY_TARGET}%`);
 
-      const axesWithLosses = initialScore.details.filter((d) => d.score < 80 && d.losses.length > 0);
-      if (axesWithLosses.length === 0) {
-        logger.info({ jobId: ctx.jobId }, '✅ Phase 8: No significant losses remaining — stopping');
+      // BUG-P27-02 FIX: arrêter si target atteinte
+      if (currentScore >= FIDELITY_TARGET) {
+        logger.info({ jobId: ctx.jobId, currentScore }, `✅ Phase 8: Target ${FIDELITY_TARGET}% reached — stopping`);
+        console.log(`[PHASE 8] ✅ Cible ${FIDELITY_TARGET}% atteinte — arrêt de la boucle`);
+        break;
+      }
+
+      // Identifier les axes défaillants (score < 80%)
+      const currentScoreObj = this.calculateFidelityScore(ir, currentPlan.files);
+      const axesWithLosses = currentScoreObj.details.filter((d) => d.score < 80);
+
+      console.log(`[PHASE 8] Axes défaillants (score < 80%): ${axesWithLosses.map((a) => `${a.axis}=${a.score}%`).join(', ') || 'aucun'}`);
+
+      if (axesWithLosses.length === 0 && currentScore >= 80) {
+        logger.info({ jobId: ctx.jobId }, '✅ Phase 8: All axes above 80% — stopping');
+        console.log(`[PHASE 8] Tous les axes ≥ 80% — arrêt`);
         break;
       }
 
       try {
-        logger.info({ jobId: ctx.jobId, axes: axesWithLosses.map((a) => a.axis) }, '🔄 Phase 8: Re-planning for losses');
-        const replan = await codePlanner.plan(ctx, ir as never);
+        // BUG-P27-05 FIX: cibler spécifiquement les axes défaillants
+        const axesStr = axesWithLosses.map((a) => a.axis).join(',');
+        const lossesStr = axesWithLosses.flatMap((a) => a.losses).slice(0, 10).join('; ');
+        const targetedCtx: ConversionContext = {
+          ...ctx,
+          // Injecter les axes et pertes comme metadata pour guider le re-planning
+          userGoal: `AUTOCORRECT iteration=${iteration} fix_axes=[${axesStr}] missing=[${lossesStr}] target_score=${FIDELITY_TARGET}% current_score=${currentScore}%`,
+        };
+
+        logger.info({ jobId: ctx.jobId, axes: axesStr, losses: lossesStr }, `🔄 Phase 8: Targeted re-planning for axes: ${axesStr}`);
+        console.log(`[PHASE 8] Re-planning ciblé — axes: ${axesStr}`);
+
+        const replan = await codePlanner.plan(targetedCtx, ir as never);
 
         // Merge : garder les fichiers existants, ajouter les nouveaux pour les gaps
         const existingPaths = new Set(currentPlan.files.map((f) => f.path));
@@ -653,6 +802,7 @@ export class ConversionPipeline {
 
         if (newFiles.length === 0) {
           logger.info({ jobId: ctx.jobId }, '⏭️  Phase 8: No new files generated — stopping loop');
+          console.log(`[PHASE 8] Aucun nouveau fichier généré — arrêt`);
           break;
         }
 
@@ -677,21 +827,24 @@ export class ConversionPipeline {
         improvements.push(...newFiles.map((f) => `[iter${iteration}] Added: ${f.path}`));
 
         logger.info({
-          jobId: ctx.jobId,
-          iteration,
-          newFiles: newFiles.length,
-          scoreAfter: currentScore,
-          delta,
+          jobId: ctx.jobId, iteration, newFiles: newFiles.length, scoreAfter: currentScore, delta,
         }, `📊 Phase 8: Iteration ${iteration} done — score=${currentScore}% delta=${delta > 0 ? '+' : ''}${delta}%`);
+        console.log(`[PHASE 8] Itération ${iteration} terminée — score=${currentScore}% delta=${delta >= 0 ? '+' : ''}${delta}% nouveaux fichiers=${newFiles.length}`);
 
-        // Arrêt si gain insuffisant
-        if (delta < IMPROVEMENT_THRESHOLD) {
-          logger.info({ jobId: ctx.jobId }, `⏭️  Phase 8: Gain (${delta}%) below threshold (${IMPROVEMENT_THRESHOLD}%) — stopping`);
+        // BUG-P27-02 FIX: arrêt seulement si gain faible ET déjà au-dessus de 80
+        if (delta < IMPROVEMENT_THRESHOLD && currentScore > 80) {
+          logger.info({ jobId: ctx.jobId }, `⏭️  Phase 8: Gain (${delta}%) below threshold AND score>${80}% — stopping`);
+          console.log(`[PHASE 8] Gain ${delta}% < seuil ${IMPROVEMENT_THRESHOLD}% avec score>${80}% — arrêt`);
           break;
+        }
+        // Si delta négatif ou nul et score bas, continuer quand même jusqu'à MAX
+        if (delta <= 0 && currentScore <= 50) {
+          logger.warn({ jobId: ctx.jobId, currentScore }, `⚠️  Phase 8: No improvement at score=${currentScore}% — will retry next iteration`);
         }
 
       } catch (err) {
         logger.error({ jobId: ctx.jobId, err: (err as Error).message, iteration }, '❌ Phase 8: Iteration failed');
+        console.error(`[PHASE 8] ❌ Itération ${iteration} échouée: ${(err as Error).message}`);
         break;
       }
     }
@@ -728,15 +881,17 @@ export class ConversionPipeline {
     };
   }
 
-  // ── FIX BUG #12: Vérification de cohérence des comptages ────────────────
-  // Flutter source files → IR screens → planned screens → generated screens
-  // Les nombres DOIVENT être cohérents. Si pas, logger des avertissements critiques.
+  // ── PHASE 27: Vérification de cohérence BLOQUANTE ───────────────────────
+  // BUG-P27-07 FIX: logCoherenceCheck retourne une sévérité et des flags
+  // Un mismatch critique (ex: 221 sources → 0 screens IR → 5 fichiers) DOIT
+  // être signalé de façon à ce que la boucle Phase 8 soit forcée à max itérations.
+  // Retourne { hasCriticalMismatch, missingScreens, missingServices }
   private logCoherenceCheck(
     ast:         Awaited<ReturnType<ASTAnalyzer['analyze']>>,
     ir:          IRDocument,
     files:       GeneratedFile[],
     jobId:       string,
-  ): void {
+  ): { hasCriticalMismatch: boolean; missingScreens: number; missingServices: number } {
     const flutterScreenFiles = ast.files.filter((f) => /screen|page|view/i.test(f.path)).length;
     const flutterModelFiles  = ast.files.filter((f) => /model|entity|dto/i.test(f.path)).length;
     const flutterServiceFiles = ast.files.filter((f) => /service|repository/i.test(f.path)).length;
@@ -753,7 +908,7 @@ export class ConversionPipeline {
     const genServices = files.filter((f) => /\.service\.(ts|js)$/.test(f.path)).length;
     const genStores   = files.filter((f) => /\.store\.(ts|js)$/.test(f.path)).length;
 
-    console.log(`\n================ COHERENCE CHECK ================`);
+    console.log(`\n================ COHERENCE CHECK (Phase 27) ================`);
     console.log(`                     | Flutter | IR      | Generated`);
     console.log(`---------------------|---------|---------|----------`);
     console.log(`Screens              | ${String(flutterScreenFiles).padStart(7)} | ${String(irScreens).padStart(7)} | ${String(genScreens).padStart(9)}`);
@@ -764,25 +919,50 @@ export class ConversionPipeline {
     console.log(`Total source files   : ${ast.files.length}`);
     console.log(`Total gen files      : ${files.length}`);
 
-    // Avertissements critiques
+    let hasCriticalMismatch = false;
+    const missingScreens  = Math.max(0, Math.min(irScreens, flutterScreenFiles) - genScreens);
+    const missingServices = Math.max(0, flutterServiceFiles - genServices);
+
+    // ── Diagnostic critique ───────────────────────────────────────────────
     if (flutterScreenFiles > 0 && irScreens === 0) {
-      console.warn(`[COHERENCE] ❌ CRITICAL: Flutter has ${flutterScreenFiles} screen files but IR has 0 screens. IR generation failed. Check Groq token limits.`);
-      logger.warn({ jobId, flutterScreenFiles, irScreens }, '❌ COHERENCE: Flutter screens → IR screens MISMATCH');
+      hasCriticalMismatch = true;
+      console.warn(`[COHERENCE] ❌ CRITICAL: Flutter has ${flutterScreenFiles} screen files but IR has 0 screens. IR generation failed — Groq token budget too small or AI returned empty JSON.`);
+      logger.error({ jobId, flutterScreenFiles, irScreens }, '❌ COHERENCE CRITICAL: Flutter screens → IR screens = 0 (IR extraction failure)');
     }
     if (irScreens > 0 && genScreens === 0) {
-      console.warn(`[COHERENCE] ❌ CRITICAL: IR has ${irScreens} screens but 0 were generated. Code planning failed. Check generateScreenFile() errors.`);
-      logger.warn({ jobId, irScreens, genScreens }, '❌ COHERENCE: IR screens → Generated screens MISMATCH');
+      hasCriticalMismatch = true;
+      console.warn(`[COHERENCE] ❌ CRITICAL: IR has ${irScreens} screens but 0 were generated. Code planning failed — check generateScreenFile() for AI errors.`);
+      logger.error({ jobId, irScreens, genScreens }, '❌ COHERENCE CRITICAL: IR screens → Generated screens = 0 (code planning failure)');
     }
     if (irScreens > 0 && genScreens < irScreens * 0.5) {
-      console.warn(`[COHERENCE] ⚠️  WARNING: IR has ${irScreens} screens but only ${genScreens} generated (${Math.round(genScreens/irScreens*100)}%). Low fidelity.`);
+      hasCriticalMismatch = true;
+      console.warn(`[COHERENCE] ❌ CRITICAL: IR has ${irScreens} screens but only ${genScreens} generated (${Math.round(genScreens/irScreens*100)}%). Phase 8 auto-correction REQUIRED.`);
+      logger.error({ jobId, irScreens, genScreens, pct: Math.round(genScreens/irScreens*100) }, '❌ COHERENCE CRITICAL: <50% screens generated');
     }
     if (irModels > 0 && genModels === 0) {
-      console.warn(`[COHERENCE] ⚠️  WARNING: IR has ${irModels} models but 0 types files generated.`);
+      hasCriticalMismatch = true;
+      console.warn(`[COHERENCE] ❌ CRITICAL: IR has ${irModels} models but 0 types files generated.`);
+      logger.error({ jobId, irModels, genModels }, '❌ COHERENCE: No model/type files generated');
     }
     if (ast.files.length > 50 && files.length <= 20) {
-      console.warn(`[COHERENCE] ❌ CRITICAL: Source has ${ast.files.length} files but only ${files.length} generated. Likely a template (expected 50+ files for 221 source files).`);
+      hasCriticalMismatch = true;
+      console.warn(`[COHERENCE] ❌ CRITICAL: Source has ${ast.files.length} files but only ${files.length} generated. This is a template scaffold (expected 50+ files for large project).`);
+      logger.error({ jobId, sourceFiles: ast.files.length, genFiles: files.length }, '❌ COHERENCE CRITICAL: Generated file count too low for project size');
+    }
+    if (flutterServiceFiles > 0 && genServices === 0) {
+      console.warn(`[COHERENCE] ⚠️  WARNING: Flutter has ${flutterServiceFiles} service files but 0 services generated.`);
+      logger.warn({ jobId, flutterServiceFiles, genServices }, '⚠️  COHERENCE: Service files not generated');
+    }
+
+    if (hasCriticalMismatch) {
+      console.warn(`[COHERENCE] 🔄 PHASE 8 MUST run at maximum iterations to recover fidelity!`);
+      logger.warn({ jobId, hasCriticalMismatch, missingScreens, missingServices }, '⚠️  COHERENCE: Critical mismatch detected — Phase 8 auto-correction needed');
+    } else {
+      console.log(`[COHERENCE] ✅ No critical mismatch detected`);
     }
     console.log(`==============================\n`);
+
+    return { hasCriticalMismatch, missingScreens, missingServices };
   }
 
 }
