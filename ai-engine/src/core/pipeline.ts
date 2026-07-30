@@ -6,16 +6,14 @@
 // PHASE 22: Prompt Maître V2 — Phase 7 Auto-correction ajoutée
 // PHASE 23: Prompt Architecte Ultime V3 — Score fidélité multi-axes + boucle Phase 8
 // PHASE 24: Audit Architecture + Correction Définitive
-//   - FIX BUG #1: Groq 15 000 chars tronquait TOUT — désormais truncation intelligente par fichier
-//   - FIX BUG #6: MappingEngine clés case-sensitive (voir mapping-engine.ts)
-//   - FIX BUG #10: Logs structurés complets (=== AST ===, === KG ===, === IR ===, etc.)
-//   - FIX BUG #12: Vérification cohérence des comptages Flutter→IR→Planned→Generated
-//   - FIX BUG #7: autoCorrectLoop activé pour Groq (max 1 itération)
 // PHASE 25: Optimisation Infrastructure + Coûts + Scalabilité
-//   - PARTIE B: Tokens IA — contexte partagé, MASTER_SYSTEM_PROMPT dédupliqué
-//   - PARTIE C: Cache LRU — AST/Arch/IR/Mapping/Plan (hit = 0 token consommé)
-//   - PARTIE D: Génération incrémentale — skip fichiers déjà corrects
-//   - PARTIE F: Métriques — timing par phase, tokens, coût estimé
+// PHASE 27: Stabilisation — 12 bugs fixés, score 10 axes, cible ≥95%
+// PHASE 28: Moteur de conversion fiable — 12 étapes complètes
+//   STEP 1: LLM Output Cleaning (output-cleaner.ts)
+//   STEP 2: File Chunking (file-chunker.ts)
+//   STEP 3: Import Verification (import-verifier.ts)
+//   STEP 4: TypeScript Issue Detection (import-verifier.ts)
+//   STEP 5: Source↔Generated Fidelity Comparison (fidelity-comparator.ts)
 // ============================================================
 import pino from 'pino';
 import { pipelineCache, buildCacheKey } from './pipeline-cache';
@@ -33,6 +31,9 @@ import { MappingEngine }            from './mapping-engine';
 import { CodePlanner }              from './code-planner';
 import { IRValidator }              from '../validators/ir.validator';
 import type { GeneratedFile, IRDocument } from '../models/ir.types';
+// PHASE 28: Nouveaux modules de qualité
+import { runFidelityComparison }    from './fidelity-comparator';
+import { verifyAndFixImports }      from './import-verifier';
 
 const logger = pino({ level: process.env['LOG_LEVEL'] ?? 'info' });
 
@@ -384,10 +385,65 @@ export class ConversionPipeline {
 
     const durationMs = Date.now() - startTime;
     const tokensUsed = astResult.tokensUsed + archResult.tokensUsed + irDocument.tokensUsed;
+
+    // ── PHASE 28 STEP 9: Import Verification finale ──────────────────────────
+    // Vérification finale des imports après toutes les phases de correction
+    logger.info({ jobId: ctx.jobId }, '🔍 Phase 9 (Phase 28): Final Import Verification');
+    const finalImportResult = verifyAndFixImports(correctedPlan.files);
+    const finalFiles = finalImportResult.files;
+    const finalReport = finalImportResult.report;
+    if (finalReport.importsFixed > 0) {
+      console.log(`[PIPELINE] Phase 9: Final import fix — ${finalReport.importsFixed} imports corrected, ${finalReport.importsUnresolved} unresolved`);
+    }
+
+    // ── PHASE 28 STEP 10: Source ↔ Generated Comparison ─────────────────────
+    // Comparaison granulaire: classes, fonctions, méthodes, services, repositories
+    logger.info({ jobId: ctx.jobId }, '🔬 Phase 10 (Phase 28): Source ↔ Generated Comparison');
+    const fidelityComparison = runFidelityComparison(
+      ctx.sourceCode,
+      finalFiles,
+      ctx.sourceLanguage ?? 'dart',
+    );
+    logger.info({
+      jobId: ctx.jobId,
+      comparatorScore: fidelityComparison.scores.overall,
+      missing: fidelityComparison.missing.length,
+      classes: fidelityComparison.scores.classes,
+      services: fidelityComparison.scores.services,
+      repositories: fidelityComparison.scores.repositories,
+    }, `🔬 Phase 10: Fidelity Comparator — Overall: ${fidelityComparison.scores.overall}%`);
+
+    // ── PHASE 28 STEP 11: Fusionner les scores (10 axes + comparateur) ───────
+    // Le score final intègre les deux sources: score existant + comparateur granulaire
+    const comparatorBonus = fidelityComparison.scores.overall;
+    const finalFidelityScore: IRFidelityScore = {
+      ...autoCorrectionReport.finalScore > fidelityScore.overall
+        ? { ...fidelityScore, overall: autoCorrectionReport.finalScore }
+        : fidelityScore,
+      // Intégrer les données du comparateur dans les axes existants
+      businessLogic: Math.round((fidelityScore.businessLogic + fidelityComparison.scores.services) / 2),
+      models:        Math.round((fidelityScore.models + fidelityComparison.scores.models) / 2),
+      api:           Math.round((fidelityScore.api + fidelityComparison.scores.repositories) / 2),
+      overall:       Math.round((
+        (autoCorrectionReport.finalScore > fidelityScore.overall ? autoCorrectionReport.finalScore : fidelityScore.overall) * 0.6
+        + comparatorBonus * 0.4
+      )),
+    };
+
+    console.log(`\n[PIPELINE] ===== PHASE 28 FINAL REPORT =====`);
+    console.log(`[PIPELINE] Pipeline score (10-axes):   ${fidelityScore.overall}%`);
+    console.log(`[PIPELINE] Auto-correction score:      ${autoCorrectionReport.finalScore}%`);
+    console.log(`[PIPELINE] Comparator score:           ${comparatorBonus}%`);
+    console.log(`[PIPELINE] FINAL COMPOSITE SCORE:      ${finalFidelityScore.overall}%`);
+    console.log(`[PIPELINE] Missing elements:           ${fidelityComparison.missing.length}`);
+    console.log(`[PIPELINE] Import fixes applied:       ${finalReport.importsFixed}`);
+    console.log(`[PIPELINE] Import unresolved:          ${finalReport.importsUnresolved}`);
+    console.log(`[PIPELINE] ==============================\n`);
+
     // ── PHASE 25 Partie F : Log métriques finales ────────────
     const cacheStats = pipelineCache.getStats();
     const estimatedCostUSD = (tokensUsed / 1_000) * (tier === 'free-groq' ? 0 : tier === 'platform' ? 0.01 : 0.02);
-    console.log(`\n================ PIPELINE METRICS (Phase 25) ================`);
+    console.log(`\n================ PIPELINE METRICS (Phase 25/28) ================`);
     console.log(`Total duration   : ${durationMs}ms`);
     console.log(`AST time         : ${phaseTimings['ast'] ?? 0}ms`);
     console.log(`Architecture time: ${phaseTimings['arch'] ?? 0}ms`);
@@ -398,8 +454,10 @@ export class ConversionPipeline {
     console.log(`Tokens consumed  : ${tokensUsed}`);
     console.log(`Est. cost (USD)  : $${estimatedCostUSD.toFixed(4)}`);
     console.log(`AI tier          : ${tier}`);
-    console.log(`Final score      : ${autoCorrectionReport.finalScore}%`);
-    console.log(`Files generated  : ${correctedPlan.files.length}`);
+    console.log(`Final score      : ${finalFidelityScore.overall}%`);
+    console.log(`Files generated  : ${finalFiles.length}`);
+    console.log(`Import fixes     : ${finalReport.importsFixed}`);
+    console.log(`Comparator score : ${fidelityComparison.scores.overall}%`);
     console.log(`Cache stats      : ast=${cacheStats['ast']?.size ?? 0} ir=${cacheStats['ir']?.size ?? 0} plan=${cacheStats['plan']?.size ?? 0}`);
     console.log(`==============================\n`);
 
@@ -409,9 +467,11 @@ export class ConversionPipeline {
       tier,
       tokensUsed,
       estimatedCostUSD,
-      finalScore: autoCorrectionReport.finalScore,
+      finalScore: finalFidelityScore.overall,
+      comparatorScore: fidelityComparison.scores.overall,
       iterations: autoCorrectionReport.iterations,
-      filesGenerated: correctedPlan.files.length,
+      filesGenerated: finalFiles.length,
+      importsFixed: finalReport.importsFixed,
       phaseTimes: {
         ast:      phaseTimings['ast'] ?? 0,
         arch:     phaseTimings['arch'] ?? 0,
@@ -419,22 +479,26 @@ export class ConversionPipeline {
         mapping:  phaseTimings['mapping'] ?? 0,
         planning: phaseTimings['planning'] ?? 0,
       },
-    }, '✨ Pipeline completed');
+    }, '✨ Pipeline completed (Phase 28)');
 
     return {
       jobId:      ctx.jobId,
       ir:         validatedIR,
-      files:      correctedPlan.files,
-      summary:    correctedPlan.summary,
+      files:      finalFiles,
+      summary:    {
+        ...correctedPlan.summary,
+        totalFiles:      finalFiles.length,
+        successfulFiles: finalFiles.filter((f) => !f.warnings?.length).length,
+        totalLines:      finalFiles.reduce((a, f) => a + f.content.split('\n').length, 0),
+        convertedLines:  finalFiles.reduce((a, f) => a + f.content.split('\n').length, 0),
+      },
       tokensUsed,
       durationMs,
       // FIX PHASE 20 — Inclure le tier et modèle IA pour affichage côté frontend
       aiTier:  tier,
       aiModel: new AIProvider(opts).getModel(),
-      // ── PHASE 23: Score fidélité + rapport auto-correction ──────────────
-      fidelityScore:        autoCorrectionReport.finalScore > fidelityScore.overall
-        ? { ...fidelityScore, overall: autoCorrectionReport.finalScore }
-        : fidelityScore,
+      // ── PHASE 23/28: Score fidélité composite + rapport auto-correction ─────
+      fidelityScore:        finalFidelityScore,
       autoCorrectionReport,
     };
   }

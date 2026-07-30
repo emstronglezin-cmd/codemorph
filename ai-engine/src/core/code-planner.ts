@@ -4,9 +4,13 @@
 // AI outputs IR → backend generates actual code files
 // Uses AIProvider — supports Free (Groq), Platform (OpenAI), Pro (user key)
 // PHASE 23: Prompt Architecte Ultime V3 — fidélité visuelle Phase 6, prompts V3
+// PHASE 28: LLM Output Cleaner + File Chunker + Import Verifier intégrés
 // ============================================================
 import { AIProvider } from './ai-provider';
 import type { ConversionContext, IRDocument, GeneratedFile, ConversionSummary, IRDesignTokens } from '../models/ir.types';
+import { cleanLLMOutput, cleanGeneratedFiles }    from './output-cleaner';
+import { convertLargeFile, needsChunking }         from './file-chunker';
+import { verifyAndFixImports, detectTypeIssues, formatTypeReport } from './import-verifier';
 
 export interface CodePlan {
   files:   GeneratedFile[];
@@ -24,7 +28,43 @@ export class CodePlanner {
     console.log(`[CodePlanner] plan() START — target=${ctx.targetFramework} projectId=${ctx.projectId}`);
     const planner = this.getFrameworkPlanner(ctx.targetFramework);
     const result  = await planner(ctx, ir);
-    console.log(`[CodePlanner] plan() DONE — Generated files: ${result.files.length} | Total lines: ${result.summary.totalLines}`);
+
+    console.log(`[CodePlanner] plan() RAW — Generated files: ${result.files.length} | Total lines: ${result.summary.totalLines}`);
+
+    // ── PHASE 28 STEP 1: Nettoyage LLM Output ────────────────────────────────
+    // Supprimer les fences markdown, "Replace this...", notes explicatives
+    console.log(`\n[CodePlanner] PHASE 28 — Step 1: LLM Output Cleaning...`);
+    const cleanedBatch = cleanGeneratedFiles(result.files);
+    result.files = cleanedBatch.files;
+    if (cleanedBatch.totalModified > 0) {
+      console.log(`[CodePlanner] Output Cleaner: ${cleanedBatch.totalModified} files cleaned, -${cleanedBatch.totalLinesRemoved} lines, -${cleanedBatch.totalCharsRemoved} chars`);
+    }
+
+    // ── PHASE 28 STEP 2: Import Verification ─────────────────────────────────
+    // Analyser et corriger tous les imports cassés
+    console.log(`[CodePlanner] PHASE 28 — Step 2: Import Verification...`);
+    const importResult = verifyAndFixImports(result.files);
+    result.files = importResult.files;
+    const importReport = importResult.report;
+    if (importReport.importsFixed > 0 || importReport.importsUnresolved > 0) {
+      console.log(`[CodePlanner] Import Verifier: ${importReport.importsFixed} fixed, ${importReport.importsUnresolved} unresolved`);
+    }
+
+    // ── PHASE 28 STEP 3: Type Issue Detection ────────────────────────────────
+    // Détecter les problèmes TypeScript courants sans exécuter tsc
+    console.log(`[CodePlanner] PHASE 28 — Step 3: TypeScript Issue Detection...`);
+    const typeIssues = detectTypeIssues(result.files);
+    if (typeIssues.length > 0) {
+      console.warn(`[CodePlanner] TypeScript issues detected: ${typeIssues.length}`);
+      console.warn(formatTypeReport(typeIssues));
+    } else {
+      console.log(`[CodePlanner] TypeScript check: ✅ No issues detected`);
+    }
+
+    // ── Recalculer le résumé après nettoyage ─────────────────────────────────
+    result.summary = this.buildSummary(result.files, ir);
+
+    console.log(`[CodePlanner] plan() DONE — Files: ${result.files.length} | Lines: ${result.summary.totalLines}`);
     result.files.forEach((f, i) => {
       if (i < 8) console.log(`[CodePlanner]   [${i + 1}] ${f.path}`);
     });
@@ -582,6 +622,29 @@ src/
       console.warn(`[CodePlanner] ⚠️  BUG#6 WARNING: generateScreenFile("${name}") has NO real IR data (purpose/bizLogic/apiCalls/states/stores/apis all empty). Prompt will be generic.`);
     }
 
+    // ── PHASE 28: Vérifier si le contenu source original nécessite du chunking ──
+    // Si le fichier source de l'écran est disponible depuis le ctx, tenter le chunking
+    const screenSourcePath = screenData?.['path'] as string | undefined;
+    if (screenSourcePath && ctx.sourceCode) {
+      // Extraire le contenu du fichier source spécifique
+      const fileMarkerPattern = new RegExp(
+        `//\\s*(?:=+\\s*)?FILE:\\s*${screenSourcePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*(?:=+)?\\n([\\s\\S]*?)(?=//\\s*(?:=+\\s*)?FILE:|$)`,
+      );
+      const fileMatch = ctx.sourceCode.match(fileMarkerPattern);
+      if (fileMatch?.[1] && fileMatch[1].trim()) {
+        const sourceFileContent = fileMatch[1].trim();
+        const irContextStr = ctxLines || '';
+        const chunkedResult = await this.generateSourceFileWithChunking(
+          ctx, sourceFileContent, ctx.sourceLanguage ?? 'dart',
+          name, framework, irContextStr,
+        );
+        if (chunkedResult) {
+          console.log(`[CodePlanner] generateScreenFile("${name}") DONE via chunking — ${chunkedResult.length} chars`);
+          return chunkedResult;
+        }
+      }
+    }
+
     // PHASE 23: System Prompt Architecte Ultime V3
     const systemPrompt = `You are an AI Software Architect specialized in software reconstruction and multi-framework migration.
 
@@ -640,15 +703,15 @@ Return ONLY the complete file content.`;
       );
       const generated = res.content || '';
 
+      // PHASE 28: Nettoyage immédiat de la sortie LLM avant TOUT contrôle
+      const cleanResult = cleanLLMOutput(generated, `screen:${name}`);
+      const cleanedGenerated = cleanResult.content;
+      if (cleanResult.wasModified) {
+        console.log(`[CodePlanner] Output cleaned for "${name}": ${cleanResult.linesRemoved} lines removed (${cleanResult.operations.length} ops)`);
+      }
+
       // FIX PHASE 24 — BUG #7 RENFORCÉ: Détecter et interdire toute génération générique
-      // Liste élargie: HomeScreen, DetailsScreen, Example, Demo, Template, Sample, TODO,
-      //                CodeMorph App, Placeholder, Skeleton, Mock Data
-      // ATTENTION: ne pas rejeter "TODO" dans les commentaires de logique métier réelle
-      // — rejeter seulement si le NOM de l'écran est générique ou si c'est un template vide
-      // PHASE 26.1 AUDIT — Liste COMPLÈTE des patterns génériques interdits.
-      // Chaque entrée protège contre un vecteur de dégradation spécifique.
-      // IMPORTANT: ne pas bloque "HomeScreen" s'il est un vrai nom de classe de l'appli
-      // source — mais bloquer tous les écrans purement génériques / de démonstration.
+      // PHASE 28: Appliquer APRÈS nettoyage (le LLM peut injecter ces patterns dans le préambule)
       const FORBIDDEN_GENERIC_PATTERNS = [
         /\bCodeMorph\s+App\b/i,               // template CodeMorph générique
         /\bPlaceholder\s+Screen\b/i,           // placeholder explicite
@@ -671,15 +734,15 @@ Return ONLY the complete file content.`;
       ];
 
       // Rejeter si le contenu correspond à un pattern générique strict
-      const isForbidden = FORBIDDEN_GENERIC_PATTERNS.some((p) => p.test(generated));
+      const isForbidden = FORBIDDEN_GENERIC_PATTERNS.some((p) => p.test(cleanedGenerated));
       if (isForbidden) {
         console.warn(`[CodePlanner] ⚠️  BUG#7: Forbidden generic content detected for screen "${name}" — using structured fallback`);
         return this.fallbackScreen(name, framework);
       }
 
       // Log du résultat
-      console.log(`[CodePlanner] generateScreenFile("${name}") DONE — generated ${generated.length} chars, tokens=${res.tokensUsed}`);
-      return generated || this.fallbackScreen(name, framework);
+      console.log(`[CodePlanner] generateScreenFile("${name}") DONE — ${cleanedGenerated.length} chars, tokens=${res.tokensUsed}`);
+      return cleanedGenerated || this.fallbackScreen(name, framework);
     } catch (err) {
       console.warn(`[CodePlanner] generateScreenFile("${name}") FAILED: ${(err as Error).message} — using fallback`);
       return this.fallbackScreen(name, framework);
@@ -711,14 +774,16 @@ Return ONLY the complete file content.`;
     if (this.ai.getTier() === 'static') return this.fallbackComponent(name);
     const propTypes = props.map((p) => `${p.name}${p.required ? '' : '?'}: ${p.type}`).join('; ');
     // PHASE 23: Prompt V3 pour les composants — vraies props + events depuis l'IR
-    const systemPrompt = `You are an AI Software Architect. Generate production-ready ${framework === 'react' ? 'React + TypeScript + TailwindCSS' : 'React Native + TypeScript'} UI components. NEVER use placeholders or TODOs. Return ONLY the complete file content.`;
+    const systemPrompt = `You are an AI Software Architect. Generate production-ready ${framework === 'react' ? 'React + TypeScript + TailwindCSS' : 'React Native + TypeScript'} UI components. NEVER use placeholders or TODOs. Return ONLY the complete file content — no markdown, no explanations.`;
     const prompt = `Generate a ${framework === 'react' ? 'React + TypeScript + TailwindCSS' : 'React Native + TypeScript'} UI component named "${name}".
 Props interface: { ${propTypes || 'children?: React.ReactNode'} }
 Requirements: TypeScript strict, accessible, no TODO, no placeholder.
 Return ONLY the complete file content.`;
     try {
       const res = await this.ai.chat([{ role: 'system', content: systemPrompt }, { role: 'user', content: prompt }], 900);
-      return res.content || this.fallbackComponent(name);
+      // PHASE 28: Nettoyage obligatoire de la sortie LLM
+      const cleaned = cleanLLMOutput(res.content || '', `component:${name}`).content;
+      return cleaned || this.fallbackComponent(name);
     } catch {
       return this.fallbackComponent(name);
     }
@@ -926,7 +991,57 @@ export class ${this.pascal(migration.name)}${Date.now()} implements MigrationInt
 `;
   }
 
-  // ── PHASE 27: fallbackScreen() — squelette fonctionnel basé sur l'IR ────
+  // ── PHASE 28: Conversion d'un fichier source avec chunking automatique ──────
+  // Si le fichier source dépasse la limite du modèle → découpage automatique
+  // Si conversion directe suffit → utilisation normale
+  // RÈGLE: jamais produire une version résumée — TODOs si nécessaire
+  private async generateSourceFileWithChunking(
+    ctx:             ConversionContext,
+    sourceContent:   string,
+    sourceLanguage:  string,
+    targetName:      string,
+    framework:       string,
+    irContext?:      string,
+  ): Promise<string> {
+    const tier = this.ai.getTier();
+    const requiresChunking = needsChunking(sourceContent, tier);
+
+    if (!requiresChunking) {
+      // Fichier dans les limites — conversion directe
+      return ''; // signal pour le caller d'utiliser generateScreenFile
+    }
+
+    // ── Gros fichier → conversion par chunks ────────────────
+    console.log(`[CodePlanner] PHASE 28: Large file detected for "${targetName}" (${sourceContent.length} chars) — activating file chunker`);
+
+    const assemblyResult = await convertLargeFile(
+      sourceContent,
+      sourceLanguage,
+      framework,
+      ctx.sourceFramework,
+      this.ai,
+      `${targetName} (${framework} screen/component)`,
+      irContext,
+    );
+
+    if (assemblyResult.content) {
+      // Nettoyer le résultat assemblé
+      const cleaned = cleanLLMOutput(assemblyResult.content, `chunked:${targetName}`).content;
+
+      console.log(`[CodePlanner] Chunked conversion complete for "${targetName}": ${assemblyResult.totalChunks} chunks, ${assemblyResult.successfulChunks} ok, ${assemblyResult.todosInserted} TODOs`);
+      console.log(`[CodePlanner] Lines: ${assemblyResult.sourceLines} source → ${assemblyResult.generatedLines} generated (${Math.round(assemblyResult.preservationRatio * 100)}% preserved)`);
+
+      if (assemblyResult.todosInserted > 0) {
+        console.warn(`[CodePlanner] ⚠️  ${assemblyResult.todosInserted} function(s) could not be auto-converted — marked with TODO(codeMorph) for manual review`);
+      }
+
+      return cleaned;
+    }
+
+    return ''; // Fallback vers la méthode normale si chunking n'a rien produit
+  }
+
+  // ── PHASE 28: fallbackScreen() — squelette fonctionnel basé sur l'IR ────
   // BUG-P27-11 FIX: l'endpoint API n'est plus inventé génériquement
   // Il est tiré du nom de l'écran + patterns du projet source
   private fallbackScreen(name: string, framework: string, irContext?: IRDocument): string {
