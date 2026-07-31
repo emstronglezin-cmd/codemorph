@@ -5,12 +5,18 @@
 // Uses AIProvider — supports Free (Groq), Platform (OpenAI), Pro (user key)
 // PHASE 23: Prompt Architecte Ultime V3 — fidélité visuelle Phase 6, prompts V3
 // PHASE 28: LLM Output Cleaner + File Chunker + Import Verifier intégrés
+// PHASE 29: Business Layer Extractor — conversion directe des couches métier source
 // ============================================================
 import { AIProvider } from './ai-provider';
 import type { ConversionContext, IRDocument, GeneratedFile, ConversionSummary, IRDesignTokens } from '../models/ir.types';
 import { cleanLLMOutput, cleanGeneratedFiles }    from './output-cleaner';
 import { convertLargeFile, needsChunking }         from './file-chunker';
 import { verifyAndFixImports, detectTypeIssues, formatTypeReport } from './import-verifier';
+// PHASE 29: Business Layer Extractor — conversion directe depuis le code source
+import {
+  extractAndConvertBusinessLayers,
+  formatExtractionReport,
+} from './business-layer-extractor';
 
 export interface CodePlan {
   files:   GeneratedFile[];
@@ -143,6 +149,43 @@ export class CodePlanner {
         language: 'typescript',
         warnings: [],
       });
+    }
+
+    // ── PHASE 29: Business Layer Direct Conversion (React) ──────────────────
+    if (ctx.sourceCode && ctx.sourceCode.length > 500) {
+      console.log(`\n[CodePlanner] PHASE 29 — Business Layer Direct Conversion (React)...`);
+      try {
+        const bizResult = await extractAndConvertBusinessLayers(
+          ctx.sourceCode,
+          this.ai,
+          ctx.targetFramework ?? 'react',
+        );
+        console.log(formatExtractionReport(bizResult));
+        const existingPaths = new Set(files.map((f) => f.path));
+        let added = 0;
+        let replaced = 0;
+        for (const converted of bizResult.convertedFiles) {
+          if (!converted.content || converted.content.length < 50) continue;
+          const genFile: GeneratedFile = {
+            path:     converted.targetPath,
+            content:  converted.content,
+            language: 'typescript',
+            fromPath: converted.sourcePath,
+            warnings: converted.success ? [] : [`Conversion incomplete — ${converted.error ?? 'unknown'}`],
+          };
+          if (existingPaths.has(converted.targetPath)) {
+            const idx = files.findIndex((f) => f.path === converted.targetPath);
+            if (idx >= 0) { files[idx] = genFile; replaced++; }
+          } else {
+            files.push(genFile);
+            existingPaths.add(converted.targetPath);
+            added++;
+          }
+        }
+        console.log(`[CodePlanner] PHASE 29 React: ${added} new + ${replaced} replaced`);
+      } catch (bizErr) {
+        console.warn(`[CodePlanner] PHASE 29 React business layer failed: ${(bizErr as Error).message}`);
+      }
     }
 
     return { files, summary: this.buildSummary(files, ir) };
@@ -285,7 +328,7 @@ export class CodePlanner {
       });
     }
 
-    // ── Services from IR backend graph ─────────────────────
+    // ── Services from IR backend graph (fallback if no source available) ──────
     const backendGraph = ir.backendGraph ?? { routes: [], services: [], entities: [], middlewares: [] };
     for (const svc of (backendGraph.services ?? []).slice(0, 10)) {
       files.push({
@@ -294,6 +337,56 @@ export class CodePlanner {
         language: 'typescript',
         warnings: [],
       });
+    }
+
+    // ── PHASE 29: Business Layer Extraction & Direct Conversion ───────────────
+    // Si du code source est disponible, convertir directement les couches métier
+    // au lieu de se baser uniquement sur les métadonnées IR
+    if (ctx.sourceCode && ctx.sourceCode.length > 500) {
+      console.log(`\n[CodePlanner] PHASE 29 — Business Layer Direct Conversion from source code...`);
+      try {
+        const bizResult = await extractAndConvertBusinessLayers(
+          ctx.sourceCode,
+          this.ai,
+          ctx.targetFramework ?? 'react-native',
+        );
+
+        console.log(formatExtractionReport(bizResult));
+
+        // Intégrer les fichiers convertis — remplacer les doublons IR ou ajouter
+        const existingPaths = new Set(files.map((f) => f.path));
+        let newFilesCount = 0;
+        let replacedCount = 0;
+
+        for (const converted of bizResult.convertedFiles) {
+          if (!converted.content || converted.content.length < 50) continue;
+
+          const genFile: GeneratedFile = {
+            path:     converted.targetPath,
+            content:  converted.content,
+            language: 'typescript',
+            fromPath: converted.sourcePath,
+            warnings: converted.success ? [] : [`Conversion incomplete — ${converted.error ?? 'unknown error'}`],
+          };
+
+          if (existingPaths.has(converted.targetPath)) {
+            // Remplacer l'entrée IR par la version source directe (meilleure fidélité)
+            const idx = files.findIndex((f) => f.path === converted.targetPath);
+            if (idx >= 0) {
+              files[idx] = genFile;
+              replacedCount++;
+            }
+          } else {
+            files.push(genFile);
+            existingPaths.add(converted.targetPath);
+            newFilesCount++;
+          }
+        }
+
+        console.log(`[CodePlanner] PHASE 29 business layers: ${newFilesCount} new + ${replacedCount} replaced (${bizResult.successCount} successful conversions)`);
+      } catch (bizErr) {
+        console.warn(`[CodePlanner] PHASE 29 business layer extraction failed: ${(bizErr as Error).message} — using IR-based services only`);
+      }
     }
 
     // ── Constants & config ─────────────────────────────────
@@ -622,34 +715,60 @@ src/
       console.warn(`[CodePlanner] ⚠️  BUG#6 WARNING: generateScreenFile("${name}") has NO real IR data (purpose/bizLogic/apiCalls/states/stores/apis all empty). Prompt will be generic.`);
     }
 
-    // ── PHASE 28: Vérifier si le contenu source original nécessite du chunking ──
-    // Si le fichier source de l'écran est disponible depuis le ctx, tenter le chunking
+    // ── PHASE 29: Injecter le contenu source COMPLET dans le prompt ─────────────
+    // Si le fichier source de l'écran est disponible → l'injecter directement
+    // Le LLM reçoit le code original et doit le convertir fidèlement
     const screenSourcePath = screenData?.['path'] as string | undefined;
-    if (screenSourcePath && ctx.sourceCode) {
-      // Extraire le contenu du fichier source spécifique
-      const fileMarkerPattern = new RegExp(
-        `//\\s*(?:=+\\s*)?FILE:\\s*${screenSourcePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*(?:=+)?\\n([\\s\\S]*?)(?=//\\s*(?:=+\\s*)?FILE:|$)`,
-      );
-      const fileMatch = ctx.sourceCode.match(fileMarkerPattern);
-      if (fileMatch?.[1] && fileMatch[1].trim()) {
-        const sourceFileContent = fileMatch[1].trim();
-        const irContextStr = ctxLines || '';
-        const chunkedResult = await this.generateSourceFileWithChunking(
-          ctx, sourceFileContent, ctx.sourceLanguage ?? 'dart',
-          name, framework, irContextStr,
+    let sourceFileContent = '';
+    if (ctx.sourceCode) {
+      // Tentative 1: via le chemin exact depuis l'IR
+      if (screenSourcePath) {
+        const fileMarkerPattern = new RegExp(
+          `//\\s*(?:=+\\s*)?FILE:\\s*${screenSourcePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*(?:=+)?\\n([\\s\\S]*?)(?=//\\s*(?:=+\\s*)?FILE:|$)`,
         );
-        if (chunkedResult) {
-          console.log(`[CodePlanner] generateScreenFile("${name}") DONE via chunking — ${chunkedResult.length} chars`);
-          return chunkedResult;
+        const fileMatch = ctx.sourceCode.match(fileMarkerPattern);
+        if (fileMatch?.[1]?.trim()) {
+          sourceFileContent = fileMatch[1].trim();
+        }
+      }
+      // Tentative 2: recherche par nom d'écran dans les marqueurs FILE:
+      if (!sourceFileContent) {
+        const nameSlug = name.replace(/Screen$/i, '').toLowerCase();
+        const fuzzyPattern = new RegExp(
+          `//\\s*(?:=+\\s*)?FILE:\\s*[^\\n]*${nameSlug.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[^\\n]*\\n([\\s\\S]*?)(?=//\\s*(?:=+\\s*)?FILE:|$)`,
+          'i',
+        );
+        const fuzzyMatch = ctx.sourceCode.match(fuzzyPattern);
+        if (fuzzyMatch?.[1]?.trim()) {
+          sourceFileContent = fuzzyMatch[1].trim();
+          console.log(`[CodePlanner] PHASE 29: Found source file for "${name}" via fuzzy name match`);
         }
       }
     }
 
-    // PHASE 23: System Prompt Architecte Ultime V3
+    // ── PHASE 28/29: Si gros fichier source → chunking ─────────────────────────
+    if (sourceFileContent && needsChunking(sourceFileContent, this.ai.getTier())) {
+      const chunkedResult = await this.generateSourceFileWithChunking(
+        ctx, sourceFileContent, ctx.sourceLanguage ?? 'dart',
+        name, framework, ctxLines || '',
+      );
+      if (chunkedResult) {
+        console.log(`[CodePlanner] generateScreenFile("${name}") DONE via chunking — ${chunkedResult.length} chars`);
+        return chunkedResult;
+      }
+    }
+
+    // ── PHASE 29: Prompt enrichi avec le code source complet ────────────────────
+    // Si source disponible: prompt direct source→target (MEILLEURE FIDÉLITÉ)
+    // Si source non disponible: prompt basé sur métadonnées IR (fallback)
+    const hasSourceCode = sourceFileContent.length > 100;
+    const targetLabel = framework === 'react' ? 'React + TypeScript + TailwindCSS' : 'React Native (Expo Router) + TypeScript';
+
+    // PHASE 29: System Prompt amélioré avec règle de fidélité source
     const systemPrompt = `You are an AI Software Architect specialized in software reconstruction and multi-framework migration.
 
 PHASE 5 — COMPLETE RECONSTRUCTION:
-Generate production-ready ${framework === 'react' ? 'React + TypeScript + TailwindCSS' : 'React Native (Expo Router) + TypeScript'} code.
+Generate production-ready ${targetLabel} code.
 Reproduce IDENTICAL behavior from the source application.
 
 PHASE 6 — VISUAL FIDELITY:
@@ -665,9 +784,24 @@ ABSOLUTE RULES:
 - ALWAYS implement ALL stated UI states (loading, error, empty, success)
 - ALWAYS implement ALL user events and validations
 - ALWAYS implement ALL business logic rules and error cases
+${hasSourceCode ? '- The source code is provided — EVERY function/method must be converted, NO logic may be lost\n- If a function cannot be converted, add: // TODO(codeMorph): CONVERSION INCOMPLETE — <reason>\n- Output line count must be at least 60% of source line count' : ''}
 - Return ONLY the complete TypeScript file content — no markdown fences`;
 
-    const userPrompt = `Generate a complete ${framework === 'react' ? 'React + TypeScript + TailwindCSS' : 'React Native (Expo Router) + TypeScript'} screen named "${name}".
+    // PHASE 29: User Prompt avec injection du code source
+    const userPrompt = hasSourceCode
+      ? `Convert this ${ctx.sourceFramework ?? 'Flutter'} screen to ${targetLabel}.
+
+SOURCE FILE (${screenSourcePath ?? name}, ${sourceFileContent.split('\n').length} lines):
+\`\`\`
+${sourceFileContent.length > 8000 ? sourceFileContent.slice(0, 8000) + '\n// ... (truncated for token limit — all methods must still be converted)' : sourceFileContent}
+\`\`\`
+
+${ctxLines ? `ADDITIONAL CONTEXT (from IR analysis):\n${ctxLines}` : ''}
+
+Output: A complete ${targetLabel} screen named "${name}".
+Requirements: TypeScript strict, all UI states, API calls via apiClient, proper error handling.
+Return ONLY the complete file content.`
+      : `Generate a complete ${targetLabel} screen named "${name}".
 
 ${ctxLines ? `CONTEXT (from source application analysis):\n${ctxLines}` : ''}
 
@@ -682,9 +816,21 @@ Return ONLY the complete file content.`;
     console.log(`\n================ PROMPT (generateScreenFile: ${name}) ================`);
     console.log(`Characters        : ${promptChars}`);
     console.log(`Est. tokens       : ~${Math.ceil(promptChars / 4)}`);
-    console.log(`Max response tok  : 1600`);
+    // Budget tokens selon le tier et la présence de code source
+    // PHASE 29: Si source disponible, allouer plus de tokens pour la conversion complète
+    const tier = this.ai.getTier();
+    const maxResponseTokens = hasSourceCode
+      ? (tier === 'free-groq' ? 1800 : tier === 'platform' ? 3500 : 6000)
+      : (tier === 'free-groq' ? 1600 : tier === 'platform' ? 2000 : 4000);
+
+    console.log(`\n================ PROMPT (generateScreenFile: ${name}) ================`);
+    console.log(`Characters        : ${systemPrompt.length + userPrompt.length}`);
+    console.log(`Est. tokens       : ~${Math.ceil((systemPrompt.length + userPrompt.length) / 4)}`);
+    console.log(`Max response tok  : ${maxResponseTokens}`);
+    console.log(`Has source code   : ${hasSourceCode ? `✓ YES (${sourceFileContent.split('\n').length} lines)` : '✗ NO (IR-based only)'}`);
     console.log(`Has real IR data  : ${hasRealIRData ? '✓ YES' : '✗ NO (generic risk!)'}`);
     console.log(`Contains:`);
+    console.log(`  ${hasSourceCode ? '✓' : '✗'} Source code (PHASE 29)`);
     console.log(`  ${purpose      ? '✓' : '✗'} Screen purpose`);
     console.log(`  ${bizLogic     ? '✓' : '✗'} Business logic`);
     console.log(`  ${apiCalls     ? '✓' : '✗'} API calls`);
@@ -699,7 +845,7 @@ Return ONLY the complete file content.`;
     try {
       const res = await this.ai.chat(
         [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }],
-        1600,
+        maxResponseTokens,
       );
       const generated = res.content || '';
 
@@ -740,8 +886,18 @@ Return ONLY the complete file content.`;
         return this.fallbackScreen(name, framework);
       }
 
-      // Log du résultat
-      console.log(`[CodePlanner] generateScreenFile("${name}") DONE — ${cleanedGenerated.length} chars, tokens=${res.tokensUsed}`);
+      // PHASE 29: Vérifier la compression si source disponible
+      if (hasSourceCode) {
+        const srcLines = sourceFileContent.split('\n').length;
+        const genLines = cleanedGenerated.split('\n').length;
+        const ratio    = genLines / srcLines;
+        if (ratio < 0.4 && srcLines > 30) {
+          console.warn(`[CodePlanner] ⚠️  PHASE 29 Compression for "${name}": ${srcLines} → ${genLines} lines (${(ratio * 100).toFixed(0)}%)`);
+        }
+        console.log(`[CodePlanner] generateScreenFile("${name}") DONE — ${cleanedGenerated.length} chars | source=${srcLines}→${genLines} lines | tokens=${res.tokensUsed}`);
+      } else {
+        console.log(`[CodePlanner] generateScreenFile("${name}") DONE — ${cleanedGenerated.length} chars, tokens=${res.tokensUsed}`);
+      }
       return cleanedGenerated || this.fallbackScreen(name, framework);
     } catch (err) {
       console.warn(`[CodePlanner] generateScreenFile("${name}") FAILED: ${(err as Error).message} — using fallback`);
