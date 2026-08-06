@@ -80,12 +80,13 @@ export class CodePlanner {
 
   private getFrameworkPlanner(target: string): (ctx: ConversionContext, ir: IRDocument) => Promise<CodePlan> {
     // FIX PHASE 16 — normaliser la cible pour matcher les variations d'entrée
-    // Backend envoie: "react", "react-native", "reactnative", "nestjs"
-    // Les clés étaient: "React", "React Native", "NestJS" → jamais de match → planGeneric
+    // Backend envoie: "react", "react-native", "reactnative", "nestjs", "flutter"
+    // PHASE 30: Ajout du planner Flutter (RN→Flutter prioritaire)
     const norm = target.toLowerCase().replace(/[\s_-]/g, '');
     if (norm === 'react')                          return this.planReact.bind(this);
     if (norm === 'reactnative' || norm === 'rn')  return this.planReactNative.bind(this);
     if (norm === 'nestjs')                         return this.planNestJS.bind(this);
+    if (norm === 'flutter')                        return this.planFlutter.bind(this);
     return this.planGeneric.bind(this);
   }
 
@@ -655,6 +656,675 @@ src/
       this.staticFile('README.md', `# Converted Project\n\nIR-based conversion completed.\n\n## Architecture\n${patterns}`),
     ];
     return { files, summary: this.buildSummary(files, ir) };
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════════
+  // ── PHASE 30: Flutter Planner ─────────────────────────────────────────────
+  // Convertit React Native → Flutter avec Dart, Riverpod, GoRouter, Dio
+  // Architecture: lib/screens/, lib/widgets/, lib/services/, lib/providers/,
+  //               lib/models/, lib/repositories/, lib/utils/, lib/config/
+  // ══════════════════════════════════════════════════════════════════════════════
+  private async planFlutter(ctx: ConversionContext, ir: IRDocument): Promise<CodePlan> {
+    const files: GeneratedFile[] = [];
+    const projectName = (ctx.projectId ?? 'app').toLowerCase().replace(/[^a-z0-9_]/g, '_');
+    console.log(`[CodePlanner] planFlutter START — projectId=${ctx.projectId}`);
+
+    // ── 1. Static scaffolding (pubspec.yaml, main.dart, config) ───────────────
+    files.push(
+      this.staticFile('pubspec.yaml',           this.flutterPubspec(projectName)),
+      this.staticFile('analysis_options.yaml',  FLUTTER_ANALYSIS_OPTIONS),
+      this.staticFile('lib/main.dart',          this.flutterMain(projectName)),
+      this.staticFile('lib/config/app_config.dart',   FLUTTER_APP_CONFIG),
+      this.staticFile('lib/config/router.dart',       this.generateGoRouter(ir)),
+      this.staticFile('lib/config/theme.dart',        FLUTTER_THEME),
+      this.staticFile('lib/core/network/dio_client.dart',    FLUTTER_DIO_CLIENT),
+      this.staticFile('lib/core/network/api_endpoints.dart', FLUTTER_API_ENDPOINTS),
+      this.staticFile('lib/core/error/app_exception.dart',   FLUTTER_APP_EXCEPTION),
+      this.staticFile('lib/core/storage/local_storage.dart', FLUTTER_LOCAL_STORAGE),
+      this.staticFile('lib/core/utils/validators.dart',      FLUTTER_VALIDATORS),
+      this.staticFile('lib/core/utils/formatters.dart',      FLUTTER_FORMATTERS),
+    );
+
+    // ── 2. Defensive: ensure IR graphs exist ──────────────────────────────────
+    const uiGraph    = ir.uiGraph    ?? { screens: [], components: [], stateFlow: [], navigationFlow: [] };
+    const dataLayer  = ir.dataLayer  ?? { models: [], relationships: [], migrations: [] };
+    const backendGraph = ir.backendGraph ?? { routes: [], services: [], entities: [], middlewares: [] };
+    const screens    = uiGraph.screens    ?? [];
+    const components = uiGraph.components ?? [];
+    const stateFlow  = uiGraph.stateFlow  ?? [];
+
+    console.log(`[CodePlanner] planFlutter IR — screens=${screens.length} stateFlow=${stateFlow.length} models=${dataLayer.models?.length ?? 0} services=${backendGraph.services?.length ?? 0}`);
+
+    // ── 3. Models / Data classes from IR ──────────────────────────────────────
+    for (const model of (dataLayer.models ?? [])) {
+      files.push({
+        path:     `lib/models/${this.toSnake(model.name)}.dart`,
+        content:  this.generateFlutterModel(model),
+        language: 'dart',
+        warnings: [],
+      });
+    }
+
+    // ── 4. Services from IR backendGraph ──────────────────────────────────────
+    for (const svc of (backendGraph.services ?? []).slice(0, 15)) {
+      files.push({
+        path:     `lib/services/${this.toSnake(svc.name.replace(/Service$/, ''))}_service.dart`,
+        content:  this.generateFlutterService(svc),
+        language: 'dart',
+        warnings: [],
+      });
+    }
+
+    // ── 5. Repositories (one per model that has a service) ────────────────────
+    const modelNames = (dataLayer.models ?? []).map((m) => m.name);
+    for (const modelName of modelNames.slice(0, 10)) {
+      files.push({
+        path:     `lib/repositories/${this.toSnake(modelName)}_repository.dart`,
+        content:  this.generateFlutterRepository(modelName),
+        language: 'dart',
+        warnings: [],
+      });
+    }
+
+    // ── 6. Riverpod providers from stateFlow ──────────────────────────────────
+    // Always add core providers
+    files.push(this.staticFile('lib/providers/auth_provider.dart',    FLUTTER_AUTH_PROVIDER));
+    files.push(this.staticFile('lib/providers/connectivity_provider.dart', FLUTTER_CONNECTIVITY_PROVIDER));
+
+    for (const sf of stateFlow) {
+      const providerName = this.toSnake(sf.store.replace(/Store$|Provider$/, ''));
+      files.push({
+        path:     `lib/providers/${providerName}_provider.dart`,
+        content:  this.generateFlutterProvider(sf.store, sf.actions ?? []),
+        language: 'dart',
+        warnings: [],
+      });
+    }
+
+    // ── 7. Screens via LLM (AI-powered) ───────────────────────────────────────
+    if (screens.length > 0) {
+      for (const screen of screens) {
+        const content = await this.generateFlutterScreen(ctx, ir, screen.name, screen.components ?? []);
+        files.push({
+          path:     `lib/screens/${this.toSnake(screen.name.replace(/Screen$/, ''))}_screen.dart`,
+          content,
+          language: 'dart',
+          fromPath: screen.path,
+          warnings: [],
+        });
+      }
+    } else {
+      // Fallback: infer from architecture
+      const fallbackScreens = this.inferScreensFromSourceFiles(ir);
+      console.log(`[CodePlanner] planFlutter fallback — ${fallbackScreens.length} screens inferred`);
+      for (const screenName of fallbackScreens) {
+        files.push({
+          path:     `lib/screens/${this.toSnake(screenName.replace(/Screen$/, ''))}_screen.dart`,
+          content:  this.generateFlutterFallbackScreen(screenName),
+          language: 'dart',
+          warnings: ['Generated from IR — review and complete implementation'],
+        });
+      }
+    }
+
+    // ── 8. Widgets from components ────────────────────────────────────────────
+    for (const comp of (components ?? []).filter((c) => c.type === 'ui' || c.type === 'shared' || c.type === 'widget')) {
+      files.push({
+        path:     `lib/widgets/${this.toSnake(comp.name)}_widget.dart`,
+        content:  this.generateFlutterWidget(comp.name, comp.props ?? []),
+        language: 'dart',
+        warnings: [],
+      });
+    }
+    // Always add base widgets
+    files.push(
+      this.staticFile('lib/widgets/loading_widget.dart',    FLUTTER_LOADING_WIDGET),
+      this.staticFile('lib/widgets/error_widget.dart',      FLUTTER_ERROR_WIDGET_DART),
+      this.staticFile('lib/widgets/empty_state_widget.dart',FLUTTER_EMPTY_STATE_WIDGET),
+    );
+
+    // ── 9. PHASE 29: Business Layer Direct Conversion (Flutter) ───────────────
+    if (ctx.sourceCode && ctx.sourceCode.length > 500) {
+      console.log(`\n[CodePlanner] PHASE 29+30 — Business Layer Direct Conversion (Flutter)...`);
+      try {
+        const bizResult = await extractAndConvertBusinessLayers(
+          ctx.sourceCode,
+          this.ai,
+          'flutter',
+        );
+        console.log(formatExtractionReport(bizResult));
+        const existingPaths = new Set(files.map((f) => f.path));
+        let added = 0; let replaced = 0;
+        for (const converted of bizResult.convertedFiles) {
+          if (!converted.content || converted.content.length < 50) continue;
+          const genFile: GeneratedFile = {
+            path:     converted.targetPath,
+            content:  converted.content,
+            language: 'dart',
+            fromPath: converted.sourcePath,
+            warnings: converted.success ? [] : [`Conversion incomplete — ${converted.error ?? 'unknown'}`],
+          };
+          if (existingPaths.has(converted.targetPath)) {
+            const idx = files.findIndex((f) => f.path === converted.targetPath);
+            if (idx >= 0) { files[idx] = genFile; replaced++; }
+          } else {
+            files.push(genFile);
+            existingPaths.add(converted.targetPath);
+            added++;
+          }
+        }
+        console.log(`[CodePlanner] PHASE 29+30 Flutter: ${added} new + ${replaced} replaced`);
+      } catch (bizErr) {
+        console.warn(`[CodePlanner] PHASE 29+30 Flutter business layer failed: ${(bizErr as Error).message}`);
+      }
+    }
+
+    // ── 10. README ────────────────────────────────────────────────────────────
+    files.push(this.staticFile('README.md', this.generateFlutterReadme(ctx, files.length + 1)));
+
+    console.log(`[CodePlanner] planFlutter DONE — totalFiles=${files.length}`);
+    return { files, summary: this.buildSummary(files, ir) };
+  }
+
+  // ── Flutter GoRouter generator ──────────────────────────
+  private generateGoRouter(ir: IRDocument): string {
+    const screens = ir.uiGraph?.screens ?? [];
+    const routes  = screens.length > 0
+      ? screens.map((s) => {
+          const slug   = this.toSnake(s.name.replace(/Screen$/, ''));
+          const wgt    = this.pascal(s.name.replace(/Screen$/, '')) + 'Screen';
+          return `  GoRoute(\n    path: '/${slug}',\n    name: '${slug}',\n    builder: (context, state) => const ${wgt}(),\n  ),`;
+        }).join('\n')
+      : `  GoRoute(\n    path: '/home',\n    name: 'home',\n    builder: (context, state) => const Scaffold(body: Center(child: Text('Home'))),\n  ),`;
+
+    const initialLocation = screens.length > 0
+      ? `'/${this.toSnake(screens[0]!.name.replace(/Screen$/, ''))}'`
+      : `'/home'`;
+
+    return `import 'package:flutter/material.dart';
+import 'package:go_router/go_router.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+// ── Screen imports ────────────────────────────────────────
+${screens.map((s) => {
+  const slugImport = this.toSnake(s.name.replace(/Screen$/, ''));
+  return `import '../screens/${slugImport}_screen.dart';`;
+}).join('\n') || "// No screens generated"}
+
+final routerProvider = Provider<GoRouter>((ref) {
+  return GoRouter(
+    initialLocation: ${initialLocation},
+    routes: [
+${routes}
+    ],
+  );
+});
+`;
+  }
+
+  // ── Flutter Model (Dart data class with fromJson/toJson) ─
+  private generateFlutterModel(model: IRDocument['dataLayer']['models'][0]): string {
+    const name   = this.pascal(model.name);
+    const fields = (model.fields ?? []).map((f: { name: string; type: string; nullable?: boolean }) => {
+      const dartType = this.tsToDartType(f.type);
+      const nullable = f.nullable ? '?' : '';
+      return { name: this.toCamel(f.name), type: `${dartType}${nullable}` };
+    });
+
+    const fieldDecls   = fields.map((f) => `  final ${f.type} ${f.name};`).join('\n');
+    const ctorParams   = fields.map((f) => `    required this.${f.name},`).join('\n');
+    const fromJsonBody = fields.map((f) => {
+      const key = f.name;
+      if (f.type === 'String' || f.type === 'String?') return `      ${key}: json['${key}'] as String${f.type.endsWith('?') ? '?' : ''},`;
+      if (f.type === 'int' || f.type === 'int?')       return `      ${key}: (json['${key}'] as num?)${f.type.endsWith('?') ? '?' : ''}.toInt() ?? 0,`;
+      if (f.type === 'double' || f.type === 'double?') return `      ${key}: (json['${key}'] as num?)${f.type.endsWith('?') ? '?' : ''}.toDouble() ?? 0.0,`;
+      if (f.type === 'bool' || f.type === 'bool?')     return `      ${key}: json['${key}'] as bool? ?? false,`;
+      if (f.type === 'DateTime' || f.type === 'DateTime?') return `      ${key}: json['${key}'] != null ? DateTime.parse(json['${key}'] as String) : ${f.type.endsWith('?') ? 'null' : 'DateTime.now()'},`;
+      return `      ${key}: json['${key}'],`;
+    }).join('\n');
+    const toJsonBody = fields.map((f) => `      '${f.name}': ${f.name},`).join('\n');
+    const copyWithParams = fields.map((f) => `    ${f.type}? ${f.name},`).join('\n');
+    const copyWithBody   = fields.map((f) => `      ${f.name}: ${f.name} ?? this.${f.name},`).join('\n');
+
+    return `import 'package:freezed_annotation/freezed_annotation.dart';
+
+part '${this.toSnake(model.name)}.g.dart';
+
+/// ${name} — auto-generated by CodeMorph Phase 30
+class ${name} {
+${fieldDecls || '  final String id;'}
+
+  const ${name}({
+${ctorParams || '    required this.id,'}
+  });
+
+  factory ${name}.fromJson(Map<String, dynamic> json) {
+    return ${name}(
+${fromJsonBody || "      id: json['id'] as String,"}
+    );
+  }
+
+  Map<String, dynamic> toJson() {
+    return {
+${toJsonBody || "      'id': id,"}
+    };
+  }
+
+  ${name} copyWith({
+${copyWithParams || '    String? id,'}
+  }) {
+    return ${name}(
+${copyWithBody || '      id: id ?? this.id,'}
+    );
+  }
+
+  @override
+  String toString() => '${name}(${fields.map((f) => `${f.name}: \$${f.name}`).join(', ') || 'id: \$id'})';
+}
+`;
+  }
+
+  // ── Flutter Service (Dio-based) ────────────────────────────
+  private generateFlutterService(svc: IRDocument['backendGraph']['services'][0]): string {
+    const name    = this.pascal(svc.name.replace(/Service$/, ''));
+    const slug    = this.toSnake(name);
+    const methods = (svc.methods ?? []).slice(0, 12).map((m) => {
+      const httpMethod = /^(create|add|register|login|save|post)/.test(m.name) ? 'post'
+        : /^(update|edit|modify|put|patch)/.test(m.name) ? 'put'
+        : /^(delete|remove|destroy)/.test(m.name) ? 'delete'
+        : 'get';
+      const endpointSuffix = m.name.replace(/^(get|find|fetch|load|list|all)/, '').toLowerCase() || '';
+      const endpoint = endpointSuffix ? `/${slug}/${endpointSuffix}` : `/${slug}`;
+      const hasBody = ['post', 'put', 'patch'].includes(httpMethod);
+      return `  Future<dynamic> ${this.toCamel(m.name)}(${hasBody ? '{required Map<String, dynamic> data}' : ''}) async {
+    final response = await _client.${httpMethod}<dynamic>('${endpoint}'${hasBody ? ', data: data' : ''});
+    return response.data;
+  }`;
+    }).join('\n\n');
+
+    return `import 'package:dio/dio.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../core/network/dio_client.dart';
+
+/// ${name}Service — auto-generated by CodeMorph Phase 30
+class ${name}Service {
+  final Dio _client;
+  ${name}Service(this._client);
+
+${methods || `  Future<List<dynamic>> getAll() async {
+    final response = await _client.get<List<dynamic>>('/${slug}');
+    return response.data ?? [];
+  }`}
+}
+
+final ${this.toCamel(name)}ServiceProvider = Provider<${name}Service>((ref) {
+  final dio = ref.watch(dioClientProvider);
+  return ${name}Service(dio);
+});
+`;
+  }
+
+  // ── Flutter Repository ─────────────────────────────────────
+  private generateFlutterRepository(modelName: string): string {
+    const name  = this.pascal(modelName);
+    const snake = this.toSnake(modelName);
+    return `import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../models/${snake}.dart';
+import '../services/${snake}_service.dart';
+
+/// ${name}Repository — data access layer (CodeMorph Phase 30)
+class ${name}Repository {
+  final ${name}Service _service;
+  final List<${name}> _cache = [];
+
+  ${name}Repository(this._service);
+
+  Future<List<${name}>> getAll({bool forceRefresh = false}) async {
+    if (_cache.isNotEmpty && !forceRefresh) return List.unmodifiable(_cache);
+    try {
+      final data = await _service.getAll();
+      _cache
+        ..clear()
+        ..addAll((data as List).map((e) => ${name}.fromJson(e as Map<String, dynamic>)));
+      return List.unmodifiable(_cache);
+    } catch (e) {
+      rethrow;
+    }
+  }
+
+  Future<${name}?> getById(String id) async {
+    final cached = _cache.where((e) => (e as dynamic).id == id).toList();
+    if (cached.isNotEmpty) return cached.first;
+    try {
+      final data = await _service.getById({'id': id});
+      return ${name}.fromJson(data as Map<String, dynamic>);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  Future<${name}> create(Map<String, dynamic> data) async {
+    final result = await _service.create(data: data);
+    final item = ${name}.fromJson(result as Map<String, dynamic>);
+    _cache.add(item);
+    return item;
+  }
+
+  Future<void> delete(String id) async {
+    await _service.delete(data: {'id': id});
+    _cache.removeWhere((e) => (e as dynamic).id == id);
+  }
+
+  void clearCache() => _cache.clear();
+}
+
+final ${this.toCamel(name)}RepositoryProvider = Provider<${name}Repository>((ref) {
+  final service = ref.watch(${this.toCamel(name)}ServiceProvider);
+  return ${name}Repository(service);
+});
+`;
+  }
+
+  // ── Flutter Riverpod Provider from stateFlow ──────────────
+  private generateFlutterProvider(storeName: string, actions: string[]): string {
+    const name  = this.pascal(storeName.replace(/Store$|Provider$/, ''));
+    const methodImpls = actions.slice(0, 8).map((a) => {
+      const isAsync = /^(fetch|load|get|refresh)/.test(a);
+      return isAsync
+        ? `  Future<void> ${this.toCamel(a)}() async {\n    state = const AsyncLoading();\n    try {\n      // TODO: implement ${a}\n      state = const AsyncData(null);\n    } catch (e, st) {\n      state = AsyncError(e, st);\n    }\n  }`
+        : `  void ${this.toCamel(a)}() {\n    // TODO: implement ${a}\n  }`;
+    }).join('\n\n');
+
+    return `import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+/// ${name}Notifier — Riverpod state (CodeMorph Phase 30)
+class ${name}Notifier extends AsyncNotifier<dynamic> {
+  @override
+  Future<dynamic> build() async {
+    return null;
+  }
+
+${methodImpls || `  Future<void> load() async {\n    state = const AsyncLoading();\n    state = const AsyncData(null);\n  }`}
+}
+
+final ${this.toCamel(name)}Provider = AsyncNotifierProvider<${name}Notifier, dynamic>(
+  ${name}Notifier.new,
+);
+`;
+  }
+
+  // ── Flutter AI-powered screen generator ───────────────────
+  private async generateFlutterScreen(ctx: ConversionContext, ir: IRDocument, name: string, components: string[]): Promise<string> {
+    if (this.ai.getTier() === 'static') return this.generateFlutterFallbackScreen(name);
+
+    const screenData  = ir.uiGraph?.screens?.find((s) => s.name === name) as Record<string, unknown> | undefined;
+    const purpose     = (screenData?.['purpose']       as string   | undefined) ?? '';
+    const bizLogic    = ((screenData?.['businessLogic'] as string[] | undefined) ?? []).join(', ');
+    const apiCalls    = ((screenData?.['apiCalls']      as string[] | undefined) ?? []).join(', ');
+    const states      = ((screenData?.['states']        as string[] | undefined) ?? []).join(', ');
+    const userEvents  = ((screenData?.['userEvents']    as string[] | undefined) ?? []).join(', ');
+    const validations = ((screenData?.['validations']   as string[] | undefined) ?? []).join(', ');
+
+    const screenSourcePath = screenData?.['path'] as string | undefined;
+    let sourceFileContent = '';
+    if (ctx.sourceCode) {
+      if (screenSourcePath) {
+        const pat = new RegExp(`//\\s*(?:=+\\s*)?FILE:\\s*${screenSourcePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*(?:=+)?\\n([\\s\\S]*?)(?=//\\s*(?:=+\\s*)?FILE:|$)`);
+        const m = ctx.sourceCode.match(pat);
+        if (m?.[1]?.trim()) sourceFileContent = m[1].trim();
+      }
+      if (!sourceFileContent) {
+        const nameSlug = name.replace(/Screen$/i, '').toLowerCase();
+        const fuzzy = new RegExp(`//\\s*(?:=+\\s*)?FILE:\\s*[^\\n]*${nameSlug.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[^\\n]*\\n([\\s\\S]*?)(?=//\\s*(?:=+\\s*)?FILE:|$)`, 'i');
+        const fm = ctx.sourceCode.match(fuzzy);
+        if (fm?.[1]?.trim()) {
+          sourceFileContent = fm[1].trim();
+          console.log(`[CodePlanner] PHASE 30: Found Flutter source for "${name}" via fuzzy match`);
+        }
+      }
+    }
+
+    const hasSource     = sourceFileContent.length > 100;
+    const widgetName    = this.pascal(name.replace(/Screen$/, '')) + 'Screen';
+    const srcLang       = ctx.sourceFramework ?? 'React Native';
+    const tier          = this.ai.getTier();
+    const maxTokens     = hasSource
+      ? (tier === 'free-groq' ? 2000 : tier === 'platform' ? 4000 : 6000)
+      : (tier === 'free-groq' ? 1600 : tier === 'platform' ? 2000 : 4000);
+
+    const ctxLines = [
+      purpose      ? `Screen purpose: ${purpose}`           : '',
+      bizLogic     ? `Business logic: ${bizLogic}`          : '',
+      apiCalls     ? `API calls: ${apiCalls}`               : '',
+      states       ? `UI states (implement ALL): ${states}` : '',
+      userEvents   ? `User events: ${userEvents}`           : '',
+      validations  ? `Validations: ${validations}`          : '',
+      components.length ? `Sub-widgets: ${components.join(', ')}` : '',
+    ].filter(Boolean).join('\n');
+
+    const systemPrompt = `You are an expert Flutter developer specializing in framework migration.
+
+TASK: Convert ${srcLang} code to production-ready Flutter/Dart.
+
+RULES:
+- Use Flutter 3.24+ with Dart null safety
+- Use Riverpod for state management (ConsumerWidget / ConsumerStatefulWidget)
+- Use GoRouter for navigation
+- Use Dio for HTTP calls via the dioClientProvider
+- Preserve ALL business logic, ALL API calls, ALL validation rules
+- Implement ALL UI states: loading (CircularProgressIndicator), error (error widget), empty, success
+- Use proper Flutter naming: ${widgetName} extends ConsumerStatefulWidget
+- NEVER use placeholder text, TODO comments, or simplify logic
+${hasSource ? '- Source code provided: convert EVERY method/function, preserve all logic\n- If a method cannot be converted, add: // TODO(codeMorph): INCOMPLETE — <reason>' : ''}
+- Return ONLY the complete Dart file — no markdown, no explanations`;
+
+    const userPrompt = hasSource
+      ? `Convert this ${srcLang} screen to Flutter.
+
+SOURCE (${screenSourcePath ?? name}, ${sourceFileContent.split('\n').length} lines):
+\`\`\`
+${sourceFileContent.length > 8000 ? sourceFileContent.slice(0, 8000) + '\n// ... (truncated)' : sourceFileContent}
+\`\`\`
+
+${ctxLines ? `CONTEXT:\n${ctxLines}` : ''}
+
+Output: Complete Flutter Dart file for widget named ${widgetName}.
+File: lib/screens/${this.toSnake(name.replace(/Screen$/, ''))}_screen.dart
+Return ONLY the complete file.`
+      : `Generate Flutter screen "${widgetName}".
+
+${ctxLines ? `CONTEXT:\n${ctxLines}` : ''}
+
+Source: ${srcLang} | Target: Flutter 3.24 + Dart null safety + Riverpod + GoRouter
+File: lib/screens/${this.toSnake(name.replace(/Screen$/, ''))}_screen.dart
+
+Return ONLY the complete Dart file.`;
+
+    console.log(`[CodePlanner] generateFlutterScreen("${name}") — hasSource=${hasSource} maxTokens=${maxTokens}`);
+    try {
+      const res     = await this.ai.chat([{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }], maxTokens);
+      const cleaned = cleanLLMOutput(res.content || '', `flutter:${name}`).content;
+      if (hasSource) {
+        const srcLines = sourceFileContent.split('\n').length;
+        const genLines = cleaned.split('\n').length;
+        if (genLines / srcLines < 0.4 && srcLines > 30) {
+          console.warn(`[CodePlanner] ⚠️  Flutter compression "${name}": ${srcLines}→${genLines} lines (${((genLines/srcLines)*100).toFixed(0)}%)`);
+        }
+      }
+      return cleaned || this.generateFlutterFallbackScreen(name);
+    } catch (err) {
+      console.warn(`[CodePlanner] generateFlutterScreen("${name}") FAILED: ${(err as Error).message}`);
+      return this.generateFlutterFallbackScreen(name);
+    }
+  }
+
+  // ── Flutter Widget generator ──────────────────────────────
+  private generateFlutterWidget(name: string, props: Array<{ name: string; type: string; required: boolean }>): string {
+    const widgetName = this.pascal(name);
+    const fields = props.slice(0, 8).map((p) => `  final ${this.tsToDartType(p.type)} ${this.toCamel(p.name)};`).join('\n');
+    const ctor   = props.slice(0, 8).map((p) => `    ${p.required ? 'required ' : ''}this.${this.toCamel(p.name)},`).join('\n');
+    return `import 'package:flutter/material.dart';
+
+/// ${widgetName} — auto-generated by CodeMorph Phase 30
+class ${widgetName} extends StatelessWidget {
+${fields || '  final Widget? child;'}
+
+  const ${widgetName}({
+    super.key,
+${ctor || '    this.child,'}
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(16),
+      child: ${props.length > 0 ? `Text('${widgetName}')` : 'child ?? const SizedBox.shrink()'},
+    );
+  }
+}
+`;
+  }
+
+  // ── Flutter fallback screen (no LLM) ────────────────────────────────────────
+  private generateFlutterFallbackScreen(name: string): string {
+    const widgetName = this.pascal(name.replace(/Screen$/, '')) + 'Screen';
+    const title      = name.replace(/Screen$/, '').replace(/([A-Z])/g, ' $1').trim();
+    return `import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+/// ${widgetName} — generated by CodeMorph Phase 30
+/// TODO(codeMorph): Complete implementation from source file
+class ${widgetName} extends ConsumerStatefulWidget {
+  const ${widgetName}({super.key});
+
+  @override
+  ConsumerState<${widgetName}> createState() => _${widgetName}State();
+}
+
+class _${widgetName}State extends ConsumerState<${widgetName}> {
+  bool _isLoading = false;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadData();
+  }
+
+  Future<void> _loadData() async {
+    setState(() { _isLoading = true; _error = null; });
+    try {
+      // TODO(codeMorph): Load data for ${title}
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+    } catch (e) {
+      setState(() { _error = e.toString(); });
+    } finally {
+      setState(() { _isLoading = false; });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('${title}')),
+      body: _buildBody(),
+    );
+  }
+
+  Widget _buildBody() {
+    if (_isLoading) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    if (_error != null) {
+      return Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Text(_error!, style: const TextStyle(color: Colors.red)),
+            const SizedBox(height: 16),
+            ElevatedButton(onPressed: _loadData, child: const Text('Retry')),
+          ],
+        ),
+      );
+    }
+    return const Center(child: Text('${title} — implementation pending'));
+  }
+}
+`;
+  }
+
+  // ── Flutter Readme ─────────────────────────────────────────
+  private generateFlutterReadme(ctx: ConversionContext, fileCount: number): string {
+    return `# ${ctx.projectId} — Flutter App
+
+> Auto-generated by **CodeMorph** from ${ctx.sourceFramework ?? 'React Native'} → Flutter
+
+## Generated Files
+This project contains **${fileCount} files** auto-converted by CodeMorph.
+
+## Tech Stack
+- **Flutter 3.24+** with Dart null safety
+- **Riverpod 2.x** (state management)
+- **GoRouter** (navigation)
+- **Dio** (HTTP client)
+- **SharedPreferences** (local storage)
+
+## Getting Started
+\`\`\`bash
+flutter pub get
+flutter run
+\`\`\`
+
+## Project Structure
+\`\`\`
+lib/
+  config/      # App config, router, theme
+  core/        # Network, error handling, storage, utils
+  models/      # Data classes with fromJson/toJson
+  services/    # API service layer (Dio)
+  repositories/# Data access with caching
+  providers/   # Riverpod state providers
+  screens/     # UI screens (ConsumerStatefulWidget)
+  widgets/     # Reusable widgets
+  main.dart    # App entry point
+\`\`\`
+
+## Notes
+- Configure API URL in \`lib/config/app_config.dart\`
+- Review generated screens and complete any TODO(codeMorph) items
+- Run \`dart run build_runner build\` if using freezed/json_serializable
+`;
+  }
+
+  // ── Type conversion helpers ───────────────────────────────
+  private tsToDartType(tsType: string): string {
+    const map: Record<string, string> = {
+      'string': 'String', 'String': 'String',
+      'number': 'double', 'int': 'int', 'integer': 'int',
+      'boolean': 'bool', 'bool': 'bool',
+      'Date': 'DateTime', 'DateTime': 'DateTime',
+      'any': 'dynamic', 'unknown': 'dynamic', 'object': 'Map<String, dynamic>',
+      'void': 'void', 'null': 'Null',
+      'string[]': 'List<String>', 'number[]': 'List<double>', 'int[]': 'List<int>',
+      'boolean[]': 'List<bool>',
+    };
+    return map[tsType] ?? (tsType.endsWith('[]') ? `List<${map[tsType.slice(0, -2)] ?? 'dynamic'}>` : tsType);
+  }
+
+  private toSnake(s: string): string {
+    return s
+      .replace(/([a-z])([A-Z])/g, '$1_$2')
+      .replace(/([A-Z]+)([A-Z][a-z])/g, '$1_$2')
+      .toLowerCase()
+      .replace(/[^a-z0-9_]/g, '_')
+      .replace(/_+/g, '_')
+      .replace(/^_|_$/g, '');
+  }
+
+  private toCamel(s: string): string {
+    return s
+      .replace(/_([a-z])/g, (_, c: string) => c.toUpperCase())
+      .replace(/^([A-Z])/, (c: string) => c.toLowerCase());
   }
 
   // ── AI-powered file generators — PHASE 23: Prompt Architecte Ultime V3 ────
@@ -1374,6 +2044,10 @@ export function ${name}({ className, children, ...props }: ${name}Props): React.
   private rnPackageJson(name: string): string { return JSON.stringify({ name, version: '0.1.0', private: true, scripts: { start: 'expo start', android: 'expo run:android', ios: 'expo run:ios' }, dependencies: { expo: '~50.0.0', 'expo-router': '^3.0.0', react: '18.2.0', 'react-native': '0.73.0', '@react-navigation/native': '^6.0.0', zustand: '^4.5.0', axios: '^1.6.0' }, devDependencies: { typescript: '^5.4.0', '@types/react': '^18.2.0', '@types/react-native': '^0.73.0' } }, null, 2); }
   private rnAppJson(name: string): string { return JSON.stringify({ expo: { name, slug: name.toLowerCase().replace(/\s+/g, '-'), version: '1.0.0', orientation: 'portrait', icon: './assets/icon.png', splash: { image: './assets/splash.png', resizeMode: 'contain', backgroundColor: '#0f172a' }, platforms: ['ios', 'android'], sdkVersion: '50.0.0' } }, null, 2); }
   private nestPackageJson(name: string): string { return JSON.stringify({ name, version: '0.0.1', private: true, scripts: { build: 'nest build', start: 'nest start', 'start:dev': 'nest start --watch', 'start:prod': 'node dist/main' }, dependencies: { '@nestjs/common': '^10.0.0', '@nestjs/core': '^10.0.0', '@nestjs/platform-express': '^10.0.0', '@nestjs/config': '^3.0.0', '@nestjs/jwt': '^10.0.0', '@nestjs/passport': '^10.0.0', '@nestjs/swagger': '^7.0.0', '@nestjs/typeorm': '^10.0.0', typeorm: '^0.3.0', pg: '^8.11.0', 'reflect-metadata': '^0.2.0', rxjs: '^7.8.0', 'class-validator': '^0.14.0', 'class-transformer': '^0.5.0' }, devDependencies: { '@nestjs/cli': '^10.0.0', '@nestjs/schematics': '^10.0.0', '@nestjs/testing': '^10.0.0', typescript: '^5.4.0' } }, null, 2); }
+
+  // PHASE 30: Flutter helpers (delegates to module-level functions for clean strings)
+  private flutterPubspec(name: string): string { return flutterPubspecTemplate(name); }
+  private flutterMain(name: string): string    { return flutterMainTemplate(name); }
 }
 
 // ── Static template strings ────────────────────────────────
@@ -1649,3 +2323,592 @@ const NEST_TSCONFIG = `{"compilerOptions":{"module":"CommonJS","declaration":tru
 const NEST_MAIN = `import { NestFactory } from '@nestjs/core';\nimport { ValidationPipe } from '@nestjs/common';\nimport { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';\nimport { AppModule } from './app.module';\nasync function bootstrap(): Promise<void> {\n  const app = await NestFactory.create(AppModule);\n  app.setGlobalPrefix('api/v1');\n  app.useGlobalPipes(new ValidationPipe({ whitelist: true, transform: true }));\n  const config = new DocumentBuilder().setTitle('API').setVersion('1.0').addBearerAuth().build();\n  SwaggerModule.setup('api/docs', app, SwaggerModule.createDocument(app, config));\n  await app.listen(4000);\n  console.log('🚀 NestJS running on http://localhost:4000');\n}\nboostrap();\n`;
 // BUG-P27-10 FIX: NEST_APP_MODULE remplacé par CodePlanner.generateNestAppModule() dynamique
 // (constante statique supprimée — utiliser la méthode de classe qui injecte les vrais modules)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PHASE 30: Flutter Static Templates
+// ══════════════════════════════════════════════════════════════════════════════
+
+function flutterPubspecTemplate(projectName: string): string {
+  return `name: ${projectName}
+description: Flutter app generated by CodeMorph Phase 30
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+  flutter: '>=3.24.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_riverpod: ^2.5.1
+  riverpod_annotation: ^2.3.5
+  go_router: ^14.2.0
+  dio: ^5.4.3
+  shared_preferences: ^2.2.3
+  connectivity_plus: ^6.0.3
+  freezed_annotation: ^2.4.1
+  json_annotation: ^4.9.0
+  intl: ^0.19.0
+  logger: ^2.4.0
+  flutter_secure_storage: ^9.2.2
+  cached_network_image: ^3.3.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  build_runner: ^2.4.11
+  freezed: ^2.5.2
+  json_serializable: ^6.8.0
+  riverpod_generator: ^2.4.0
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/images/
+    - assets/icons/
+`;
+}
+
+function flutterMainTemplate(projectName: string): string {
+  const appName = projectName.split('_').map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+  return `import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'config/router.dart';
+import 'config/theme.dart';
+
+void main() {
+  WidgetsFlutterBinding.ensureInitialized();
+  runApp(
+    const ProviderScope(
+      child: ${appName.replace(/\s/g, '')}App(),
+    ),
+  );
+}
+
+class ${appName.replace(/\s/g, '')}App extends ConsumerWidget {
+  const ${appName.replace(/\s/g, '')}App({super.key});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final router = ref.watch(routerProvider);
+    return MaterialApp.router(
+      title: '${appName}',
+      theme: AppTheme.lightTheme,
+      darkTheme: AppTheme.darkTheme,
+      routerConfig: router,
+      debugShowCheckedModeBanner: false,
+    );
+  }
+}
+`;
+}
+
+const FLUTTER_ANALYSIS_OPTIONS = `include: package:flutter_lints/flutter.yaml
+
+analyzer:
+  strong-mode:
+    implicit-casts: false
+    implicit-dynamic: false
+  errors:
+    missing_required_param: error
+    missing_return: error
+
+linter:
+  rules:
+    - always_declare_return_types
+    - avoid_print
+    - prefer_const_constructors
+    - prefer_final_fields
+    - use_key_in_widget_constructors
+`;
+
+const FLUTTER_APP_CONFIG = `/// Application configuration — CodeMorph Phase 30
+class AppConfig {
+  static const String apiBaseUrl    = String.fromEnvironment('API_URL', defaultValue: 'http://localhost:4000/api/v1');
+  static const String appName       = String.fromEnvironment('APP_NAME', defaultValue: 'App');
+  static const Duration apiTimeout  = Duration(seconds: 30);
+  static const int maxRetries       = 3;
+  static const String tokenKey      = 'auth_token';
+  static const String refreshKey    = 'refresh_token';
+  static const String userKey       = 'current_user';
+}
+`;
+
+const FLUTTER_THEME = `import 'package:flutter/material.dart';
+
+/// AppTheme — CodeMorph Phase 30
+class AppTheme {
+  static const Color primary     = Color(0xFF2563EB);
+  static const Color secondary   = Color(0xFF10B981);
+  static const Color error       = Color(0xFFEF4444);
+  static const Color background  = Color(0xFFF9FAFB);
+  static const Color surface     = Colors.white;
+  static const Color textPrimary = Color(0xFF111827);
+  static const Color textSecondary = Color(0xFF6B7280);
+
+  static ThemeData get lightTheme => ThemeData(
+    useMaterial3: true,
+    colorScheme: ColorScheme.fromSeed(seedColor: primary),
+    scaffoldBackgroundColor: background,
+    appBarTheme: const AppBarTheme(
+      backgroundColor: Colors.white,
+      foregroundColor: textPrimary,
+      elevation: 0,
+    ),
+    elevatedButtonTheme: ElevatedButtonThemeData(
+      style: ElevatedButton.styleFrom(
+        backgroundColor: primary,
+        foregroundColor: Colors.white,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+        padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
+      ),
+    ),
+    inputDecorationTheme: InputDecorationTheme(
+      border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+      contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+    ),
+  );
+
+  static ThemeData get darkTheme => ThemeData.dark(useMaterial3: true).copyWith(
+    colorScheme: ColorScheme.fromSeed(seedColor: primary, brightness: Brightness.dark),
+  );
+}
+`;
+
+const FLUTTER_DIO_CLIENT = `import 'package:dio/dio.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import '../../config/app_config.dart' show AppConfig;
+
+/// DioClient — HTTP client with auth interceptor (CodeMorph Phase 30)
+class DioClient {
+  late final Dio _dio;
+
+  DioClient() {
+    _dio = Dio(BaseOptions(
+      baseUrl: AppConfig.apiBaseUrl,
+      connectTimeout: AppConfig.apiTimeout,
+      receiveTimeout: AppConfig.apiTimeout,
+      headers: {'Content-Type': 'application/json'},
+    ));
+    _dio.interceptors.addAll([_AuthInterceptor(), LogInterceptor(requestBody: false, responseBody: false)]);
+  }
+
+  Dio get dio => _dio;
+}
+
+class _AuthInterceptor extends Interceptor {
+  @override
+  Future<void> onRequest(RequestOptions options, RequestInterceptorHandler handler) async {
+    final prefs = await SharedPreferences.getInstance();
+    final token = prefs.getString(AppConfig.tokenKey);
+    if (token != null) {
+      options.headers['Authorization'] = 'Bearer \$token';
+    }
+    handler.next(options);
+  }
+
+  @override
+  void onError(DioException err, ErrorInterceptorHandler handler) {
+    if (err.response?.statusCode == 401) {
+      // Token expired — clear and redirect to login
+    }
+    handler.next(err);
+  }
+}
+
+final dioClientProvider = Provider<Dio>((ref) {
+  return DioClient().dio;
+});
+`;
+
+const FLUTTER_API_ENDPOINTS = `/// API Endpoints — CodeMorph Phase 30
+class ApiEndpoints {
+  static const String auth    = '/auth';
+  static const String login   = '/auth/login';
+  static const String register = '/auth/register';
+  static const String refresh = '/auth/refresh';
+  static const String profile = '/auth/profile';
+  static const String logout  = '/auth/logout';
+}
+`;
+
+const FLUTTER_APP_EXCEPTION = `/// AppException — unified error handling (CodeMorph Phase 30)
+class AppException implements Exception {
+  final String message;
+  final int? statusCode;
+  final String? code;
+
+  const AppException({
+    required this.message,
+    this.statusCode,
+    this.code,
+  });
+
+  factory AppException.fromDioError(dynamic error) {
+    if (error.response != null) {
+      final status = error.response.statusCode as int;
+      final data = error.response.data;
+      final msg = data is Map ? (data['message'] ?? data['error'] ?? 'Server error') as String : 'Server error';
+      return AppException(message: msg, statusCode: status, code: 'HTTP_\$status');
+    }
+    if (error.type.toString().contains('connectTimeout') || error.type.toString().contains('receiveTimeout')) {
+      return const AppException(message: 'Connection timeout. Check your internet.', code: 'TIMEOUT');
+    }
+    return AppException(message: error.message?.toString() ?? 'Network error', code: 'NETWORK');
+  }
+
+  bool get isUnauthorized => statusCode == 401;
+  bool get isNotFound     => statusCode == 404;
+  bool get isServerError  => (statusCode ?? 0) >= 500;
+
+  @override
+  String toString() => 'AppException(message: \$message, status: \$statusCode)';
+}
+`;
+
+const FLUTTER_LOCAL_STORAGE = `import 'dart:convert';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+/// LocalStorage — wrapper around SharedPreferences (CodeMorph Phase 30)
+class LocalStorage {
+  static SharedPreferences? _prefs;
+
+  static Future<void> init() async {
+    _prefs ??= await SharedPreferences.getInstance();
+  }
+
+  static SharedPreferences get prefs {
+    if (_prefs == null) throw StateError('LocalStorage not initialized. Call LocalStorage.init() first.');
+    return _prefs!;
+  }
+
+  static Future<void> setString(String key, String value) async => prefs.setString(key, value);
+  static String? getString(String key) => prefs.getString(key);
+
+  static Future<void> setObject<T>(String key, T value) async {
+    final json = jsonEncode(value);
+    await prefs.setString(key, json);
+  }
+
+  static T? getObject<T>(String key, T Function(Map<String, dynamic>) fromJson) {
+    final json = prefs.getString(key);
+    if (json == null) return null;
+    try {
+      return fromJson(jsonDecode(json) as Map<String, dynamic>);
+    } catch (_) { return null; }
+  }
+
+  static Future<void> remove(String key) async => prefs.remove(key);
+  static Future<void> clear() async => prefs.clear();
+  static bool hasKey(String key) => prefs.containsKey(key);
+}
+
+final localStorageProvider = Provider<LocalStorage>((_) => LocalStorage());
+`;
+
+const FLUTTER_VALIDATORS = `/// Validators — CodeMorph Phase 30
+class Validators {
+  static final _emailRegex = RegExp(r'^[a-zA-Z0-9._%+\\-]+@[a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,}\$');
+  static final _phoneRegex = RegExp(r'^[\\+]?[(]?[0-9]{3}[)]?[\\-\\s\\.]?[0-9]{3}[\\-\\s\\.]?[0-9]{4,6}\$');
+
+  static String? required(String? value, [String? fieldName]) {
+    if (value == null || value.trim().isEmpty) return '\${fieldName ?? 'Field'} is required';
+    return null;
+  }
+
+  static String? email(String? value) {
+    if (value == null || value.trim().isEmpty) return 'Email is required';
+    if (!_emailRegex.hasMatch(value.trim())) return 'Invalid email address';
+    return null;
+  }
+
+  static String? password(String? value) {
+    if (value == null || value.isEmpty) return 'Password is required';
+    if (value.length < 8) return 'Password must be at least 8 characters';
+    if (!RegExp(r'[A-Z]').hasMatch(value)) return 'Must contain uppercase letter';
+    if (!RegExp(r'[0-9]').hasMatch(value)) return 'Must contain a number';
+    return null;
+  }
+
+  static String? minLength(String? value, int min, [String? fieldName]) {
+    if (value == null || value.length < min) return '\${fieldName ?? 'Field'} must be at least \$min characters';
+    return null;
+  }
+
+  static String? maxLength(String? value, int max, [String? fieldName]) {
+    if (value != null && value.length > max) return '\${fieldName ?? 'Field'} must be at most \$max characters';
+    return null;
+  }
+
+  static String? phone(String? value) {
+    if (value == null || value.trim().isEmpty) return 'Phone is required';
+    if (!_phoneRegex.hasMatch(value.trim())) return 'Invalid phone number';
+    return null;
+  }
+
+  static String? Function(String?) compose(List<String? Function(String?)> validators) {
+    return (value) {
+      for (final v in validators) {
+        final err = v(value);
+        if (err != null) return err;
+      }
+      return null;
+    };
+  }
+}
+`;
+
+const FLUTTER_FORMATTERS = `import 'package:intl/intl.dart';
+
+/// Formatters — CodeMorph Phase 30
+class Formatters {
+  static final _currencyFmt = NumberFormat.currency(locale: 'en_US', symbol: '\$');
+  static final _numberFmt   = NumberFormat('#,##0.##');
+  static final _dateFmt     = DateFormat('MMM d, yyyy');
+  static final _timeFmt     = DateFormat('h:mm a');
+  static final _dateTimeFmt = DateFormat('MMM d, yyyy h:mm a');
+
+  static String currency(num value)   => _currencyFmt.format(value);
+  static String number(num value)     => _numberFmt.format(value);
+  static String date(DateTime dt)     => _dateFmt.format(dt);
+  static String time(DateTime dt)     => _timeFmt.format(dt);
+  static String dateTime(DateTime dt) => _dateTimeFmt.format(dt);
+
+  static String relativeTime(DateTime dt) {
+    final diff = DateTime.now().difference(dt);
+    if (diff.inSeconds < 60)  return 'just now';
+    if (diff.inMinutes < 60)  return '\${diff.inMinutes}m ago';
+    if (diff.inHours < 24)    return '\${diff.inHours}h ago';
+    if (diff.inDays < 30)     return '\${diff.inDays}d ago';
+    return _dateFmt.format(dt);
+  }
+
+  static String fileSize(int bytes) {
+    if (bytes < 1024)       return '\$bytes B';
+    if (bytes < 1048576)    return '\${(bytes / 1024).toStringAsFixed(1)} KB';
+    if (bytes < 1073741824) return '\${(bytes / 1048576).toStringAsFixed(1)} MB';
+    return '\${(bytes / 1073741824).toStringAsFixed(1)} GB';
+  }
+
+  static String initials(String name) {
+    return name.trim().split(RegExp(r'\\s+')).where((w) => w.isNotEmpty).take(2).map((w) => w[0].toUpperCase()).join();
+  }
+}
+`;
+
+const FLUTTER_AUTH_PROVIDER = `import 'dart:convert';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import '../core/network/dio_client.dart';
+import '../core/network/api_endpoints.dart';
+import '../core/error/app_exception.dart';
+
+/// AuthState — CodeMorph Phase 30
+class AuthState {
+  final Map<String, dynamic>? user;
+  final String? token;
+  final bool isAuthenticated;
+  final bool isLoading;
+  final String? error;
+
+  const AuthState({
+    this.user,
+    this.token,
+    this.isAuthenticated = false,
+    this.isLoading = false,
+    this.error,
+  });
+
+  AuthState copyWith({Map<String, dynamic>? user, String? token, bool? isAuthenticated, bool? isLoading, String? error}) {
+    return AuthState(
+      user: user ?? this.user,
+      token: token ?? this.token,
+      isAuthenticated: isAuthenticated ?? this.isAuthenticated,
+      isLoading: isLoading ?? this.isLoading,
+      error: error,
+    );
+  }
+}
+
+/// AuthNotifier — Riverpod auth state (CodeMorph Phase 30)
+class AuthNotifier extends StateNotifier<AuthState> {
+  final Ref _ref;
+
+  AuthNotifier(this._ref) : super(const AuthState()) {
+    _loadStoredAuth();
+  }
+
+  Future<void> _loadStoredAuth() async {
+    final prefs = await SharedPreferences.getInstance();
+    final token  = prefs.getString('auth_token');
+    final userStr = prefs.getString('current_user');
+    if (token != null && userStr != null) {
+      final user = jsonDecode(userStr) as Map<String, dynamic>;
+      state = AuthState(user: user, token: token, isAuthenticated: true);
+    }
+  }
+
+  Future<bool> login(String email, String password) async {
+    state = state.copyWith(isLoading: true, error: null);
+    try {
+      final dio = _ref.read(dioClientProvider);
+      final response = await dio.post<Map<String, dynamic>>(
+        ApiEndpoints.login,
+        data: {'email': email, 'password': password},
+      );
+      final data  = response.data!;
+      final token = data['token'] as String? ?? data['accessToken'] as String? ?? '';
+      final user  = data['user'] as Map<String, dynamic>? ?? {};
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString('auth_token', token);
+      await prefs.setString('current_user', jsonEncode(user));
+      state = AuthState(user: user, token: token, isAuthenticated: true);
+      return true;
+    } catch (e) {
+      final err = e is Exception ? AppException.fromDioError(e).message : e.toString();
+      state = state.copyWith(isLoading: false, error: err);
+      return false;
+    }
+  }
+
+  Future<void> logout() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove('auth_token');
+    await prefs.remove('current_user');
+    state = const AuthState();
+  }
+}
+
+final authProvider = StateNotifierProvider<AuthNotifier, AuthState>(
+  (ref) => AuthNotifier(ref),
+);
+`;
+
+const FLUTTER_CONNECTIVITY_PROVIDER = `import 'package:connectivity_plus/connectivity_plus.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+/// Connectivity provider — offline detection (CodeMorph Phase 30)
+final connectivityProvider = StreamProvider<ConnectivityResult>((ref) {
+  return Connectivity().onConnectivityChanged.map((results) => results.isNotEmpty ? results.first : ConnectivityResult.none);
+});
+
+final isOnlineProvider = Provider<bool>((ref) {
+  return ref.watch(connectivityProvider).when(
+    data: (result) => result != ConnectivityResult.none,
+    loading: () => true,
+    error: (_, __) => true,
+  );
+});
+`;
+
+const FLUTTER_LOADING_WIDGET = `import 'package:flutter/material.dart';
+
+/// LoadingWidget — CodeMorph Phase 30
+class LoadingWidget extends StatelessWidget {
+  final String? message;
+  const LoadingWidget({super.key, this.message});
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          const CircularProgressIndicator(),
+          if (message != null) ...[
+            const SizedBox(height: 16),
+            Text(message!, style: Theme.of(context).textTheme.bodyMedium),
+          ],
+        ],
+      ),
+    );
+  }
+}
+`;
+
+const FLUTTER_ERROR_WIDGET_DART = `import 'package:flutter/material.dart';
+
+/// AppErrorWidget — CodeMorph Phase 30
+class AppErrorWidget extends StatelessWidget {
+  final String message;
+  final VoidCallback? onRetry;
+
+  const AppErrorWidget({super.key, required this.message, this.onRetry});
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const Icon(Icons.error_outline, color: Colors.red, size: 48),
+            const SizedBox(height: 16),
+            Text(message, textAlign: TextAlign.center, style: const TextStyle(color: Colors.red)),
+            if (onRetry != null) ...[
+              const SizedBox(height: 16),
+              ElevatedButton.icon(
+                onPressed: onRetry,
+                icon: const Icon(Icons.refresh),
+                label: const Text('Retry'),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+}
+`;
+
+const FLUTTER_EMPTY_STATE_WIDGET = `import 'package:flutter/material.dart';
+
+/// EmptyStateWidget — CodeMorph Phase 30
+class EmptyStateWidget extends StatelessWidget {
+  final String title;
+  final String? subtitle;
+  final IconData icon;
+  final VoidCallback? onAction;
+  final String? actionLabel;
+
+  const EmptyStateWidget({
+    super.key,
+    required this.title,
+    this.subtitle,
+    this.icon = Icons.inbox_outlined,
+    this.onAction,
+    this.actionLabel,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(32),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(icon, size: 64, color: Colors.grey[400]),
+            const SizedBox(height: 16),
+            Text(title, style: Theme.of(context).textTheme.titleMedium, textAlign: TextAlign.center),
+            if (subtitle != null) ...[
+              const SizedBox(height: 8),
+              Text(subtitle!, style: Theme.of(context).textTheme.bodySmall, textAlign: TextAlign.center),
+            ],
+            if (onAction != null) ...[
+              const SizedBox(height: 24),
+              ElevatedButton(onPressed: onAction, child: Text(actionLabel ?? 'Add')),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+}
+`;
+

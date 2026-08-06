@@ -455,6 +455,38 @@ export function generateTargetPath(
     }
   }
 
+  // ── PHASE 30: Flutter target ───────────────────────────────────────────────
+  const isFlutter = norm === 'flutter';
+  if (isFlutter) {
+    // Dart snake_case naming convention
+    const dartSnake = cleanName; // already snake_case from source
+    switch (layerType) {
+      case 'service':      return `lib/services/${dartSnake}_service.dart`;
+      case 'repository':   return `lib/repositories/${dartSnake}_repository.dart`;
+      case 'datasource':   return `lib/data/${dartSnake}_datasource.dart`;
+      case 'store':
+      case 'bloc':         return `lib/blocs/${dartSnake}_bloc.dart`;
+      case 'cubit':        return `lib/cubits/${dartSnake}_cubit.dart`;
+      case 'provider':     return `lib/providers/${dartSnake}_provider.dart`;
+      case 'validator':    return `lib/core/validators/${dartSnake}_validator.dart`;
+      case 'model':        return `lib/models/${dartSnake}.dart`;
+      case 'mapper':       return `lib/data/mappers/${dartSnake}_mapper.dart`;
+      case 'hook':         return `lib/providers/${dartSnake}_provider.dart`; // hooks → providers in Flutter
+      case 'middleware':   return `lib/core/middleware/${dartSnake}.dart`;
+      case 'exception':    return `lib/core/errors/${dartSnake}.dart`;
+      case 'util':
+      case 'helper':       return `lib/core/utils/${dartSnake}.dart`;
+      case 'cache':        return `lib/core/cache/${dartSnake}.dart`;
+      case 'offline':      return `lib/core/offline/${dartSnake}.dart`;
+      case 'networking':   return `lib/core/network/${dartSnake}.dart`;
+      case 'interactor':
+      case 'usecase':      return `lib/usecases/${dartSnake}_usecase.dart`;
+      case 'controller':   return `lib/controllers/${dartSnake}_controller.dart`;
+      case 'factory':      return `lib/core/factories/${dartSnake}_factory.dart`;
+      default:             return `lib/${dartSnake}.dart`;
+    }
+  }
+
   // React Native (default)
   switch (layerType) {
     case 'service':
@@ -489,13 +521,28 @@ function buildConversionPrompt(
   targetPath:      string,
 ): { system: string; user: string } {
   const norm = targetFramework.toLowerCase().replace(/[\s_-]/g, '');
-  const isRN  = norm === 'reactnative' || norm === 'rn';
-  const isNest = norm === 'nestjs';
-  const targetLabel = isRN ? 'React Native (Expo) + TypeScript' : isNest ? 'NestJS + TypeScript' : 'React + TypeScript';
+  const isRN      = norm === 'reactnative' || norm === 'rn';
+  const isNest    = norm === 'nestjs';
+  const isFlutter = norm === 'flutter';
+  const targetLabel = isFlutter ? 'Flutter 3.24+ / Dart (null safety)'
+    : isRN   ? 'React Native (Expo) + TypeScript'
+    : isNest ? 'NestJS + TypeScript'
+    : 'React + TypeScript';
 
   // Instructions spécifiques par type de couche
   const layerInstructions: Partial<Record<BusinessLayerType, string>> = {
-    repository: `Convert this ${file.layerType.toUpperCase()} to ${targetLabel}.
+    repository: isFlutter
+      ? `Convert this ${file.layerType.toUpperCase()} to ${targetLabel}.
+RULES:
+- Keep EVERY method — no method must be removed
+- Convert TypeScript/JS to Dart with null safety
+- Replace Axios → Dio, AsyncStorage → SharedPreferences/Hive
+- Preserve all API endpoints, HTTP methods, request/response types
+- Keep all error handling (try/catch → try/catch in Dart)
+- Keep all data mapping/transformation logic (Map<String,dynamic>)
+- Use Riverpod or Repository pattern for dependency injection
+- Output file path: ${targetPath}`
+      : `Convert this ${file.layerType.toUpperCase()} to ${targetLabel}.
 RULES:
 - Keep EVERY method — no method must be removed
 - Replace Flutter-specific packages (dio → axios, shared_preferences → AsyncStorage)
@@ -504,7 +551,17 @@ RULES:
 - Keep all data mapping/transformation logic
 - Output file path: ${targetPath}`,
 
-    service: `Convert this ${file.layerType.toUpperCase()} to ${targetLabel}.
+    service: isFlutter
+      ? `Convert this ${file.layerType.toUpperCase()} to ${targetLabel}.
+RULES:
+- Keep EVERY method and business rule — no logic must be lost
+- Convert TypeScript/JS → Dart null safety
+- Replace axios/fetch with Dio
+- Replace TS types with Dart types (string→String, number→double/int, boolean→bool)
+- Keep all error cases and exception handling
+- Add proper Dart class structure
+- Output file path: ${targetPath}`
+      : `Convert this ${file.layerType.toUpperCase()} to ${targetLabel}.
 RULES:
 - Keep EVERY method and business rule — no logic must be lost
 - Preserve all validation logic, calculations, transformations
@@ -512,7 +569,16 @@ RULES:
 - Replace Flutter dependencies with RN/TS equivalents
 - Output file path: ${targetPath}`,
 
-    bloc: `Convert this Flutter BLoC to a ${targetLabel} Zustand store.
+    bloc: isFlutter
+      ? `Convert this TypeScript/JS state management to a Flutter ${targetLabel} Riverpod Notifier.
+RULES:
+- Map each Zustand/Redux action → Riverpod AsyncNotifier method
+- Map each state slice → Riverpod state class
+- Preserve all async logic
+- Keep all error handling and loading states
+- Use AsyncNotifierProvider pattern
+- Output file path: ${targetPath}`
+      : `Convert this Flutter BLoC to a ${targetLabel} Zustand store.
 RULES:
 - Map each BLoC event → Zustand action
 - Map each BLoC state → Zustand state slice
@@ -521,7 +587,14 @@ RULES:
 - The output is a Zustand store (create<StateType>(...))
 - Output file path: ${targetPath}`,
 
-    cubit: `Convert this Flutter Cubit to a ${targetLabel} Zustand store.
+    cubit: isFlutter
+      ? `Convert this TypeScript state to Flutter ${targetLabel} Riverpod Cubit/Notifier.
+RULES:
+- Convert to StateNotifier or Notifier pattern
+- Preserve all state management logic
+- Keep all error handling and loading states
+- Output file path: ${targetPath}`
+      : `Convert this Flutter Cubit to a ${targetLabel} Zustand store.
 RULES:
 - Map each Cubit method → Zustand action
 - Map each Cubit state field → Zustand state field
@@ -529,7 +602,14 @@ RULES:
 - Keep all error handling and loading states
 - Output file path: ${targetPath}`,
 
-    provider: `Convert this Flutter Provider/Riverpod to a ${targetLabel} Zustand store or React Context.
+    provider: isFlutter
+      ? `Convert this TypeScript/JS provider/store to Flutter ${targetLabel} Riverpod provider.
+RULES:
+- Convert Zustand store → Riverpod StateNotifierProvider
+- Preserve all state fields and actions
+- Keep all business logic
+- Output file path: ${targetPath}`
+      : `Convert this Flutter Provider/Riverpod to a ${targetLabel} Zustand store or React Context.
 RULES:
 - Preserve all state fields and computed values
 - Convert ChangeNotifier methods → Zustand actions
@@ -544,7 +624,16 @@ RULES:
 - Output yup/zod validation schema or equivalent
 - Output file path: ${targetPath}`,
 
-    model: `Convert this data model/DTO to ${targetLabel} TypeScript interfaces.
+    model: isFlutter
+      ? `Convert this TypeScript/JS data model to Flutter ${targetLabel} data class.
+RULES:
+- Convert TypeScript interface/type → Dart class with null safety
+- Add fromJson(Map<String,dynamic>) and toJson() methods
+- Add copyWith() method
+- Replace TypeScript types with Dart types (string→String, number→double/int, boolean→bool)
+- Preserve ALL fields exactly
+- Output file path: ${targetPath}`
+      : `Convert this data model/DTO to ${targetLabel} TypeScript interfaces.
 RULES:
 - Preserve ALL fields exactly (no field must be missing)
 - Keep nullability (nullable fields → optional ?)
@@ -606,6 +695,7 @@ RULES:
   const specificInstructions = layerInstructions[file.layerType]
     ?? `Convert this ${file.layerType.toUpperCase()} from ${file.path.split('.').pop()?.toUpperCase() ?? 'source'} to ${targetLabel}. Output file path: ${targetPath}`;
 
+  const outputLang = isFlutter ? 'Dart (Flutter null safety)' : 'TypeScript';
   const system = `You are an expert software architect specializing in cross-framework code migration.
 Your task is to perform a COMPLETE and FAITHFUL conversion of source code.
 
@@ -613,8 +703,8 @@ ABSOLUTE RULES:
 1. NEVER summarize — every function/method must appear in the output
 2. NEVER delete business logic — if conversion is impossible, add: // TODO(codeMorph): CONVERSION INCOMPLETE — <reason>
 3. NEVER invent functionality not in the source
-4. Output ONLY the complete TypeScript file content — no markdown fences, no explanations
-5. The output file must be compilable TypeScript
+4. Output ONLY the complete ${outputLang} file content — no markdown fences, no explanations
+5. The output file must be compilable ${outputLang}
 6. The output line count should be at least 60% of the source line count`;
 
   const user = `${specificInstructions}
@@ -625,7 +715,7 @@ ${file.content}
 \`\`\`
 
 Convert the COMPLETE source above to ${targetLabel}.
-Preserve ALL logic. Output ONLY the TypeScript file content.`;
+Preserve ALL logic. Output ONLY the ${outputLang} file content.`;
 
   return { system, user };
 }

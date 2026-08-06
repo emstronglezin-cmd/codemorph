@@ -150,11 +150,20 @@ export class IRGenerator {
     const components: IRDocument['uiGraph']['components'] = [];
 
     // Screen heuristic: files matching screen/page/view pattern
-    const screenFiles = ast.files.filter((f) =>
-      /screen|page|view/i.test(f.path) ||
-      /\/pages?\//i.test(f.path) ||
-      /\/screens?\//i.test(f.path)
-    );
+    // OR files in app/ directory that look like screens (home, login, profile, etc.)
+    // OR files whose basename matches common screen names
+    const knownScreenNames = /^(home|login|register|signup|signin|profile|settings|dashboard|cart|checkout|product|detail|search|feed|splash|onboarding|welcome|about|contact|help|faq|order|payment|account)\.(tsx?|jsx?|dart)$/i;
+    const screenFiles = ast.files.filter((f) => {
+      const basename = f.path.split('/').pop() ?? '';
+      return (
+        /screen|page|view/i.test(f.path) ||
+        /\/pages?\//i.test(f.path) ||
+        /\/screens?\//i.test(f.path) ||
+        /\/app\//i.test(f.path) ||
+        /\/views?\//i.test(f.path) ||
+        knownScreenNames.test(basename)
+      );
+    });
 
     // Component heuristic: files matching widget/component pattern
     const componentFiles = ast.files.filter((f) =>
@@ -185,23 +194,32 @@ export class IRGenerator {
       });
     }
 
-    // If no screen files found, create basic screens from modules
+    // If no screen files found, infer from .tsx?/.dart filenames (not directories)
+    // Skip generic folder names: src, app, lib, components, utils, hooks, services
     if (screens.length === 0) {
-      const moduleNames = [...new Set(ast.files.map((f) => {
-        const parts = f.path.split('/');
-        return parts.length > 1 ? parts[0] : null;
-      }).filter(Boolean))].slice(0, 6) as string[];
-
-      for (const mod of moduleNames) {
+      const genericFolders = new Set(['src', 'app', 'lib', 'components', 'utils', 'hooks', 'services', 'stores', 'types', 'models', 'repositories', 'api', 'assets', 'config', 'core', 'shared']);
+      const uiFiles = ast.files.filter((f) =>
+        /\.(tsx?|jsx?|dart)$/.test(f.path) &&
+        !/test|spec|story|\.d\.ts$/.test(f.path)
+      );
+      for (const f of uiFiles.slice(0, 8)) {
         const toP3 = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
-      const name = toP3(mod.replace(/[-_]/g, ' ').split(' ').map(toP3).join(''));
-        if (name.length < 2) continue;
+        const baseName = f.path.split('/').pop() ?? f.path;
+        const rawName  = baseName.replace(/\.(dart|tsx?|jsx?|vue)$/, '');
+        const normalized = rawName.replace(/Screen$|Page$|View$/i, '').replace(/[-_]/g, ' ');
+        const parts = normalized.split(' ').filter(Boolean);
+        // Skip if looks like a utility/service file
+        if (/service|repository|store|type|hook|util|helper|validator|model|provider/i.test(rawName)) continue;
+        const name = parts.map(toP3).join('');
+        if (name.length < 2 || genericFolders.has(name.toLowerCase())) continue;
+        if (seenScreens.has(name.toLowerCase())) continue;
+        seenScreens.add(name.toLowerCase());
         screens.push({
           id:         `screen-${name.toLowerCase()}`,
           name:       `${name}Screen`,
-          path:       `${mod}/`,
+          path:       f.path,
           route:      `/${name.toLowerCase()}`,
-          components: [],
+          components: f.classes.slice(0, 5),
           guards:     [],
         });
       }

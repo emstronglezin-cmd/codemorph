@@ -321,7 +321,7 @@ export class ConversionPipeline {
     } else {
       plan = await codePlanner.plan(ctx, mappedIR);
       // Ne mettre en cache que si le plan est suffisamment bon (éviter de cacher un plan dégradé)
-      const quickScreenCount = plan.files.filter((f) => /\/(screens?|pages?)\//.test(f.path)).length;
+      const quickScreenCount = plan.files.filter((f) => /\/(screens?|pages?|views?)\//.test(f.path)).length;
       if (quickScreenCount > 0) {
         pipelineCache.planCache.set(planCacheKey, plan);
       }
@@ -329,11 +329,27 @@ export class ConversionPipeline {
     phaseEnd('planning');
 
     // ── LOG STRUCTURÉ: RESULT (après planning) ────────────
-    const genScreens    = plan.files.filter((f) => /\/(screens?|pages?|app)\/[^/]+\.(tsx?|jsx?)$/.test(f.path) && !/_layout|index|tabs/.test(f.path)).length;
-    const genComponents = plan.files.filter((f) => /\/components\/[^/]+\.(tsx?|jsx?)$/.test(f.path)).length;
-    const genStores     = plan.files.filter((f) => /\.store\.(ts|js)$/.test(f.path)).length;
-    const genServices   = plan.files.filter((f) => /\.service\.(ts|js)$/.test(f.path)).length;
-    const genModels     = plan.files.filter((f) => /\.types\.(ts|js)$/.test(f.path) || /\/types\//.test(f.path)).length;
+    const _isFlutterPlan = plan.files.some((f) => /\.dart$/.test(f.path));
+    const genScreens    = plan.files.filter((f) => _isFlutterPlan
+      ? /\/(screens?|pages?)\/[^/]+\.dart$/.test(f.path)
+      : /\/(screens?|pages?|app)\/[^/]+\.(tsx?|jsx?)$/.test(f.path) && !/_layout|index|tabs/.test(f.path)
+    ).length;
+    const genComponents = plan.files.filter((f) => _isFlutterPlan
+      ? /\/(widgets?)\/[^/]+\.dart$/.test(f.path)
+      : /\/components\/[^/]+\.(tsx?|jsx?)$/.test(f.path)
+    ).length;
+    const genStores     = plan.files.filter((f) => _isFlutterPlan
+      ? /\/(blocs?|providers?|cubits?)\/[^/]+\.dart$/.test(f.path)
+      : /\.store\.(ts|js)$/.test(f.path)
+    ).length;
+    const genServices   = plan.files.filter((f) => _isFlutterPlan
+      ? /\/services\/[^/]+\.dart$/.test(f.path)
+      : /\.service\.(ts|js)$/.test(f.path)
+    ).length;
+    const genModels     = plan.files.filter((f) => _isFlutterPlan
+      ? /\/models?\/[^/]+\.dart$/.test(f.path)
+      : /\.types\.(ts|js)$/.test(f.path) || /\/types\//.test(f.path)
+    ).length;
     const genRouter     = plan.files.filter((f) => /router|navigation|_layout/.test(f.path)).length;
     console.log(`\n================ RESULT (after Code Planning) ================`);
     console.log(`Generated Screens    : ${genScreens}`);
@@ -522,8 +538,16 @@ export class ConversionPipeline {
     const strictRatio = (gen: number, src: number): number =>
       src === 0 ? 100 : gen === 0 ? 0 : Math.min(100, Math.round((gen / Math.max(src, 1)) * 100));
 
+    // Flutter: screens/*.dart   RN/React: screens/*.tsx
+    const isFlutterTarget = files.some((f) => /\.dart$/.test(f.path));
+    const screenPattern = isFlutterTarget
+      ? /\/(screens?|pages?|views?)\/[^/]+\.dart$/
+      : /\/(screens?|pages?|app)\/[^/]+\.tsx?$/;
+    const screenExclude = isFlutterTarget
+      ? /loading|error|empty|splash_screen/
+      : /layout|index|\(tabs\)/;
     const generatedScreenCount = files.filter((f) =>
-      /\/(screens?|pages?|app)\/[^/]+\.tsx?$/.test(f.path) && !/layout|index|\(tabs\)/.test(f.path)
+      screenPattern.test(f.path) && !screenExclude.test(f.path)
     ).length;
 
     // ── Axe 1 : Business Logic ───────────────────────────────────────────────
@@ -566,7 +590,12 @@ export class ConversionPipeline {
 
     // ── Axe 3 : API Endpoints ────────────────────────────────────────────────
     const sourceEndpoints = sourceMetrics?.endpointsCount ?? (ir.backendGraph?.routes?.length ?? 0);
-    const generatedServices = files.filter((f) => /\.service\.(ts|js)$/.test(f.path)).length;
+    // Flutter: *_service.dart | *service*.dart   TS: *.service.ts
+    const generatedServices = files.filter((f) =>
+      isFlutterTarget
+        ? /_service\.dart$/.test(f.path) || /\/services\/[^/]+\.dart$/.test(f.path)
+        : /\.service\.(ts|js)$/.test(f.path)
+    ).length;
     // 1 service couvre ~3 endpoints en moyenne
     const apiScore = strictRatio(generatedServices, Math.max(1, Math.ceil(sourceEndpoints / 3)));
     details.push({
@@ -579,7 +608,13 @@ export class ConversionPipeline {
 
     // ── Axe 4 : Stores ──────────────────────────────────────────────────────
     const sourceStores = sourceMetrics?.storesCount ?? (ir.uiGraph?.stateFlow?.length ?? 0);
-    const generatedStores = files.filter((f) => /\.store\.(ts|js)$/.test(f.path)).length;
+    // Flutter: *_bloc.dart | *_provider.dart | *_notifier.dart   TS: *.store.ts
+    const generatedStores = files.filter((f) =>
+      isFlutterTarget
+        ? /_bloc\.dart$|_notifier\.dart$|_provider\.dart$/.test(f.path) ||
+          /\/(blocs?|providers?|cubits?)\/[^/]+\.dart$/.test(f.path)
+        : /\.store\.(ts|js)$/.test(f.path)
+    ).length;
     const storesScore = strictRatio(generatedStores, sourceStores);
     details.push({
       axis: 'stores',
@@ -593,8 +628,11 @@ export class ConversionPipeline {
 
     // ── Axe 5 : Components ──────────────────────────────────────────────────
     const sourceComponents = ir.uiGraph?.components?.length ?? 0;
+    // Flutter: widgets/*.dart   TS: components/*.tsx
     const generatedComponents = files.filter((f) =>
-      /\/components\/[^/]+\.tsx?$/.test(f.path)
+      isFlutterTarget
+        ? /\/(widgets?|components?)\/[^/]+\.dart$/.test(f.path)
+        : /\/components\/[^/]+\.tsx?$/.test(f.path)
     ).length;
     const compScore = safeRatio(generatedComponents, sourceComponents);
     details.push({
@@ -607,8 +645,11 @@ export class ConversionPipeline {
 
     // ── Axe 6 : Models ──────────────────────────────────────────────────────
     const sourceModels = sourceMetrics?.modelsCount ?? (ir.dataLayer?.models?.length ?? 0);
+    // Flutter: models/*.dart   TS: *.types.ts | types/*.ts
     const generatedTypes = files.filter((f) =>
-      /\.types\.(ts|js)$/.test(f.path) || /\/types\//.test(f.path) || /\.entity\.(ts|js)$/.test(f.path)
+      isFlutterTarget
+        ? /\/models?\/[^/]+\.dart$/.test(f.path) || /\.model\.dart$/.test(f.path)
+        : /\.types\.(ts|js)$/.test(f.path) || /\/types\//.test(f.path) || /\.entity\.(ts|js)$/.test(f.path)
     ).length;
     const modelsScore = safeRatio(generatedTypes, sourceModels);
     details.push({
