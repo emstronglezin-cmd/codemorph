@@ -115,6 +115,25 @@ convertRouter.post('/', async (req: Request, res: Response, next: NextFunction):
           console.log(`[PIPELINE]   [${i+1}] ${f.path}`);
         });
         if (filesCount > 5) console.log(`[PIPELINE]   ... and ${filesCount - 5} more files`);
+
+        // ── Phase 9: Afficher le CONVERSION REPORT dans les logs (si disponible)
+        if (result.conversionReport?.text) {
+          console.log(result.conversionReport.text);
+        }
+
+        // ── Phase 5: Afficher le statut compilation
+        if (result.compilationResult) {
+          const cr = result.compilationResult;
+          console.log(`[PIPELINE] ━━━ Compilation ━━━`);
+          console.log(`[PIPELINE] Status: ${cr.success ? '✅ PASS' : '❌ FAIL'} | Errors: ${cr.errorsCount} | Warnings: ${cr.warningsCount} | Fixed: ${cr.filesFixed} | Duration: ${cr.duration}ms`);
+        }
+
+        // ── Phase 8: Afficher le statut ZIP
+        if (result.zipResult) {
+          const zr = result.zipResult;
+          console.log(`[PIPELINE] ━━━ ZIP ━━━`);
+          console.log(`[PIPELINE] Status: ${zr.success ? '✅ OK' : '❌ FAIL'} | Files: ${zr.fileCount} | Size: ${(zr.totalBytes / 1024).toFixed(1)} KB | Path: ${zr.zipPath}`);
+        }
         if (callbackUrl) {
           const { default: axios } = await import('axios');
           // FIX: format de callback attendu par le backend handleCallback()
@@ -149,6 +168,10 @@ convertRouter.post('/', async (req: Request, res: Response, next: NextFunction):
               // FIX PHASE 20 — Transmettre le provider IA au backend pour affichage frontend
               aiTier:  result.aiTier,
               aiModel: result.aiModel,
+              // PHASE FINALE — Nouveaux champs
+              compilationResult:  result.compilationResult,
+              zipResult:          result.zipResult,
+              conversionReport:   result.conversionReport?.text,
             },
             irDocument:     result.ir,
           }, { timeout: 15_000, headers: callbackHeaders }).catch((cbErr: Error) => {
@@ -211,6 +234,12 @@ convertRouter.post('/sync', async (req: Request, res: Response, next: NextFuncti
 
     const aiOpts = extractAIKeys(req);
     const result = await pipeline.run(ctx, aiOpts);
+
+    // Phase 9: Afficher le CONVERSION REPORT dans les logs
+    if (result.conversionReport?.text) {
+      console.log(result.conversionReport.text);
+    }
+
     res.json({ success: true, data: result });
   } catch (err) {
     next(err);

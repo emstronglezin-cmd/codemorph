@@ -309,6 +309,30 @@ export interface ConversionResult {
   // ── PHASE 23: Score de fidélité multi-axes + rapport auto-correction ─────
   fidelityScore?:        IRFidelityScore;
   autoCorrectionReport?: IRAutoCorrectReport;
+  // ── PHASE FINALE: Compilation, ZIP, Rapport ──────────────────────────────
+  compilationResult?: {
+    success:          boolean;
+    errorsCount:      number;
+    warningsCount:    number;
+    filesFixed:       number;
+    dartAvailable:    boolean;
+    flutterAvailable: boolean;
+    duration:         number;
+  };
+  zipResult?: {
+    success:    boolean;
+    zipPath:    string;
+    fileCount:  number;
+    totalBytes: number;
+    duration:   number;
+    error?:     string | undefined;
+  };
+  conversionReport?: {
+    text:     string;
+    json:     string;
+    markdown: string;
+    html:     string;
+  };
 }
 
 export interface GeneratedFile {

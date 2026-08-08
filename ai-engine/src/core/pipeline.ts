@@ -34,6 +34,14 @@ import type { GeneratedFile, IRDocument } from '../models/ir.types';
 // PHASE 28: Nouveaux modules de qualité
 import { runFidelityComparison }    from './fidelity-comparator';
 import { verifyAndFixImports }      from './import-verifier';
+// PHASE FINALE: Nouveaux modules (5, 4, 8, 9)
+import { compileDartFiles }         from './dart-compiler';
+import { packageToZip }             from './zip-packager';
+import { buildConversionReport, formatConversionReport } from './conversion-report';
+import { extractDesignSystem, generateThemeFiles }       from './ui-fidelity-extractor';
+import type { CompilationResult }   from './dart-compiler';
+import type { ZipPackageResult }    from './zip-packager';
+import type { ConversionReport }    from './conversion-report';
 
 const logger = pino({ level: process.env['LOG_LEVEL'] ?? 'info' });
 
@@ -497,16 +505,111 @@ export class ConversionPipeline {
       },
     }, '✨ Pipeline completed (Phase 28)');
 
+    // ── PHASE 4 FINALE: UI Fidelity Extractor ───────────────────────────────
+    // Extraire les tokens de design depuis les fichiers source
+    // et les injecter dans les fichiers générés si thème manquant
+    logger.info({ jobId: ctx.jobId }, '🎨 Phase Finale 4: UI Fidelity Extraction');
+    let enhancedFiles = finalFiles;
+    try {
+      // Parser les fichiers source pour extraire les tokens
+      const sourceFileBlocks: { path: string; content: string }[] = [];
+      const filePattern = /\/\/\s*(?:=+\s*)?FILE:\s*(.+?)(?:\s*=+)?\n([\s\S]*?)(?=\/\/\s*(?:=+\s*)?FILE:|$)/g;
+      let fmatch: RegExpExecArray | null;
+      while ((fmatch = filePattern.exec(ctx.sourceCode)) !== null) {
+        const p = (fmatch[1] ?? '').trim();
+        const c = (fmatch[2] ?? '').trim();
+        if (p && c) sourceFileBlocks.push({ path: p, content: c });
+      }
+
+      if (sourceFileBlocks.length > 0) {
+        const designSystem = extractDesignSystem(sourceFileBlocks);
+        const themeFilesGenerated = generateThemeFiles(designSystem, ctx.targetFramework ?? '');
+
+        // Ajouter les fichiers de thème seulement s'ils ne sont pas déjà présents
+        for (const tf of themeFilesGenerated) {
+          const alreadyPresent = finalFiles.some((f) => f.path === tf.path);
+          if (!alreadyPresent && tf.content) {
+            enhancedFiles = [...enhancedFiles, tf];
+            console.log(`[PIPELINE] Phase 4 UI: Added theme file → ${tf.path}`);
+          }
+        }
+        if (themeFilesGenerated.length > 0) {
+          console.log(`[PIPELINE] Phase 4 UI: Design system extracted — ${designSystem.colors.length} colors, ${designSystem.typography.length} fonts, ${themeFilesGenerated.length} theme files`);
+        }
+      }
+    } catch (uiErr) {
+      console.warn(`[PIPELINE] Phase 4 UI: Extraction skipped — ${(uiErr as Error).message}`);
+    }
+
+    // ── PHASE 5 FINALE: Compilation Dart/Flutter ─────────────────────────────
+    logger.info({ jobId: ctx.jobId }, '🔨 Phase Finale 5: Dart/Flutter Compilation');
+    let compilationResult: CompilationResult | undefined;
+    const isFlutterTarget = enhancedFiles.some((f) => /\.dart$/.test(f.path));
+    if (isFlutterTarget) {
+      try {
+        compilationResult = await compileDartFiles(enhancedFiles, ctx.projectId ?? 'project');
+        enhancedFiles = compilationResult.fixedFiles.length > 0 ? compilationResult.fixedFiles : enhancedFiles;
+        console.log(`[PIPELINE] Phase 5 Dart: success=${compilationResult.success} errors=${compilationResult.errors.length} warnings=${compilationResult.warnings.length} fixed=${compilationResult.filesFixed} dartAvail=${compilationResult.dartAvailable}`);
+      } catch (compErr) {
+        console.warn(`[PIPELINE] Phase 5 Dart: Compilation skipped — ${(compErr as Error).message}`);
+      }
+    }
+
+    // ── PHASE 8 FINALE: ZIP Packaging ───────────────────────────────────────
+    logger.info({ jobId: ctx.jobId }, '📦 Phase Finale 8: ZIP Packaging');
+    let zipResult: ZipPackageResult | undefined;
+    try {
+      zipResult = await packageToZip(
+        enhancedFiles,
+        ctx.projectId ?? 'output',
+        `/tmp/codemorph-${ctx.jobId}`,
+      );
+      console.log(`[PIPELINE] Phase 8 ZIP: success=${zipResult.success} files=${zipResult.fileCount} bytes=${zipResult.totalBytes} path=${zipResult.zipPath}`);
+    } catch (zipErr) {
+      console.warn(`[PIPELINE] Phase 8 ZIP: Packaging skipped — ${(zipErr as Error).message}`);
+    }
+
+    // ── PHASE 9 FINALE: Conversion Report ────────────────────────────────────
+    logger.info({ jobId: ctx.jobId }, '📊 Phase Finale 9: Conversion Report');
+    let conversionReportData: { text: string; json: string; markdown: string; html: string } | undefined;
+    try {
+      const report: ConversionReport = buildConversionReport({
+        fidelityScore:        finalFidelityScore,
+        autoCorrectionReport,
+        files:                enhancedFiles,
+        ...(compilationResult !== undefined ? { compilationResult } : {}),
+        projectName:          ctx.projectId ?? 'project',
+        conversionType:       `${ctx.sourceFramework ?? 'unknown'} → ${ctx.targetFramework ?? 'unknown'}`,
+        duration:             durationMs,
+        aiTier:               tier,
+      });
+
+      const { formatConversionReportJSON, formatConversionReportMarkdown, formatConversionReportHTML } = await import('./conversion-report');
+      const reportText = formatConversionReport(report);
+
+      // Afficher le rapport dans la console (Phase 9)
+      console.log(reportText);
+
+      conversionReportData = {
+        text:     reportText,
+        json:     formatConversionReportJSON(report),
+        markdown: formatConversionReportMarkdown(report),
+        html:     formatConversionReportHTML(report),
+      };
+    } catch (rptErr) {
+      console.warn(`[PIPELINE] Phase 9 Report: Generation skipped — ${(rptErr as Error).message}`);
+    }
+
     return {
       jobId:      ctx.jobId,
       ir:         validatedIR,
-      files:      finalFiles,
+      files:      enhancedFiles,
       summary:    {
         ...correctedPlan.summary,
-        totalFiles:      finalFiles.length,
-        successfulFiles: finalFiles.filter((f) => !f.warnings?.length).length,
-        totalLines:      finalFiles.reduce((a, f) => a + f.content.split('\n').length, 0),
-        convertedLines:  finalFiles.reduce((a, f) => a + f.content.split('\n').length, 0),
+        totalFiles:      enhancedFiles.length,
+        successfulFiles: enhancedFiles.filter((f) => !f.warnings?.length).length,
+        totalLines:      enhancedFiles.reduce((a, f) => a + f.content.split('\n').length, 0),
+        convertedLines:  enhancedFiles.reduce((a, f) => a + f.content.split('\n').length, 0),
       },
       tokensUsed,
       durationMs,
@@ -516,6 +619,29 @@ export class ConversionPipeline {
       // ── PHASE 23/28: Score fidélité composite + rapport auto-correction ─────
       fidelityScore:        finalFidelityScore,
       autoCorrectionReport,
+      // ── PHASE FINALE: Compilation, ZIP, Rapport ─────────────────────────────
+      ...(compilationResult ? {
+        compilationResult: {
+          success:          compilationResult.success,
+          errorsCount:      compilationResult.errors.length,
+          warningsCount:    compilationResult.warnings.length,
+          filesFixed:       compilationResult.filesFixed,
+          dartAvailable:    compilationResult.dartAvailable,
+          flutterAvailable: compilationResult.flutterAvailable,
+          duration:         compilationResult.duration,
+        },
+      } : {}),
+      ...(zipResult ? {
+        zipResult: {
+          success:    zipResult.success,
+          zipPath:    zipResult.zipPath,
+          fileCount:  zipResult.fileCount,
+          totalBytes: zipResult.totalBytes,
+          duration:   zipResult.duration,
+          ...(zipResult.error !== undefined ? { error: zipResult.error } : {}),
+        },
+      } : {}),
+      ...(conversionReportData ? { conversionReport: conversionReportData } : {}),
     };
   }
 
