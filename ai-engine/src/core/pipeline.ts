@@ -39,9 +39,11 @@ import { compileDartFiles }         from './dart-compiler';
 import { packageToZip }             from './zip-packager';
 import { buildConversionReport, formatConversionReport } from './conversion-report';
 import { extractDesignSystem, generateThemeFiles }       from './ui-fidelity-extractor';
+import { detectSourceLayers, summarizeLayerPresence }    from './layer-detector';
 import type { CompilationResult }   from './dart-compiler';
 import type { ZipPackageResult }    from './zip-packager';
 import type { ConversionReport }    from './conversion-report';
+import type { LayerDetectionResult } from './layer-detector';
 
 const logger = pino({ level: process.env['LOG_LEVEL'] ?? 'info' });
 
@@ -81,6 +83,66 @@ export class ConversionPipeline {
   //   4. Logger le nombre de fichiers gardés vs total
   //
   // IMPORTANT: Cette limite est contournée pour les tiers payants (platform/pro).
+  // ── FIX "sourceCode tronqué" — Résumé structurel statique ─────────────
+  // Analyse le sourceCode complet (non tronqué) pour extraire les compteurs
+  // importants. Ce résumé est préservé même après la troncature et sera
+  // injecté dans le contexte de l'IR generator pour éviter les "0 screens".
+  private buildStructuralSummary(sourceCode: string): string {
+    const lines = sourceCode.split('\n');
+    const allPaths: string[] = [];
+
+    // Extraire les chemins depuis les marqueurs "// === FILE: path ==="
+    const fileMarker = /\/\/\s*=+\s*FILE:\s*(.+?)\s*=+/;
+    for (const line of lines) {
+      const m = line.match(fileMarker);
+      if (m?.[1]) allPaths.push(m[1].trim());
+    }
+
+    // Compteurs par type
+    const count = (patterns: RegExp[]): number =>
+      allPaths.filter((p) => patterns.some((pat) => pat.test(p))).length;
+
+    const screens    = count([/screen|page|view/i]);
+    const widgets    = count([/widget|component/i]);
+    const services   = count([/service/i]);
+    const repos      = count([/repo/i]);
+    const stores     = count([/store|bloc|cubit|provider|notifier|slice|atom/i]);
+    const models     = count([/model|entity|dto|schema/i]);
+    const api        = count([/api|network|http|remote|client/i]);
+    const assets     = count([/assets?|images?|fonts?|icons?/i]);
+    const navigation = count([/navigation|router|routing|routes?|stack/i]);
+    const migrations = count([/migration|seed/i]);
+
+    // Détecter framework à partir des extensions
+    const hasDart  = allPaths.some((p) => p.endsWith('.dart'));
+    const hasTsx   = allPaths.some((p) => p.endsWith('.tsx') || p.endsWith('.jsx'));
+    const hasVue   = allPaths.some((p) => p.endsWith('.vue'));
+    const framework = hasDart ? 'flutter' : hasVue ? 'vue' : hasTsx ? 'react/rn' : 'unknown';
+
+    // Patterns de contenu (limités aux 50 000 premiers chars pour rapidité)
+    const codeSlice    = sourceCode.slice(0, 50_000);
+    const httpCalls    = (codeSlice.match(/fetch\s*\(|axios\.|http\.(get|post)|dio\.(get|post)/g) ?? []).length;
+    const stateSignals = [
+      /StateNotifierProvider/.test(codeSlice) ? 'Riverpod' : '',
+      /extends Bloc</.test(codeSlice) ? 'Bloc' : '',
+      /extends Cubit</.test(codeSlice) ? 'Cubit' : '',
+      /ChangeNotifierProvider/.test(codeSlice) ? 'Provider' : '',
+      /zustand/.test(codeSlice) ? 'Zustand' : '',
+      /createStore\(/.test(codeSlice) ? 'Redux' : '',
+    ].filter(Boolean);
+
+    const summary = [
+      `STRUCTURAL_SUMMARY (pre-truncation):`,
+      `  framework=${framework}  totalFiles=${allPaths.length}`,
+      `  screens=${screens}  components=${widgets}  services=${services}`,
+      `  repos=${repos}  stores=${stores}  models=${models}`,
+      `  api=${api}  assets=${assets}  navigation=${navigation}  migrations=${migrations}`,
+      `  httpCalls=${httpCalls}  stateManagement=[${stateSignals.join(', ')}]`,
+    ].join('\n');
+
+    return summary;
+  }
+
   private enforceLimits(ctx: ConversionContext, tier: AITier): void {
     if (tier === 'static') {
       const limits = AIProvider.getLimits(tier);
@@ -173,6 +235,12 @@ export class ConversionPipeline {
       delete phaseTimings[`${phase}_start`];
       logger.info({ jobId: ctx.jobId, phase, elapsedMs: elapsed }, `⏱️  Phase timing: ${phase}=${elapsed}ms`);
     };
+
+    // ── FIX "sourceCode tronqué" — étape 1 : résumé structurel avant truncation ──
+    // Construire le résumé structurel AVANT d'appliquer les limites, pour préserver
+    // les compteurs screens/services/stores même si le code est tronqué.
+    ctx.structuralSummary = this.buildStructuralSummary(ctx.sourceCode);
+    console.log(`[PIPELINE] Structural summary built BEFORE truncation: ${ctx.structuralSummary.slice(0, 200)}`);
 
     // Enforce per-tier input limits
     this.enforceLimits(ctx, tier);
@@ -388,18 +456,28 @@ export class ConversionPipeline {
     const validatedIR = await this.irValidator.validate(mappedIR);
     phaseEnd('validation');
 
-    // ── PHASE 7: Fidelity Score multi-axes ─────────────────────────────────
-    logger.info({ jobId: ctx.jobId, tier }, '📐 Phase 7: Fidelity Score Calculation');
-    const fidelityScore = this.calculateFidelityScore(validatedIR, plan.files);
+    // ── PHASE 6.5: Layer Detection (SOURCE_PRESENT par couche) ──────────────
+    // Doit être exécuté avant le calcul du score pour passer layerDetection
+    logger.info({ jobId: ctx.jobId }, '🔍 Phase 6.5: Source Layer Detection');
+    const layerDetection = detectSourceLayers(ctx.sourceCode, astResult, archResult);
+    console.log(`\n================ LAYER DETECTION ================`);
+    console.log(summarizeLayerPresence(layerDetection));
+    console.log(`=================================================\n`);
+
+    // ── PHASE 7: Fidelity Score multi-axes (N/A-aware) ─────────────────────
+    logger.info({ jobId: ctx.jobId, tier }, '📐 Phase 7: Fidelity Score Calculation (N/A-aware)');
+    const fidelityScore = this.calculateFidelityScore(validatedIR, plan.files, layerDetection);
     logger.info({
       jobId: ctx.jobId,
-      overall: fidelityScore.overall,
-      businessLogic: fidelityScore.businessLogic,
-      navigation: fidelityScore.navigation,
-      api: fidelityScore.api,
-      stores: fidelityScore.stores,
-      uiFidelity: fidelityScore.uiFidelity,
-    }, `📊 Phase 7: Fidelity Score — Overall: ${fidelityScore.overall}%`);
+      overall:        fidelityScore.overall,
+      businessLogic:  fidelityScore.businessLogic,
+      navigation:     fidelityScore.navigation,
+      api:            fidelityScore.api,
+      stores:         fidelityScore.stores,
+      uiFidelity:     fidelityScore.uiFidelity,
+      applicableAxes: fidelityScore.applicableAxes,
+      naAxes:         fidelityScore.naAxes,
+    }, `📊 Phase 7: Fidelity Score — Overall: ${fidelityScore.overall}% (${fidelityScore.applicableAxes.length} axes applicables, ${fidelityScore.naAxes.length} N/A)`);
 
     // ── PHASE 8: Auto-correction boucle (max 3 itérations) ─────────────────
     logger.info({ jobId: ctx.jobId, tier }, '🔄 Phase 8: Auto-correction Loop');
@@ -444,10 +522,16 @@ export class ConversionPipeline {
       ...autoCorrectionReport.finalScore > fidelityScore.overall
         ? { ...fidelityScore, overall: autoCorrectionReport.finalScore }
         : fidelityScore,
-      // Intégrer les données du comparateur dans les axes existants
-      businessLogic: Math.round((fidelityScore.businessLogic + fidelityComparison.scores.services) / 2),
-      models:        Math.round((fidelityScore.models + fidelityComparison.scores.models) / 2),
-      api:           Math.round((fidelityScore.api + fidelityComparison.scores.repositories) / 2),
+      // Intégrer les données du comparateur dans les axes existants (N/A-safe)
+      businessLogic: fidelityScore.businessLogic !== null
+        ? Math.round(((fidelityScore.businessLogic ?? 0) + fidelityComparison.scores.services) / 2)
+        : null,
+      models: fidelityScore.models !== null
+        ? Math.round(((fidelityScore.models ?? 0) + fidelityComparison.scores.models) / 2)
+        : null,
+      api: fidelityScore.api !== null
+        ? Math.round(((fidelityScore.api ?? 0) + fidelityComparison.scores.repositories) / 2)
+        : null,
       overall:       Math.round((
         (autoCorrectionReport.finalScore > fidelityScore.overall ? autoCorrectionReport.finalScore : fidelityScore.overall) * 0.6
         + comparatorBonus * 0.4
@@ -645,26 +729,61 @@ export class ConversionPipeline {
     };
   }
 
-  // ── PHASE 27: Calcul du score de fidélité multi-axes — 10 axes ─────────
-  // businessLogic, navigation, api, stores, components, models, uiFidelity,
-  // dataLayer, assets, functional → overall (moyenne pondérée)
-  // BUG-P27-01 FIX: 7 axes → 10 axes
-  // BUG-P27-06 FIX: IR=0 screens ne donne plus 100% (score 0 si source>0)
+  // ── PHASE 27 (v2): Calcul du score de fidélité N/A-aware ─────────────────
+  //
+  // REFACTORING SESSION 2 — Corrections fondamentales :
+  //   BUG-01 FIXED: safeRatio/strictRatio src=0 → 100 supprimé
+  //   BUG-02 FIXED: Navigation absence → N/A (plus 80/50 fabricé)
+  //   BUG-03 FIXED: API Math.max(1,...) supprimé → 0 endpoint = N/A réel
+  //   BUG-04 FIXED: dataLayer src=0 → 100 supprimé → N/A
+  //   BUG-05 FIXED: assets src=0 → N/A
+  //   BUG-06 FIXED: Overall calculé UNIQUEMENT sur axes applicables
+  //   BUG-07 FIXED: businessLogic IR=0 → N/A (pas 0%) si pas de signal source
+  //
+  // Nouvelles règles :
+  //   1. detectSourceLayers() détermine SOURCE_PRESENT par couche
+  //   2. Si SOURCE_PRESENT = false → score = null, status = 'na'
+  //   3. Overall = somme_pondérée(applicables) / poids_applicables
+  //   4. Pipeline trace : SOURCE→AST→IR→PLANNED→GENERATED→VALIDATED
   private calculateFidelityScore(
     ir: Awaited<ReturnType<IRValidator['validate']>>,
     files: GeneratedFile[],
+    layerDetection?: LayerDetectionResult,
   ): IRFidelityScore {
     const sourceMetrics: IRSourceMetrics | undefined = ir.validation?.sourceMetrics;
     const details: IRFidelityDetail[] = [];
 
-    // ── Helpers ──────────────────────────────────────────────────────────────
-    const safeRatio = (gen: number, src: number): number =>
-      src === 0 ? 100 : Math.min(100, Math.round((gen / Math.max(src, 1)) * 100));
-    // BUG-P27-06 FIX: si source > 0 ET generated = 0 → score = 0 (pas 100)
-    const strictRatio = (gen: number, src: number): number =>
-      src === 0 ? 100 : gen === 0 ? 0 : Math.min(100, Math.round((gen / Math.max(src, 1)) * 100));
+    // ── Détection de la présence des couches ──────────────────────────────
+    // Si layerDetection est fourni (depuis run()), on l'utilise directement.
+    // Sinon, on fait une détection basique à partir de l'IR.
+    const presence = layerDetection?.presence ?? {
+      businessLogic: (ir.uiGraph?.screens?.length ?? 0) > 0,
+      navigation:    (ir.uiGraph?.navigationFlow?.length ?? 0) > 0 || (ir.uiGraph?.screens?.length ?? 0) >= 2,
+      api:           (ir.backendGraph?.routes?.length ?? 0) > 0,
+      repositories:  false,
+      services:      (ir.backendGraph?.routes?.length ?? 0) > 0,
+      stores:        (ir.uiGraph?.stateFlow?.length ?? 0) > 0,
+      components:    (ir.uiGraph?.components?.length ?? 0) > 0,
+      models:        (ir.dataLayer?.models?.length ?? 0) > 0,
+      uiFidelity:    (ir.uiGraph?.screens?.length ?? 0) > 0,
+      dataLayer:     (ir.dataLayer?.models?.length ?? 0) > 0 || (ir.dataLayer?.migrations?.length ?? 0) > 0,
+      assets:        ((sourceMetrics?.assetsCount ?? 0) + (ir.assets?.images?.length ?? 0)) > 0,
+      functional:    true,
+    };
+    const lCounts = layerDetection?.counts;
 
-    // Flutter: screens/*.dart   RN/React: screens/*.tsx
+    // ── Helpers N/A-aware ────────────────────────────────────────────────────
+    // RÈGLE : si la couche est absente (sourcePresent=false) → retourne null (N/A)
+    // Sinon calcule un ratio réel.
+    const nawareRatio = (gen: number, src: number, sourcePresent: boolean): number | null => {
+      if (!sourcePresent) return null;  // N/A
+      if (src === 0) return null;       // N/A (pas de source mesurable)
+      if (gen === 0) return 0;          // 0% : couche présente mais rien généré
+      return Math.min(100, Math.round((gen / src) * 100));
+    };
+    // (helper nawareQualScore supprimé — inline dans chaque axe à la place)
+
+    // Flutter target detection
     const isFlutterTarget = files.some((f) => /\.dart$/.test(f.path));
     const screenPattern = isFlutterTarget
       ? /\/(screens?|pages?|views?)\/[^/]+\.dart$/
@@ -677,244 +796,565 @@ export class ConversionPipeline {
     ).length;
 
     // ── Axe 1 : Business Logic ───────────────────────────────────────────────
-    const sourceScreens = sourceMetrics?.screensCount ?? (ir.uiGraph?.screens?.length ?? 0);
+    // SOURCE_PRESENT : use cases / domain / significant logic exists in source
+    // Si IR a 0 screens ET source has no business logic signal → N/A
+    const sourceScreens    = sourceMetrics?.screensCount ?? (ir.uiGraph?.screens?.length ?? 0);
     const screensWithLogic = (ir.uiGraph?.screens ?? []).filter((s) =>
       (s as unknown as Record<string, unknown>)['businessLogic'] ||
       (s as unknown as Record<string, unknown>)['apiCalls']
     ).length;
-    // BUG-P27-06 FIX: strictRatio → 0 si IR screens = 0 et source > 0
-    const bizLogicScore = strictRatio(generatedScreenCount, sourceScreens);
-    const bizLosses = sourceScreens > generatedScreenCount
+    const bizSourcePresent = presence.businessLogic;
+    const bizScore: number | null = bizSourcePresent
+      ? (sourceScreens === 0
+          ? 0   // IR n'a pas extrait les screens → pénalité réelle (pas N/A car source présente)
+          : Math.min(100, Math.round((generatedScreenCount / Math.max(sourceScreens, 1)) * 100)))
+      : null;
+    const bizLosses = bizSourcePresent && sourceScreens > generatedScreenCount
       ? (ir.uiGraph?.screens ?? []).slice(generatedScreenCount).map((s) => s.name)
       : [];
-    const bizNote = sourceScreens === 0
-      ? 'WARNING: 0 screens in IR — check if Groq token budget was too small'
+    const bizNote = bizSourcePresent && sourceScreens === 0
+      ? 'WARNING: 0 screens in IR — sourceCode may be truncated or token budget exceeded'
       : undefined;
     const bizDetail: IRFidelityDetail = {
-      axis: 'businessLogic',
-      score: bizLogicScore,
-      sourceCount: Math.max(sourceScreens, screensWithLogic),
+      axis:          'businessLogic',
+      score:         bizScore,
+      sourcePresent: bizSourcePresent,
+      applicable:    bizSourcePresent,
+      status:        !bizSourcePresent ? 'na'
+                   : bizScore === null ? 'na'
+                   : bizScore === 0   ? 'missing'
+                   : bizScore < 70    ? 'partial'
+                   : 'applicable',
+      sourceCount:    Math.max(sourceScreens, screensWithLogic),
       generatedCount: generatedScreenCount,
-      losses: bizLosses,
+      losses:         bizLosses,
+      pipelineTrace: {
+        sourceCount:    Math.max(sourceScreens, screensWithLogic),
+        astCount:       lCounts?.screenFiles ?? sourceScreens,
+        irCount:        sourceScreens,
+        plannedCount:   sourceScreens,
+        generatedCount: generatedScreenCount,
+        validatedCount: generatedScreenCount,
+      },
     };
     if (bizNote) bizDetail.notes = bizNote;
     details.push(bizDetail);
 
     // ── Axe 2 : Navigation ──────────────────────────────────────────────────
-    const sourceNavFlows = ir.uiGraph?.navigationFlow?.length ?? 0;
-    const generatedRouter = files.filter((f) => /router|navigation|_layout/.test(f.path)).length;
-    const navScore = sourceNavFlows === 0
-      ? (generatedRouter > 0 ? 80 : 50)  // router sans nav flows = partiel
-      : Math.min(100, generatedRouter > 0 ? 80 + Math.min(20, Math.round((sourceNavFlows / 5) * 20)) : 0);
+    const sourceNavFlows   = ir.uiGraph?.navigationFlow?.length ?? 0;
+    const generatedRouter  = files.filter((f) => /router|navigation|_layout|routes/.test(f.path)).length;
+    const navSourcePresent = presence.navigation;
+    let navScore: number | null = null;
+    if (navSourcePresent) {
+      if (sourceNavFlows === 0) {
+        // Navigation présente mais IR n'a pas de flows → score basé sur le fichier router généré
+        navScore = generatedRouter > 0 ? 70 : 30;
+      } else {
+        navScore = generatedRouter > 0
+          ? Math.min(100, 75 + Math.min(25, Math.round((Math.min(sourceNavFlows, 10) / 10) * 25)))
+          : 0;
+      }
+    }
     details.push({
-      axis: 'navigation',
-      score: navScore,
-      sourceCount: sourceNavFlows,
+      axis:          'navigation',
+      score:         navScore,
+      sourcePresent: navSourcePresent,
+      applicable:    navSourcePresent,
+      status:        !navSourcePresent ? 'na'
+                   : navScore === null ? 'na'
+                   : navScore === 0   ? 'missing'
+                   : navScore < 70    ? 'partial'
+                   : 'applicable',
+      sourceCount:    sourceNavFlows,
       generatedCount: generatedRouter,
-      losses: generatedRouter === 0 ? ['Navigation router file missing'] : [],
+      losses:         navSourcePresent && generatedRouter === 0 ? ['Navigation router file missing'] : [],
+      pipelineTrace: {
+        sourceCount:    lCounts?.navigationFiles ?? sourceNavFlows,
+        astCount:       lCounts?.navigationFiles ?? sourceNavFlows,
+        irCount:        sourceNavFlows,
+        plannedCount:   navSourcePresent ? 1 : 0,
+        generatedCount: generatedRouter,
+        validatedCount: generatedRouter,
+      },
     });
 
     // ── Axe 3 : API Endpoints ────────────────────────────────────────────────
-    const sourceEndpoints = sourceMetrics?.endpointsCount ?? (ir.backendGraph?.routes?.length ?? 0);
-    // Flutter: *_service.dart | *service*.dart   TS: *.service.ts
-    const generatedServices = files.filter((f) =>
+    // FIX CRITIQUE : Math.max(1,...) supprimé → 0 endpoints = N/A
+    const sourceEndpoints  = sourceMetrics?.endpointsCount ?? (ir.backendGraph?.routes?.length ?? 0);
+    const apiSourcePresent = presence.api;
+    const generatedApiServices = files.filter((f) =>
       isFlutterTarget
         ? /_service\.dart$/.test(f.path) || /\/services\/[^/]+\.dart$/.test(f.path)
-        : /\.service\.(ts|js)$/.test(f.path)
+        : /\.service\.(ts|js)$/.test(f.path) || /\/api\/[^/]+\.(ts|js)$/.test(f.path)
     ).length;
-    // 1 service couvre ~3 endpoints en moyenne
-    const apiScore = strictRatio(generatedServices, Math.max(1, Math.ceil(sourceEndpoints / 3)));
+    const apiScore: number | null = nawareRatio(
+      generatedApiServices,
+      sourceEndpoints > 0 ? Math.ceil(sourceEndpoints / 3) : 0,
+      apiSourcePresent,
+    );
     details.push({
-      axis: 'api',
-      score: apiScore,
-      sourceCount: sourceEndpoints,
-      generatedCount: generatedServices,
-      losses: generatedServices === 0 && sourceEndpoints > 0 ? ['Service layer entirely missing'] : [],
+      axis:          'api',
+      score:         apiScore,
+      sourcePresent: apiSourcePresent,
+      applicable:    apiSourcePresent,
+      status:        !apiSourcePresent ? 'na'
+                   : apiScore === null  ? 'na'
+                   : apiScore === 0     ? 'missing'
+                   : apiScore < 70      ? 'partial'
+                   : 'applicable',
+      sourceCount:    sourceEndpoints,
+      generatedCount: generatedApiServices,
+      losses:         apiSourcePresent && generatedApiServices === 0 && sourceEndpoints > 0
+                        ? ['Service layer entirely missing'] : [],
+      pipelineTrace: {
+        sourceCount:    lCounts?.httpCallSites ?? sourceEndpoints,
+        astCount:       lCounts?.apiFiles ?? sourceEndpoints,
+        irCount:        sourceEndpoints,
+        plannedCount:   apiSourcePresent ? Math.ceil(sourceEndpoints / 3) : 0,
+        generatedCount: generatedApiServices,
+        validatedCount: generatedApiServices,
+      },
     });
 
-    // ── Axe 4 : Stores ──────────────────────────────────────────────────────
-    const sourceStores = sourceMetrics?.storesCount ?? (ir.uiGraph?.stateFlow?.length ?? 0);
-    // Flutter: *_bloc.dart | *_provider.dart | *_notifier.dart   TS: *.store.ts
-    const generatedStores = files.filter((f) =>
+    // ── Axe 4 : Repositories ─────────────────────────────────────────────────
+    // NOUVEL AXE explicite (était implicite dans businessLogic avant)
+    const sourceRepos   = lCounts?.repositoryFiles ?? 0;
+    const repoPresent   = presence.repositories;
+    const generatedRepos = files.filter((f) =>
+      isFlutterTarget
+        ? /\/(repo(?:sitori(?:es|y))?|datasource)\/[^/]+\.dart$/.test(f.path)
+        : /\/(repo(?:sitori(?:es|y))?|dao)\/[^/]+\.(ts|js)$/.test(f.path)
+    ).length;
+    const repoScore: number | null = nawareRatio(generatedRepos, sourceRepos, repoPresent);
+    details.push({
+      axis:          'repositories',
+      score:         repoScore,
+      sourcePresent: repoPresent,
+      applicable:    repoPresent,
+      status:        !repoPresent   ? 'na'
+                   : repoScore === null ? 'na'
+                   : repoScore === 0   ? 'missing'
+                   : repoScore < 70    ? 'partial'
+                   : 'applicable',
+      sourceCount:    sourceRepos,
+      generatedCount: generatedRepos,
+      losses:         repoPresent && generatedRepos === 0 && sourceRepos > 0
+                        ? ['Repository layer not generated'] : [],
+      pipelineTrace: {
+        sourceCount:    sourceRepos,
+        astCount:       sourceRepos,
+        irCount:        sourceRepos,
+        plannedCount:   repoPresent ? sourceRepos : 0,
+        generatedCount: generatedRepos,
+        validatedCount: generatedRepos,
+      },
+    });
+
+    // ── Axe 5 : Services (frontend services inclus) ──────────────────────────
+    // FIX : Services frontend (auth service, storage service...) sont valides même sans API
+    const sourceServicesFromCounts = lCounts?.serviceFiles ?? 0;
+    const servSourcePresent        = presence.services;
+    const allServiceFiles          = files.filter((f) =>
+      isFlutterTarget
+        ? /_service\.dart$/.test(f.path) || /\/services?\/[^/]+\.dart$/.test(f.path)
+        : /\.service\.(ts|js)$/.test(f.path) || /\/services?\/[^/]+\.(ts|js)$/.test(f.path)
+    ).length;
+    // Pour les services, comparer généré vs source (compté par layer-detector)
+    const servScore: number | null = servSourcePresent
+      ? (sourceServicesFromCounts === 0
+          // IR n'a pas de compte explicite → score qualitatif basé sur les fichiers générés
+          ? (allServiceFiles > 0 ? Math.min(100, allServiceFiles * 20) : 0)
+          : Math.min(100, Math.round((allServiceFiles / Math.max(sourceServicesFromCounts, 1)) * 100)))
+      : null;
+    details.push({
+      axis:          'services',
+      score:         servScore,
+      sourcePresent: servSourcePresent,
+      applicable:    servSourcePresent,
+      status:        !servSourcePresent   ? 'na'
+                   : servScore === null   ? 'na'
+                   : servScore === 0      ? 'missing'
+                   : servScore < 70       ? 'partial'
+                   : 'applicable',
+      sourceCount:    sourceServicesFromCounts,
+      generatedCount: allServiceFiles,
+      losses:         servSourcePresent && allServiceFiles === 0 ? ['No service files generated'] : [],
+      pipelineTrace: {
+        sourceCount:    sourceServicesFromCounts,
+        astCount:       lCounts?.serviceFiles ?? sourceServicesFromCounts,
+        irCount:        sourceServicesFromCounts,
+        plannedCount:   servSourcePresent ? sourceServicesFromCounts : 0,
+        generatedCount: allServiceFiles,
+        validatedCount: allServiceFiles,
+      },
+    });
+
+    // ── Axe 6 : Stores ──────────────────────────────────────────────────────
+    const sourceStores      = sourceMetrics?.storesCount ?? (ir.uiGraph?.stateFlow?.length ?? 0);
+    const storeSourceCount  = Math.max(sourceStores, lCounts?.storeFiles ?? 0);
+    const storesSourcePres  = presence.stores;
+    const generatedStores   = files.filter((f) =>
       isFlutterTarget
         ? /_bloc\.dart$|_notifier\.dart$|_provider\.dart$/.test(f.path) ||
           /\/(blocs?|providers?|cubits?)\/[^/]+\.dart$/.test(f.path)
-        : /\.store\.(ts|js)$/.test(f.path)
+        : /\.store\.(ts|js)$/.test(f.path) || /\/stores?\/[^/]+\.(ts|js)$/.test(f.path) ||
+          /slice\.(ts|js)$/.test(f.path)
     ).length;
-    const storesScore = strictRatio(generatedStores, sourceStores);
+    const storesScore: number | null = nawareRatio(generatedStores, Math.max(storeSourceCount, 1), storesSourcePres);
+    // Pour stores présents mais IR count = 0 → score qualitatif si fichiers générés
+    const storesFinal: number | null = storesSourcePres && storeSourceCount === 0
+      ? (generatedStores > 0 ? Math.min(100, generatedStores * 25) : 0)
+      : storesScore;
     details.push({
-      axis: 'stores',
-      score: storesScore,
-      sourceCount: sourceStores,
+      axis:          'stores',
+      score:         storesFinal,
+      sourcePresent: storesSourcePres,
+      applicable:    storesSourcePres,
+      status:        !storesSourcePres   ? 'na'
+                   : storesFinal === null ? 'na'
+                   : storesFinal === 0    ? 'missing'
+                   : storesFinal < 70     ? 'partial'
+                   : 'applicable',
+      sourceCount:    storeSourceCount,
       generatedCount: generatedStores,
-      losses: sourceStores > generatedStores
-        ? (ir.uiGraph?.stateFlow ?? []).slice(generatedStores).map((sf) => sf.store)
-        : [],
+      losses:         storesSourcePres && sourceStores > generatedStores
+                        ? (ir.uiGraph?.stateFlow ?? []).slice(generatedStores).map((sf) => sf.store)
+                        : [],
+      pipelineTrace: {
+        sourceCount:    storeSourceCount,
+        astCount:       lCounts?.storeFiles ?? sourceStores,
+        irCount:        sourceStores,
+        plannedCount:   storesSourcePres ? Math.max(storeSourceCount, 1) : 0,
+        generatedCount: generatedStores,
+        validatedCount: generatedStores,
+      },
     });
 
-    // ── Axe 5 : Components ──────────────────────────────────────────────────
-    const sourceComponents = ir.uiGraph?.components?.length ?? 0;
-    // Flutter: widgets/*.dart   TS: components/*.tsx
+    // ── Axe 7 : Components ──────────────────────────────────────────────────
+    const sourceComponents    = Math.max(ir.uiGraph?.components?.length ?? 0, lCounts?.componentFiles ?? 0);
+    const compSourcePresent   = presence.components;
     const generatedComponents = files.filter((f) =>
       isFlutterTarget
         ? /\/(widgets?|components?)\/[^/]+\.dart$/.test(f.path)
-        : /\/components\/[^/]+\.tsx?$/.test(f.path)
+        : /\/components?\/[^/]+\.tsx?$/.test(f.path)
     ).length;
-    const compScore = safeRatio(generatedComponents, sourceComponents);
+    // Components : si source count = 0 mais presence = true, score qualitatif
+    const compScore: number | null = compSourcePresent
+      ? (sourceComponents === 0
+          ? (generatedComponents > 0 ? Math.min(100, generatedComponents * 15) : 0)
+          : Math.min(100, Math.round((generatedComponents / sourceComponents) * 100)))
+      : null;
     details.push({
-      axis: 'components',
-      score: compScore,
-      sourceCount: sourceComponents,
+      axis:          'components',
+      score:         compScore,
+      sourcePresent: compSourcePresent,
+      applicable:    compSourcePresent,
+      status:        !compSourcePresent ? 'na'
+                   : compScore === null  ? 'na'
+                   : compScore === 0     ? 'missing'
+                   : compScore < 70      ? 'partial'
+                   : 'applicable',
+      sourceCount:    sourceComponents,
       generatedCount: generatedComponents,
-      losses: sourceComponents > 0 && generatedComponents === 0 ? ['No component files generated'] : [],
+      losses:         compSourcePresent && sourceComponents > 0 && generatedComponents === 0
+                        ? ['No component files generated'] : [],
+      pipelineTrace: {
+        sourceCount:    sourceComponents,
+        astCount:       lCounts?.componentFiles ?? sourceComponents,
+        irCount:        ir.uiGraph?.components?.length ?? 0,
+        plannedCount:   compSourcePresent ? sourceComponents : 0,
+        generatedCount: generatedComponents,
+        validatedCount: generatedComponents,
+      },
     });
 
-    // ── Axe 6 : Models ──────────────────────────────────────────────────────
-    const sourceModels = sourceMetrics?.modelsCount ?? (ir.dataLayer?.models?.length ?? 0);
-    // Flutter: models/*.dart   TS: *.types.ts | types/*.ts
-    const generatedTypes = files.filter((f) =>
+    // ── Axe 8 : Models ──────────────────────────────────────────────────────
+    const sourceModels    = Math.max(sourceMetrics?.modelsCount ?? 0, ir.dataLayer?.models?.length ?? 0, lCounts?.modelFiles ?? 0);
+    const modSourcePresent = presence.models;
+    const generatedTypes  = files.filter((f) =>
       isFlutterTarget
         ? /\/models?\/[^/]+\.dart$/.test(f.path) || /\.model\.dart$/.test(f.path)
-        : /\.types\.(ts|js)$/.test(f.path) || /\/types\//.test(f.path) || /\.entity\.(ts|js)$/.test(f.path)
+        : /\.types\.(ts|js)$/.test(f.path) || /\/types\//.test(f.path) || /\.entity\.(ts|js)$/.test(f.path) ||
+          /\/models?\/[^/]+\.(ts|js)$/.test(f.path)
     ).length;
-    const modelsScore = safeRatio(generatedTypes, sourceModels);
+    const modScore: number | null = modSourcePresent
+      ? (sourceModels === 0
+          ? (generatedTypes > 0 ? Math.min(100, generatedTypes * 20) : 0)
+          : Math.min(100, Math.round((generatedTypes / sourceModels) * 100)))
+      : null;
     details.push({
-      axis: 'models',
-      score: modelsScore,
-      sourceCount: sourceModels,
+      axis:          'models',
+      score:         modScore,
+      sourcePresent: modSourcePresent,
+      applicable:    modSourcePresent,
+      status:        !modSourcePresent ? 'na'
+                   : modScore === null  ? 'na'
+                   : modScore === 0     ? 'missing'
+                   : modScore < 70      ? 'partial'
+                   : 'applicable',
+      sourceCount:    sourceModels,
       generatedCount: generatedTypes,
-      losses: sourceModels > 0 && generatedTypes === 0 ? ['No type/entity files generated'] : [],
+      losses:         modSourcePresent && sourceModels > 0 && generatedTypes === 0
+                        ? ['No model/type files generated'] : [],
+      pipelineTrace: {
+        sourceCount:    sourceModels,
+        astCount:       lCounts?.modelFiles ?? sourceModels,
+        irCount:        ir.dataLayer?.models?.length ?? 0,
+        plannedCount:   modSourcePresent ? sourceModels : 0,
+        generatedCount: generatedTypes,
+        validatedCount: generatedTypes,
+      },
     });
 
-    // ── Axe 7 : UI Fidelity (design tokens + visual structure) ──────────────
-    const hasDesignTokens = !!(ir as IRDocument & { designTokens?: unknown }).designTokens;
-    const hasThemeFiles   = files.some((f) => /theme|colors|spacing/.test(f.path));
-    const uiFidelityScore = hasDesignTokens && hasThemeFiles ? 90
-      : hasDesignTokens || hasThemeFiles ? 70
-      : generatedScreenCount > 0 ? 50
-      : 20;
+    // ── Axe 9 : UI Fidelity (design tokens + visual structure) ──────────────
+    const hasDesignTokens  = !!(ir as IRDocument & { designTokens?: unknown }).designTokens;
+    const hasThemeFiles    = files.some((f) => /theme|colors|spacing/.test(f.path));
+    const uiSourcePresent  = presence.uiFidelity;
+    let uiScore: number | null = null;
+    if (uiSourcePresent) {
+      uiScore = hasDesignTokens && hasThemeFiles ? 90
+              : hasDesignTokens || hasThemeFiles  ? 70
+              : generatedScreenCount > 0          ? 50
+              : 20;
+    }
     details.push({
-      axis: 'uiFidelity',
-      score: uiFidelityScore,
-      sourceCount: hasDesignTokens ? 1 : 0,
+      axis:          'uiFidelity',
+      score:         uiScore,
+      sourcePresent: uiSourcePresent,
+      applicable:    uiSourcePresent,
+      status:        !uiSourcePresent ? 'na'
+                   : uiScore === null  ? 'na'
+                   : uiScore < 50      ? 'partial'
+                   : 'applicable',
+      sourceCount:    uiSourcePresent ? 1 : 0,
       generatedCount: hasThemeFiles ? 1 : 0,
-      losses: !hasDesignTokens ? ['Design tokens not extracted from source'] : [],
+      losses:         uiSourcePresent && !hasDesignTokens ? ['Design tokens not extracted from source'] : [],
+      pipelineTrace: {
+        sourceCount:    uiSourcePresent ? 1 : 0,
+        astCount:       uiSourcePresent ? 1 : 0,
+        irCount:        hasDesignTokens ? 1 : 0,
+        plannedCount:   uiSourcePresent ? 1 : 0,
+        generatedCount: hasThemeFiles ? 1 : 0,
+        validatedCount: hasThemeFiles ? 1 : 0,
+      },
     });
 
-    // ── Axe 8 : Data Layer (PHASE 27 — nouvel axe) ──────────────────────────
-    const sourceEntities = (ir.dataLayer?.models?.length ?? 0);
-    const sourceMigrations = (ir.dataLayer?.migrations?.length ?? 0);
-    const genEntities = files.filter((f) => /\.entity\.(ts|js)$/.test(f.path)).length;
-    const genMigrations = files.filter((f) => /migration|migrate/.test(f.path)).length;
-    const dataLayerScore = (sourceEntities + sourceMigrations) === 0
-      ? 100
-      : Math.min(100, Math.round(
-          ((genEntities + genMigrations) / Math.max(sourceEntities + sourceMigrations, 1)) * 100
-        ));
+    // ── Axe 10 : Data Layer ──────────────────────────────────────────────────
+    // FIX CRITIQUE : src=0 → N/A (plus jamais 100%)
+    const sourceEntities      = (ir.dataLayer?.models?.length ?? 0);
+    const sourceMigrations    = (ir.dataLayer?.migrations?.length ?? 0);
+    const dataSourcePresent   = presence.dataLayer;
+    const genEntities         = files.filter((f) => /\.entity\.(ts|js)$/.test(f.path)).length;
+    const genMigrations       = files.filter((f) => /migration|migrate/.test(f.path)).length;
+    const dataTotal           = sourceEntities + sourceMigrations;
+    const dataScore: number | null = nawareRatio(genEntities + genMigrations, dataTotal, dataSourcePresent);
     details.push({
-      axis: 'dataLayer',
-      score: dataLayerScore,
-      sourceCount: sourceEntities + sourceMigrations,
+      axis:          'dataLayer',
+      score:         dataScore,
+      sourcePresent: dataSourcePresent,
+      applicable:    dataSourcePresent,
+      status:        !dataSourcePresent ? 'na'
+                   : dataScore === null  ? 'na'
+                   : dataScore === 0     ? 'missing'
+                   : dataScore < 70      ? 'partial'
+                   : 'applicable',
+      sourceCount:    dataTotal,
       generatedCount: genEntities + genMigrations,
-      losses: sourceEntities > 0 && genEntities === 0 ? ['Entity files missing'] : [],
+      losses:         dataSourcePresent && sourceEntities > 0 && genEntities === 0 ? ['Entity files missing'] : [],
+      pipelineTrace: {
+        sourceCount:    lCounts?.dataLayerFiles ?? dataTotal,
+        astCount:       lCounts?.dataLayerFiles ?? dataTotal,
+        irCount:        dataTotal,
+        plannedCount:   dataSourcePresent ? dataTotal : 0,
+        generatedCount: genEntities + genMigrations,
+        validatedCount: genEntities + genMigrations,
+      },
     });
 
-    // ── Axe 9 : Assets (PHASE 27 — nouvel axe) ──────────────────────────────
-    const sourceAssets = (sourceMetrics?.assetsCount ?? 0) +
-      (ir.assets?.images?.length ?? 0) +
-      (ir.assets?.fonts?.length ?? 0) +
-      (ir.assets?.icons?.length ?? 0);
-    const genAssets = files.filter((f) =>
+    // ── Axe 11 : Assets ─────────────────────────────────────────────────────
+    // FIX CRITIQUE : src=0 → N/A (plus jamais 100%)
+    const sourceAssets       = (sourceMetrics?.assetsCount ?? 0) +
+                               (ir.assets?.images?.length ?? 0) +
+                               (ir.assets?.fonts?.length ?? 0) +
+                               (ir.assets?.icons?.length ?? 0);
+    const assetsSourceCount  = Math.max(sourceAssets, lCounts?.assetFiles ?? 0);
+    const assetsPresent      = presence.assets;
+    const genAssets          = files.filter((f) =>
       /\.(png|jpg|svg|ttf|otf|woff|woff2|gif|webp|ico)$/.test(f.path) ||
       /assets\//.test(f.path)
     ).length;
-    // Assets = génération de config + références correctes (pas forcément les fichiers binaires)
-    const genAssetRefs = files.filter((f) =>
-      /theme|colors|fonts|assets/.test(f.path)
-    ).length;
-    const assetsScore = sourceAssets === 0 ? 100
-      : Math.min(100, Math.round(Math.max(genAssets, genAssetRefs > 0 ? 50 : 0) / Math.max(sourceAssets, 1) * 100));
+    const genAssetRefs       = files.filter((f) => /theme|colors|fonts|assets/.test(f.path)).length;
+    // Score hybride : fichiers binaires + références dans les fichiers de config/theme
+    let assetsScore: number | null = null;
+    if (assetsPresent) {
+      if (assetsSourceCount === 0) {
+        assetsScore = genAssets > 0 ? 80 : (genAssetRefs > 0 ? 60 : 0);
+      } else {
+        const rawScore = Math.round(
+          Math.max(genAssets, genAssetRefs > 0 ? assetsSourceCount * 0.5 : 0) /
+          assetsSourceCount * 100
+        );
+        assetsScore = Math.min(100, rawScore);
+      }
+    }
     details.push({
-      axis: 'assets',
-      score: assetsScore,
-      sourceCount: sourceAssets,
+      axis:          'assets',
+      score:         assetsScore,
+      sourcePresent: assetsPresent,
+      applicable:    assetsPresent,
+      status:        !assetsPresent      ? 'na'
+                   : assetsScore === null ? 'na'
+                   : assetsScore === 0    ? 'missing'
+                   : assetsScore < 70     ? 'partial'
+                   : 'applicable',
+      sourceCount:    assetsSourceCount,
       generatedCount: genAssets,
-      losses: sourceAssets > 0 && genAssets === 0 ? ['Assets not referenced in generated project'] : [],
+      losses:         assetsPresent && assetsSourceCount > 0 && genAssets === 0
+                        ? ['Assets not referenced in generated project'] : [],
+      pipelineTrace: {
+        sourceCount:    assetsSourceCount,
+        astCount:       lCounts?.assetFiles ?? assetsSourceCount,
+        irCount:        sourceAssets,
+        plannedCount:   assetsPresent ? assetsSourceCount : 0,
+        generatedCount: genAssets,
+        validatedCount: genAssets,
+      },
     });
 
-    // ── Axe 10 : Functional (PHASE 27 — nouvel axe) ─────────────────────────
-    // Mesure les fonctionnalités testables : auth, formulaires, navigation, API calls
-    const hasAuthFiles   = files.some((f) => /auth|login|register|signin|signup/.test(f.path));
-    const hasApiClient   = files.some((f) => /api.*client|lib.*api|service.*http/.test(f.path));
-    const hasEnvConfig   = files.some((f) => /\.env|env\.example|constants/.test(f.path));
-    const hasNavigation  = files.some((f) => /navigation|router|stack|tab/.test(f.path));
+    // ── Axe 12 : Functional (auth, forms, error handling) ───────────────────
+    const hasAuthFiles     = files.some((f) => /auth|login|register|signin|signup/.test(f.path));
+    const hasApiClient     = files.some((f) => /api.*client|lib.*api|service.*http/.test(f.path));
+    const hasEnvConfig     = files.some((f) => /\.env|env\.example|constants/.test(f.path));
+    const hasNavigation    = files.some((f) => /navigation|router|stack|tab/.test(f.path));
     const hasErrorHandling = files.some((f) => f.content?.includes('catch') || f.content?.includes('error'));
     const functionalPoints = [hasAuthFiles, hasApiClient, hasEnvConfig, hasNavigation, hasErrorHandling].filter(Boolean).length;
-    // Source indications
-    const srcHasAuth = (ir.externalConnections ?? []).some((c) => c.type === 'auth') ||
-                       (ir.uiGraph?.screens ?? []).some((s) => /login|auth|sign/i.test(s.name));
-    const functionalScore = Math.min(100, Math.round((functionalPoints / 5) * 100));
+    const functPresent     = presence.functional;
+    const srcHasAuth       = (ir.externalConnections ?? []).some((c) => c.type === 'auth') ||
+                             (ir.uiGraph?.screens ?? []).some((s) => /login|auth|sign/i.test(s.name));
+    // Source functional points estimés
+    const srcFunctPoints   = srcHasAuth ? 5 : 3;
+    const functScore: number | null = functPresent
+      ? Math.min(100, Math.round((functionalPoints / srcFunctPoints) * 100))
+      : null;
     details.push({
-      axis: 'functional',
-      score: functionalScore,
-      sourceCount: srcHasAuth ? 5 : 3,
+      axis:          'functional',
+      score:         functScore,
+      sourcePresent: functPresent,
+      applicable:    functPresent,
+      status:        !functPresent       ? 'na'
+                   : functScore === null  ? 'na'
+                   : functScore === 0     ? 'missing'
+                   : functScore < 70      ? 'partial'
+                   : 'applicable',
+      sourceCount:    srcFunctPoints,
       generatedCount: functionalPoints,
-      losses: [
-        !hasApiClient   ? 'API client file missing'       : '',
-        !hasEnvConfig   ? 'Environment config missing'    : '',
-        !hasNavigation  ? 'Navigation config missing'     : '',
-        !hasErrorHandling ? 'No error handling detected'  : '',
+      losses:         [
+        functPresent && !hasApiClient   ? 'API client missing'          : '',
+        functPresent && !hasEnvConfig   ? 'Environment config missing'  : '',
+        functPresent && !hasNavigation  ? 'Navigation config missing'   : '',
+        functPresent && !hasErrorHandling ? 'No error handling'         : '',
       ].filter(Boolean),
+      pipelineTrace: {
+        sourceCount:    srcFunctPoints,
+        astCount:       srcFunctPoints,
+        irCount:        srcFunctPoints,
+        plannedCount:   functPresent ? srcFunctPoints : 0,
+        generatedCount: functionalPoints,
+        validatedCount: functionalPoints,
+      },
     });
 
-    // ── Overall : moyenne pondérée 10 axes ───────────────────────────────────
-    // Poids Phase 27 (total=13): businessLogic x2.5, navigation x1.5, api x1.5,
-    //   stores x1, components x1, models x1, uiFidelity x1, dataLayer x1, assets x1, functional x1.5
-    const weights = {
-      businessLogic: 2.5,
+    // ── Overall : moyenne pondérée UNIQUEMENT sur axes APPLICABLES ───────────
+    // FIX FONDAMENTAL : N/A axes exclus du dénominateur
+    const weights: Record<string, number> = {
+      businessLogic: 2.0,
       navigation:    1.5,
       api:           1.5,
+      repositories:  1.0,
+      services:      1.0,
       stores:        1.0,
       components:    1.0,
       models:        1.0,
       uiFidelity:    1.0,
       dataLayer:     1.0,
-      assets:        1.0,
-      functional:    1.5,
+      assets:        0.5,
+      functional:    1.0,
     };
-    const totalWeight = Object.values(weights).reduce((a, b) => a + b, 0); // 14.5
-    const overall = Math.round(
-      details.reduce((sum, d, i) => {
-        const key = Object.keys(weights)[i] as keyof typeof weights;
-        return sum + d.score * (weights[key] ?? 1);
-      }, 0) / totalWeight
-    );
 
+    let weightedSum   = 0;
+    let applicableW   = 0;
+    const applicableAxes: string[] = [];
+    const naAxes:         string[] = [];
+
+    for (const d of details) {
+      const w = weights[d.axis] ?? 1.0;
+      if (d.applicable && d.score !== null) {
+        weightedSum   += d.score * w;
+        applicableW   += w;
+        applicableAxes.push(d.axis);
+      } else {
+        naAxes.push(d.axis);
+      }
+    }
+
+    const overall = applicableW > 0
+      ? Math.min(100, Math.round(weightedSum / applicableW))
+      : 0;
+
+    // ── Logging ──────────────────────────────────────────────────────────────
     logger.info({
-      axes: details.map((d) => ({ axis: d.axis, score: d.score, src: d.sourceCount, gen: d.generatedCount })),
-      overall: Math.min(100, overall),
-    }, '📊 Phase 7 (Phase 27): Fidelity Score 10-axes calculated');
+      axes:           details.map((d) => ({ axis: d.axis, score: d.score, applicable: d.applicable, src: d.sourceCount, gen: d.generatedCount })),
+      overall,
+      applicableCount: applicableAxes.length,
+      naCount:         naAxes.length,
+      framework:       lCounts?.detectedFramework ?? 'unknown',
+    }, '📊 Phase 7 (v2 N/A-aware): Fidelity Score calculated');
 
-    console.log(`\n================ FIDELITY SCORE (Phase 27 — 10 axes) ================`);
-    details.forEach((d) => {
-      const bar = '█'.repeat(Math.round(d.score / 10)) + '░'.repeat(10 - Math.round(d.score / 10));
-      console.log(`  ${d.axis.padEnd(14)} [${bar}] ${String(d.score).padStart(3)}%  src=${d.sourceCount} gen=${d.generatedCount}${d.losses.length ? ` ⚠️  ${d.losses.slice(0, 2).join(', ')}` : ''}`);
-    });
-    console.log(`  ${'OVERALL'.padEnd(14)} ${''.padEnd(12)} ${String(Math.min(100, overall)).padStart(3)}%`);
-    console.log(`==============================\n`);
+    // ── Console display ───────────────────────────────────────────────────────
+    const fmtScore = (s: number | null): string =>
+      s === null ? '  N/A' : `${String(s).padStart(3)}%`;
+
+    console.log(`\n================ FIDELITY SCORE ================`);
+    console.log(`  Framework   : ${lCounts?.detectedFramework ?? 'unknown'}`);
+    if ((lCounts?.stateManagements?.length ?? 0) > 0) {
+      console.log(`  State Mgmt  : ${lCounts!.stateManagements.join(', ')}`);
+    }
+    console.log('');
+    for (const d of details) {
+      const scoreStr = fmtScore(d.score);
+      const barLen   = d.score === null ? 0 : Math.round(d.score / 10);
+      const bar      = d.applicable
+        ? '█'.repeat(barLen) + '░'.repeat(10 - barLen)
+        : '──────────';
+      const warn     = d.losses.length > 0 ? ` ⚠️  ${d.losses.slice(0, 2).join(', ')}` : '';
+      console.log(`  ${d.axis.padEnd(14)} [${bar}] ${scoreStr}  src=${d.sourceCount} gen=${d.generatedCount}${warn}`);
+    }
+    console.log('');
+    console.log(`  ${'OVERALL'.padEnd(14)} [${'═'.repeat(10)}] ${String(overall).padStart(3)}%  (${applicableAxes.length} axes applicables, ${naAxes.length} N/A)`);
+    console.log(`=================================================\n`);
+    if (naAxes.length > 0) {
+      console.log(`  Axes N/A    : ${naAxes.join(', ')}`);
+      console.log(`  Score calculé sur : ${applicableAxes.join(', ')}\n`);
+    }
 
     return {
-      businessLogic: details[0]!.score,
-      navigation:    details[1]!.score,
-      api:           details[2]!.score,
-      stores:        details[3]!.score,
-      components:    details[4]!.score,
-      models:        details[5]!.score,
-      uiFidelity:    details[6]!.score,
-      dataLayer:     details[7]!.score,
-      assets:        details[8]!.score,
-      functional:    details[9]!.score,
-      overall:       Math.min(100, overall),
+      businessLogic: details.find((d) => d.axis === 'businessLogic')?.score ?? null,
+      navigation:    details.find((d) => d.axis === 'navigation')?.score    ?? null,
+      api:           details.find((d) => d.axis === 'api')?.score           ?? null,
+      repositories:  details.find((d) => d.axis === 'repositories')?.score ?? null,
+      services:      details.find((d) => d.axis === 'services')?.score      ?? null,
+      stores:        details.find((d) => d.axis === 'stores')?.score        ?? null,
+      components:    details.find((d) => d.axis === 'components')?.score    ?? null,
+      models:        details.find((d) => d.axis === 'models')?.score        ?? null,
+      uiFidelity:    details.find((d) => d.axis === 'uiFidelity')?.score    ?? null,
+      dataLayer:     details.find((d) => d.axis === 'dataLayer')?.score     ?? null,
+      assets:        details.find((d) => d.axis === 'assets')?.score        ?? null,
+      functional:    details.find((d) => d.axis === 'functional')?.score    ?? null,
+      overall,
+      applicableAxes,
+      naAxes,
+      ...(lCounts ? { detectedFramework: lCounts.detectedFramework } : {}),
+      ...(lCounts?.stateManagements?.length ? { stateManagements: lCounts.stateManagements } : {}),
       details,
     };
   }
@@ -964,8 +1404,8 @@ export class ConversionPipeline {
     if (currentScore >= FIDELITY_TARGET || MAX_ITERATIONS === 0) {
       if (MAX_ITERATIONS === 0 && tier !== 'static') {
         const lossLines = initialScore.details
-          .filter((d) => d.score < 100 && d.losses.length > 0)
-          .map((d) => `[Phase8] ${d.axis} score=${d.score}% losses=${d.losses.join(', ')}`);
+          .filter((d) => d.applicable && (d.score ?? 100) < 100 && d.losses.length > 0)
+          .map((d) => `[Phase8] ${d.axis} score=${d.score ?? 'N/A'}% losses=${d.losses.join(', ')}`);
         if (lossLines.length > 0 && ir.validation) {
           ir.validation.warnings = [...(ir.validation.warnings ?? []), ...lossLines];
           logger.warn({ jobId: ctx.jobId, losses: lossLines.length }, '⏭️  Phase 8: Groq static — losses noted in warnings');
@@ -1000,15 +1440,15 @@ export class ConversionPipeline {
         break;
       }
 
-      // Identifier les axes défaillants (score < 80%)
+      // Identifier les axes défaillants (applicable + score < 80%)
       const currentScoreObj = this.calculateFidelityScore(ir, currentPlan.files);
-      const axesWithLosses = currentScoreObj.details.filter((d) => d.score < 80);
+      const axesWithLosses = currentScoreObj.details.filter((d) => d.applicable && (d.score ?? 0) < 80);
 
       console.log(`[PHASE 8] Axes défaillants (score < 80%): ${axesWithLosses.map((a) => `${a.axis}=${a.score}%`).join(', ') || 'aucun'}`);
 
       if (axesWithLosses.length === 0 && currentScore >= 80) {
-        logger.info({ jobId: ctx.jobId }, '✅ Phase 8: All axes above 80% — stopping');
-        console.log(`[PHASE 8] Tous les axes ≥ 80% — arrêt`);
+        logger.info({ jobId: ctx.jobId }, '✅ Phase 8: All applicable axes above 80% — stopping');
+        console.log(`[PHASE 8] Tous les axes applicables ≥ 80% — arrêt`);
         break;
       }
 

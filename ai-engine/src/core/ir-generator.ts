@@ -510,9 +510,13 @@ Return ONLY valid JSON. No markdown. No explanation.`;
 
     console.log(`[IRGenerator] generateUIGraph: using ${Math.min(uiFiles.length, maxFiles)}/${uiFiles.length} UI files, ${maxPerFile} chars/file, isGroq=${isGroq}`);
 
-    const prompt = `Framework: ${ctx.sourceFramework} → Target: ${ctx.targetFramework}
-${contextBlock ? `Context: ${contextBlock}` : ''}
+    // Injecter le résumé structurel pre-truncation si disponible
+    const structuralHint = ctx.structuralSummary
+      ? `\n${ctx.structuralSummary}\n`
+      : '';
 
+    const prompt = `Framework: ${ctx.sourceFramework} → Target: ${ctx.targetFramework}
+${contextBlock ? `Context: ${contextBlock}` : ''}${structuralHint}
 SOURCE UI FILES (${uiFiles.length} total, showing ${Math.min(uiFiles.length, maxFiles)}):
 ${filesCtx}
 

@@ -286,6 +286,13 @@ export interface ConversionContext {
   targetFramework: string;
   userGoal?:      string;
   options:        ConversionOptions;
+  /**
+   * Résumé structurel généré AVANT la troncature du sourceCode.
+   * Garantit que screens/services/stores/models sont transmis à l'IR generator
+   * même si le sourceCode est tronqué pour respecter les limites de tokens.
+   * Format :  "STRUCTURAL_SUMMARY:\n screens=N, services=M, ..."
+   */
+  structuralSummary?: string | undefined;
 }
 
 export interface ConversionOptions {
@@ -475,30 +482,50 @@ export interface IRAnimationToken {
 // ── Phase 7 : Score de fidélité multi-axes ────────────────────────────────────
 
 export interface IRFidelityScore {
-  // Axes de mesure (0-100 chacun) — PHASE 27: 10 axes
-  businessLogic: number;  // couverture règles métier
-  navigation:    number;  // routes / transitions conservées
-  api:           number;  // endpoints + méthodes HTTP conservés
-  stores:        number;  // stores/state conservés
-  components:    number;  // composants UI conservés
-  models:        number;  // modèles de données conservés
-  uiFidelity:    number;  // fidélité visuelle (tokens + layout)
-  // ── PHASE 27: 3 axes supplémentaires ────────────────────────
-  dataLayer:     number;  // couverture couche données (entités, migrations, relations)
-  assets:        number;  // assets recréés (images, fonts, icons)
-  functional:    number;  // fonctionnalités testables (auth, navigation, formulaires)
-  overall:       number;  // moyenne pondérée — indicateur principal
+  // Axes de mesure (0-100 chacun, ou null si N/A) — PHASE 27: 10 axes + N/A support
+  businessLogic: number | null;  // null = N/A (absent du projet source)
+  navigation:    number | null;
+  api:           number | null;
+  repositories:  number | null;  // axe ajouté pour cohérence avec layer-detector
+  services:      number | null;
+  stores:        number | null;
+  components:    number | null;
+  models:        number | null;
+  uiFidelity:    number | null;
+  // ── PHASE 27: axes supplémentaires ────────────────────────
+  dataLayer:     number | null;  // couverture couche données (entités, migrations, relations)
+  assets:        number | null;  // assets recréés (images, fonts, icons)
+  functional:    number | null;  // fonctionnalités testables (auth, navigation, formulaires)
+  overall:       number;         // moyenne pondérée — calculée UNIQUEMENT sur axes applicables
+  // Metadata
+  applicableAxes:   string[];    // axes avec score réel (SOURCE_PRESENT = true)
+  naAxes:           string[];    // axes N/A (SOURCE_PRESENT = false)
+  detectedFramework?: string | undefined;
+  stateManagements?:  string[] | undefined;
   // Détail par axe
   details:       IRFidelityDetail[];
 }
 
 export interface IRFidelityDetail {
   axis:           string;   // nom de l'axe (ex. "navigation")
-  score:          number;   // 0-100
+  score:          number | null;  // 0-100, ou null si N/A
   sourceCount:    number;   // nombre d'éléments dans la source
   generatedCount: number;   // nombre d'éléments générés
   losses:         string[]; // éléments manquants ou dégradés (noms/ids)
-  notes?:         string;   // commentaire libre
+  notes?:         string | undefined;   // commentaire libre
+  // ── N/A support ─────────────────────────────────────────────
+  sourcePresent:  boolean;  // true = couche présente dans source, false = N/A
+  applicable:     boolean;  // true = score calculé, false = N/A (exclu du dénominateur)
+  status:         'applicable' | 'na' | 'partial' | 'missing';
+  // ── Pipeline trace ───────────────────────────────────────────
+  pipelineTrace?: {
+    sourceCount:    number;   // éléments détectés dans source
+    astCount:       number;   // éléments détectés par AST
+    irCount:        number;   // éléments dans l'IR
+    plannedCount:   number;   // éléments planifiés
+    generatedCount: number;   // fichiers générés
+    validatedCount: number;   // fichiers validés (imports OK)
+  } | undefined;
 }
 
 // ── Phase 8 : Rapport auto-correction ────────────────────────────────────────
