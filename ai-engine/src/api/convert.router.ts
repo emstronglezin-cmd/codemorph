@@ -134,6 +134,34 @@ convertRouter.post('/', async (req: Request, res: Response, next: NextFunction):
           console.log(`[PIPELINE] ━━━ ZIP ━━━`);
           console.log(`[PIPELINE] Status: ${zr.success ? '✅ OK' : '❌ FAIL'} | Files: ${zr.fileCount} | Size: ${(zr.totalBytes / 1024).toFixed(1)} KB | Path: ${zr.zipPath}`);
         }
+
+        // ── Phase 12 (NOUVEAU): Afficher le statut Delivery Check
+        if (result.deliveryCheck) {
+          const dc = result.deliveryCheck;
+          const statusIcon = dc.status === 'READY' ? '✅' : '⚠️';
+          console.log(`[PIPELINE] ━━━ Delivery Check ━━━`);
+          console.log(`[PIPELINE] ${statusIcon} Status: ${dc.status} | Score: ${dc.score}% | Blockers: ${dc.blockers?.length ?? 0} | Warnings: ${dc.warnings?.length ?? 0}`);
+          if (dc.blockers && dc.blockers.length > 0) {
+            dc.blockers.forEach((b: string) => console.log(`[PIPELINE]   🔴 ${b}`));
+          }
+        }
+
+        // ── Phase 8 fonctionnelle (NOUVEAU): Afficher le résumé des tests
+        if (result.testResults) {
+          const tr = result.testResults;
+          console.log(`[PIPELINE] ━━━ Functional Tests ━━━`);
+          console.log(`[PIPELINE] ${tr.overallStatus} | Total: ${tr.totalTests} | PASS: ${tr.passed} | PARTIAL: ${tr.partial} | FAIL: ${tr.failed} | NOT_TESTABLE: ${tr.notTestable}`);
+        }
+
+        // ── Phase 6 (NOUVEAU): Afficher le résumé Content Validation
+        if (result.contentValidation) {
+          const cv = result.contentValidation;
+          console.log(`[PIPELINE] ━━━ Content Validation ━━━`);
+          console.log(`[PIPELINE] Total: ${cv.totalFiles} | Converted: ${cv.convertedFiles} | SHELL: ${cv.shellFiles} | Rate: ${cv.conversionRate}%`);
+          if (cv.shellFiles > 0) {
+            console.log(`[PIPELINE] ⚠️  ${cv.shellFiles} SHELL files detected — counted as score=0`);
+          }
+        }
         if (callbackUrl) {
           const { default: axios } = await import('axios');
           // FIX: format de callback attendu par le backend handleCallback()
@@ -172,6 +200,14 @@ convertRouter.post('/', async (req: Request, res: Response, next: NextFunction):
               compilationResult:  result.compilationResult,
               zipResult:          result.zipResult,
               conversionReport:   result.conversionReport?.text,
+              // PHASE 2.5/6/8/12 (NOUVEAU) — Livrables obligatoires
+              applicationSpec:    result.applicationSpec,
+              contentValidation:  result.contentValidation,
+              deliveryCheck:      result.deliveryCheck,
+              testResults:        result.testResults,
+              fidelityScore:      result.fidelityScore,
+              conversionReportJson:    result.conversionReport?.json,
+              conversionReportMarkdown: result.conversionReport?.markdown,
             },
             irDocument:     result.ir,
           }, { timeout: 15_000, headers: callbackHeaders }).catch((cbErr: Error) => {
@@ -240,7 +276,68 @@ convertRouter.post('/sync', async (req: Request, res: Response, next: NextFuncti
       console.log(result.conversionReport.text);
     }
 
-    res.json({ success: true, data: result });
+    // Phase 12 (NOUVEAU): Log delivery check status
+    if (result.deliveryCheck) {
+      const dc = result.deliveryCheck;
+      const statusIcon = dc.status === 'READY' ? '✅' : '⚠️';
+      console.log(`[SYNC] ${statusIcon} Delivery: ${dc.status} | Score: ${dc.score}% | Blockers: ${dc.blockers?.length ?? 0}`);
+    }
+
+    // Phase 6 (NOUVEAU): Log content validation
+    if (result.contentValidation) {
+      const cv = result.contentValidation;
+      console.log(`[SYNC] Content: ${cv.convertedFiles}/${cv.totalFiles} converted | SHELL: ${cv.shellFiles} | Rate: ${cv.conversionRate}%`);
+    }
+
+    // Phase 8 fonctionnelle (NOUVEAU): Log test results
+    if (result.testResults) {
+      const tr = result.testResults;
+      console.log(`[SYNC] Tests: ${tr.overallStatus} | PASS: ${tr.passed}/${tr.totalTests} | FAIL: ${tr.failed}`);
+    }
+
+    // Retourner l'ensemble du résultat incluant les 7 livrables obligatoires
+    res.json({
+      success: true,
+      data: {
+        // Identifiant et IR
+        jobId:               result.jobId,
+        ir:                  result.ir,
+        // Fichiers générés
+        files:               result.files,
+        summary:             result.summary,
+        // Méta
+        tokensUsed:          result.tokensUsed,
+        durationMs:          result.durationMs,
+        aiTier:              result.aiTier,
+        aiModel:             result.aiModel,
+        // Scores et rapports
+        fidelityScore:       result.fidelityScore,
+        autoCorrectionReport: result.autoCorrectionReport,
+        // ── LIVRABLES OBLIGATOIRES (7) ───────────────────────────────────
+        // 1. application-spec.json
+        applicationSpec:     result.applicationSpec,
+        // 2. conversion-report.json + .md
+        conversionReport:    result.conversionReport,
+        // 3. fidelity-report.json (score + details)
+        fidelityReport: result.fidelityScore ? {
+          overall:        result.fidelityScore.overall,
+          applicableAxes: result.fidelityScore.applicableAxes,
+          naAxes:         result.fidelityScore.naAxes,
+          details:        result.fidelityScore.details,
+          deliveryStatus: result.deliveryCheck?.status,
+          generatedAt:    new Date().toISOString(),
+        } : undefined,
+        // 4. content-validation (SHELL detection)
+        contentValidation:   result.contentValidation,
+        // 5. delivery-check.json (READY/NEEDS_REPAIR)
+        deliveryCheck:       result.deliveryCheck,
+        // 6. test-results.json
+        testResults:         result.testResults,
+        // 7. target.zip
+        compilationResult:   result.compilationResult,
+        zipResult:           result.zipResult,
+      },
+    });
   } catch (err) {
     next(err);
   }

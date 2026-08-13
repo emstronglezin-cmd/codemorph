@@ -316,6 +316,14 @@ export interface ConversionResult {
   // ── PHASE 23: Score de fidélité multi-axes + rapport auto-correction ─────
   fidelityScore?:        IRFidelityScore;
   autoCorrectionReport?: IRAutoCorrectReport;
+  // ── PHASE 2.5 (NOUVEAU): ApplicationSpec — source de vérité ──────────────
+  applicationSpec?:      ApplicationSpec;
+  // ── PHASE 6 (NOUVEAU): Content Validation — SHELL detection ──────────────
+  contentValidation?:    ContentValidationReport;
+  // ── PHASE 12 (NOUVEAU): Delivery Check — READY / NEEDS_REPAIR ────────────
+  deliveryCheck?:        DeliveryCheckResult;
+  // ── PHASE 8 fonctionnelle (NOUVEAU): Résultats des tests fonctionnels ─────
+  testResults?:          TestResultsReport;
   // ── PHASE FINALE: Compilation, ZIP, Rapport ──────────────────────────────
   compilationResult?: {
     success:          boolean;
@@ -546,4 +554,300 @@ export interface IRScoreSnapshot {
   score:     number;   // overall à cette itération
   delta:     number;   // gain vs itération précédente
   filesRegenerated: number;
+}
+
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  APPLICATION SPEC — Source of truth for faithful reconstruction             ║
+// ║  Built in Phase 1-3 BEFORE any file generation                              ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+export interface ApplicationSpec {
+  // ── App metadata ────────────────────────────────────────
+  app: {
+    name:        string;
+    version?:    string;
+    platform:    'mobile' | 'web' | 'desktop' | 'backend';
+    architecture: string;       // e.g. "Feature-based + Clean Architecture"
+    sourceFramework: string;
+    targetFramework: string;
+  };
+
+  // ── Navigation ──────────────────────────────────────────
+  navigation: {
+    pattern:    string;         // "GoRouter ShellRoute" / "expo-router Stack" etc.
+    routes:     AppSpecRoute[];
+    guards:     string[];       // auth guards, redirects
+    deepLinks?: string[];
+  };
+
+  // ── Screens (UI) ───────────────────────────────────────
+  screens: AppSpecScreen[];
+
+  // ── Components ──────────────────────────────────────────
+  components: AppSpecComponent[];
+
+  // ── Data models ─────────────────────────────────────────
+  models: AppSpecModel[];
+
+  // ── API layer ───────────────────────────────────────────
+  api: {
+    baseUrl:    string;         // real URL extracted from source
+    authType:   string;         // "Bearer JWT" / "API-Key" etc.
+    headers:    Record<string, string>;
+    endpoints:  AppSpecEndpoint[];
+  };
+
+  // ── Services ────────────────────────────────────────────
+  services: AppSpecService[];
+
+  // ── State management ────────────────────────────────────
+  state: AppSpecStore[];
+
+  // ── Authentication ──────────────────────────────────────
+  auth: {
+    type:              string;  // "OTP+Phone" / "email+password" / "OAuth2" etc.
+    loginFlow:         string[];
+    logoutFlow:        string[];
+    tokenStorage:      string;  // "SecureStorage" / "AsyncStorage" etc.
+    sessionPersistence: boolean;
+    guards:            string[];
+  };
+
+  // ── External services ───────────────────────────────────
+  externalServices: AppSpecExternalService[];
+
+  // ── Configuration (NO secrets printed) ─────────────────
+  config: {
+    envVars: AppSpecEnvVar[];   // key + description + required (value NEVER printed)
+    buildConfig: Record<string, string>;
+    featureFlags: Record<string, boolean>;
+  };
+
+  // ── Assets ──────────────────────────────────────────────
+  assets: {
+    images: string[];
+    icons:  string[];
+    fonts:  string[];
+    theme: {
+      colors:     Record<string, string>;   // real hex values from source
+      typography: Record<string, unknown>;
+      spacing:    Record<string, number>;
+    };
+  };
+
+  // ── Permissions ─────────────────────────────────────────
+  permissions: {
+    android?: string[];
+    ios?:     string[];
+  };
+
+  // ── Critical info that must NOT be replaced by placeholders ─
+  criticalValues: {
+    key:         string;   // e.g. "API_BASE_URL"
+    value:       string;   // real value from source
+    source:      string;   // e.g. "lib/services/api_service.dart:12"
+    isSecret:    boolean;  // if true, value is masked in reports
+  }[];
+
+  // ── Missing information (must be reported) ──────────────
+  missingInfo: {
+    key:         string;
+    description: string;
+    impact:      'critical' | 'high' | 'medium' | 'low';
+  }[];
+}
+
+export interface AppSpecRoute {
+  path:       string;
+  screen:     string;
+  params?:    Record<string, string>;
+  guard?:     string;
+  isShell?:   boolean;   // ShellRoute / bottom nav tab
+  children?:  AppSpecRoute[];
+}
+
+export interface AppSpecScreen {
+  name:        string;
+  sourcePath:  string;
+  route:       string;
+  purpose:     string;         // business purpose
+  components:  string[];       // components used
+  stores:      string[];       // stores/providers consumed
+  apiCalls:    string[];       // API calls made
+  states:      string[];       // loading/error/empty/success states
+  userEvents:  string[];       // button presses, form submits etc.
+  validations: string[];       // form validation rules
+  specialFeatures: string[];   // GPS, camera, scanner etc.
+}
+
+export interface AppSpecComponent {
+  name:       string;
+  sourcePath: string;
+  type:       'shared' | 'feature' | 'layout';
+  props:      { name: string; type: string; required: boolean }[];
+  description: string;
+}
+
+export interface AppSpecModel {
+  name:       string;
+  sourcePath: string;
+  fields: {
+    name:     string;
+    type:     string;
+    nullable: boolean;
+    example?: string;
+  }[];
+  enums?: Record<string, string[]>;
+  relationships?: string[];
+}
+
+export interface AppSpecEndpoint {
+  name:        string;
+  method:      'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
+  path:        string;         // relative path e.g. "/auth/initiate"
+  fullUrl?:    string;         // base_url + path
+  auth:        boolean;
+  requestBody?: Record<string, string>;
+  queryParams?: Record<string, string>;
+  responseType: string;        // e.g. "AuthResponse" / "TripModel[]"
+  errorCodes?:  string[];
+  usedBy:      string[];       // screens/stores that use this endpoint
+}
+
+export interface AppSpecService {
+  name:         string;
+  sourcePath:   string;
+  responsibility: string;
+  methods: {
+    name:       string;
+    params:     string[];
+    returns:    string;
+    isAsync:    boolean;
+  }[];
+  dependencies: string[];
+}
+
+export interface AppSpecStore {
+  name:         string;
+  sourcePath:   string;
+  stateType:    string;        // state shape
+  initialState: Record<string, unknown>;
+  actions:      string[];
+  selectors:    string[];
+  persistence:  boolean;
+  effects?:     string[];      // side effects (timers, subscriptions)
+}
+
+export interface AppSpecExternalService {
+  name:         string;
+  type:         'firebase' | 'supabase' | 'rest-api' | 'websocket' | 'sms' | 'push' | 'payment' | 'analytics' | 'other';
+  configKeys:   string[];      // config keys needed (values masked if secret)
+  description:  string;
+  usedFor:      string[];
+}
+
+export interface AppSpecEnvVar {
+  key:          string;
+  description:  string;
+  required:     boolean;
+  example?:     string;        // safe example value (NOT the real secret)
+  foundInSource: boolean;      // true = found in source code
+  sourceLocation?: string;     // file:line where it was found
+}
+
+// ── Content Validation (Phase 6 — SHELL file detection) ──────────────────────
+
+export type FileContentStatus =
+  | 'converted'    // file has real target-language content
+  | 'shell_401'    // AI call failed (HTTP 401), contains only source in comment
+  | 'incomplete'   // partial conversion with TODOs/placeholders
+  | 'empty'        // empty file
+  | 'scaffold'     // valid scaffold (intentionally minimal, e.g. config files)
+  | 'source_residual'; // contains imports from source language
+
+export interface FileContentValidation {
+  path:            string;
+  status:          FileContentStatus;
+  language:        string;
+  linesTotal:      number;
+  linesCode:       number;     // actual code lines (non-comment, non-blank)
+  todosCount:      number;
+  placeholdersCount: number;
+  sourceImports:   string[];   // e.g. ["import 'package:flutter/material.dart'"]
+  shellMarkers:    string[];   // "Error: 401", "CONVERSION INCOMPLETE" etc.
+  isValid:         boolean;    // true only if status === 'converted' || 'scaffold'
+  score:           number;     // 0-100 content quality score
+}
+
+export interface ContentValidationReport {
+  totalFiles:       number;
+  convertedFiles:   number;    // status === 'converted'
+  shellFiles:       number;    // status === 'shell_401'
+  incompleteFiles:  number;    // status === 'incomplete'
+  emptyFiles:       number;    // status === 'empty'
+  scaffoldFiles:    number;    // status === 'scaffold'
+  sourceResidual:   number;    // status === 'source_residual'
+  totalTodos:       number;
+  totalPlaceholders: number;
+  totalSourceImports: number;
+  conversionRate:   number;    // convertedFiles / totalFiles * 100
+  files:            FileContentValidation[];
+}
+
+// ── Static Validation (Phase 7) ──────────────────────────────────────────────
+
+export interface StaticValidationResult {
+  tsCompilation: {
+    attempted:  boolean;
+    success:    boolean;
+    errors:     string[];
+    warnings:   string[];
+  };
+  brokenImports: string[];       // import paths that resolve to nothing
+  sourceImports: string[];       // imports from source language (Dart, Swift etc.)
+  emptyFiles:    string[];       // files with no real content
+  criticalTodos: string[];       // TODOs that block functionality
+  undefinedRefs: string[];       // calls to undefined functions/variables
+  missingRoutes: string[];       // routes referenced but not defined
+  overallPassed: boolean;
+}
+
+// ── Delivery Status (Phase 12) ────────────────────────────────────────────────
+
+export type DeliveryStatus = 'READY' | 'NEEDS_REPAIR';
+
+export interface DeliveryCheckResult {
+  status:            DeliveryStatus;
+  score:             number;         // real fidelity score (0-100)
+  compilationPassed: boolean;
+  noSourceImports:   boolean;
+  noShellCritical:   boolean;
+  noMissingCritical: boolean;
+  navigationFunctional: boolean;
+  apiLayerPresent:   boolean;
+  configTransferred: boolean;
+  blockers:          string[];       // what prevents READY status
+  warnings:          string[];       // non-blocking issues
+  readyChecklist:    { item: string; passed: boolean; detail?: string }[];
+}
+
+// ── Test Results (Phase 8) ────────────────────────────────────────────────────
+
+export type TestStatus = 'PASS' | 'PARTIAL' | 'FAIL' | 'NOT_TESTABLE';
+
+export interface FunctionalTestResult {
+  feature:     string;
+  status:      TestStatus;
+  detail:      string;
+  blockedBy?:  string;    // what prevents testing / passing
+}
+
+export interface TestResultsReport {
+  totalTests:       number;
+  passed:           number;
+  partial:          number;
+  failed:           number;
+  notTestable:      number;
+  overallStatus:    TestStatus;
+  tests:            FunctionalTestResult[];
 }

@@ -44,6 +44,16 @@ import type { CompilationResult }   from './dart-compiler';
 import type { ZipPackageResult }    from './zip-packager';
 import type { ConversionReport }    from './conversion-report';
 import type { LayerDetectionResult } from './layer-detector';
+// ── NEW PHASES: Application Spec, Content Validation, Delivery Check ─────────
+import { buildApplicationSpec, summarizeSpecForPrompt }  from './application-spec-builder';
+import { validateAllFiles, formatContentReport }          from './content-validator';
+import { runStaticValidationSync }                        from './static-validator';
+import { runDeliveryCheck, formatDeliveryReport }         from './delivery-checker';
+import { buildFunctionalTestResults, formatTestResultsReport } from './functional-test-runner';
+import type {
+  ApplicationSpec, ContentValidationReport,
+  DeliveryCheckResult, TestResultsReport,
+} from '../models/ir.types';
 
 const logger = pino({ level: process.env['LOG_LEVEL'] ?? 'info' });
 
@@ -310,7 +320,27 @@ export class ConversionPipeline {
     }
     phaseEnd('arch');
 
-    // ── PHASE 3+4: IR Generation + Knowledge Graph — avec cache ──
+    // ── PHASE 2.5: Application Spec Builder (Phases 1-3 du cahier des charges) ─
+    // RÈGLE ABSOLUE: Construire la spec AVANT toute génération de fichiers.
+    // La spec devient la source de vérité pour toute la reconstruction.
+    logger.info({ jobId: ctx.jobId }, '📋 Phase 2.5: Application Spec Builder (exhaustive source analysis)');
+    let appSpec: ApplicationSpec | undefined;
+    try {
+      appSpec = buildApplicationSpec(
+        ctx.sourceCode,
+        astResult,
+        archResult,
+        // Pass minimal IR result proxy (real IR not yet built — use AST/arch data)
+        { ir: { uiGraph: { screens: [], components: [], navigationFlow: [], stateFlow: [] }, backendGraph: { routes: [], services: [], entities: [], middlewares: [] }, dataLayer: { models: [], relationships: [], migrations: [] }, projectMeta: { name: ctx.projectId, type: 'mobile', sourceStack: ctx.sourceFramework ?? '', targetStack: ctx.targetFramework ?? '', complexityScore: 50, sourceFiles: astResult.files.length, totalLines: 0, detectedFrameworks: [] }, architecture: { modules: [], layers: [], patterns: [] }, dependencyMap: { keep: [], replace: [], add: [], remove: [] }, conversionPlan: [], validation: { buildable: true, testsRequired: false, riskLevel: 'medium' } }, tokensUsed: 0 },
+        { sourceFramework: ctx.sourceFramework ?? '', targetFramework: ctx.targetFramework ?? '', projectId: ctx.projectId },
+      );
+      // Inject spec summary into context for downstream AI calls
+      const specSummary = summarizeSpecForPrompt(appSpec);
+      ctx.structuralSummary = (ctx.structuralSummary ?? '') + '\n\n' + specSummary;
+      console.log(`[PIPELINE] Phase 2.5: AppSpec built — ${appSpec.screens.length} screens, ${appSpec.api.endpoints.length} endpoints, baseUrl=${appSpec.api.baseUrl || '(none)'}`);
+    } catch (specErr) {
+      console.warn(`[PIPELINE] Phase 2.5: AppSpec build failed — ${(specErr as Error).message} (continuing without spec)`);
+    }
     phaseStart('ir');
     logger.info({ jobId: ctx.jobId, tier }, '⚙️  Phase 3: IR Generation + Knowledge Graph');
     let irDocument: Awaited<ReturnType<IRGenerator['generate']>>;
@@ -498,6 +528,19 @@ export class ConversionPipeline {
       console.log(`[PIPELINE] Phase 9: Final import fix — ${finalReport.importsFixed} imports corrected, ${finalReport.importsUnresolved} unresolved`);
     }
 
+    // ── PHASE 6 (NOUVEAU): Content Validation — SHELL file detection ─────────
+    // RÈGLE ABSOLUE: Un fichier SHELL_401 ne compte JAMAIS comme converti.
+    logger.info({ jobId: ctx.jobId }, '🔬 Phase 6-CV: Content Validation (SHELL detection)');
+    const contentValidation: ContentValidationReport = validateAllFiles(
+      finalFiles,
+      ctx.sourceLanguage ?? 'dart',
+    );
+    console.log(formatContentReport(contentValidation));
+
+    // ── PHASE 7 (NOUVEAU): Static Validation ─────────────────────────────────
+    logger.info({ jobId: ctx.jobId }, '✅ Phase 7-SV: Static Validation');
+    void runStaticValidationSync; // Phase 7 static validation is run in Phase 12 block below
+
     // ── PHASE 28 STEP 10: Source ↔ Generated Comparison ─────────────────────
     // Comparaison granulaire: classes, fonctions, méthodes, services, repositories
     logger.info({ jobId: ctx.jobId }, '🔬 Phase 10 (Phase 28): Source ↔ Generated Comparison');
@@ -517,26 +560,68 @@ export class ConversionPipeline {
 
     // ── PHASE 28 STEP 11: Fusionner les scores (10 axes + comparateur) ───────
     // Le score final intègre les deux sources: score existant + comparateur granulaire
+    // CORRECTION SHELL-AWARE: pénaliser les axes dont les fichiers sont SHELL_401
     const comparatorBonus = fidelityComparison.scores.overall;
+
+    // Compute shell-aware adjustments
+    const shellServicesRatio = contentValidation.totalFiles > 0
+      ? contentValidation.files
+          .filter((f) => f.status === 'shell_401' && /service/i.test(f.path)).length /
+          Math.max(1, contentValidation.files.filter((f) => /service/i.test(f.path)).length)
+      : 0;
+    const shellStoresRatio = contentValidation.totalFiles > 0
+      ? contentValidation.files
+          .filter((f) => f.status === 'shell_401' && /store/i.test(f.path)).length /
+          Math.max(1, contentValidation.files.filter((f) => /store/i.test(f.path)).length)
+      : 0;
+    const shellModelsRatio = contentValidation.totalFiles > 0
+      ? contentValidation.files
+          .filter((f) => f.status === 'shell_401' && /types|model/i.test(f.path)).length /
+          Math.max(1, contentValidation.files.filter((f) => /types|model/i.test(f.path)).length)
+      : 0;
+
     const finalFidelityScore: IRFidelityScore = {
       ...autoCorrectionReport.finalScore > fidelityScore.overall
         ? { ...fidelityScore, overall: autoCorrectionReport.finalScore }
         : fidelityScore,
+      // Shell-aware axis overrides: if >50% of files for an axis are SHELL_401 → 0%
+      services: (fidelityScore.services !== null && shellServicesRatio > 0.5) ? 0 : (
+        fidelityScore.services !== null
+          ? Math.round(((fidelityScore.services ?? 0) + fidelityComparison.scores.services) / 2)
+          : null
+      ),
+      stores: (fidelityScore.stores !== null && shellStoresRatio > 0.5) ? 0 : fidelityScore.stores,
+      models: (fidelityScore.models !== null && shellModelsRatio > 0.5) ? 0 : (
+        fidelityScore.models !== null
+          ? Math.round(((fidelityScore.models ?? 0) + fidelityComparison.scores.models) / 2)
+          : null
+      ),
       // Intégrer les données du comparateur dans les axes existants (N/A-safe)
       businessLogic: fidelityScore.businessLogic !== null
         ? Math.round(((fidelityScore.businessLogic ?? 0) + fidelityComparison.scores.services) / 2)
         : null,
-      models: fidelityScore.models !== null
-        ? Math.round(((fidelityScore.models ?? 0) + fidelityComparison.scores.models) / 2)
-        : null,
       api: fidelityScore.api !== null
-        ? Math.round(((fidelityScore.api ?? 0) + fidelityComparison.scores.repositories) / 2)
+        ? (shellServicesRatio > 0.8 ? 0 : Math.round(((fidelityScore.api ?? 0) + fidelityComparison.scores.repositories) / 2))
         : null,
-      overall:       Math.round((
+      overall: Math.round((
         (autoCorrectionReport.finalScore > fidelityScore.overall ? autoCorrectionReport.finalScore : fidelityScore.overall) * 0.6
         + comparatorBonus * 0.4
       )),
     };
+
+    // CORRECTION: Recalculate overall from shell-aware axes
+    {
+      const weights: Record<string, number> = { businessLogic: 2.0, navigation: 1.5, api: 1.5, repositories: 1.0, services: 1.0, stores: 1.0, components: 1.0, models: 1.0, uiFidelity: 1.0, dataLayer: 1.0, assets: 0.5, functional: 1.0 };
+      let ws = 0, wt = 0;
+      for (const ax of fidelityScore.applicableAxes) {
+        const score = finalFidelityScore[ax as keyof IRFidelityScore] as number | null;
+        if (score !== null && score !== undefined) {
+          ws += score * (weights[ax] ?? 1.0);
+          wt += weights[ax] ?? 1.0;
+        }
+      }
+      if (wt > 0) finalFidelityScore.overall = Math.min(100, Math.round(ws / wt));
+    }
 
     console.log(`\n[PIPELINE] ===== PHASE 28 FINAL REPORT =====`);
     console.log(`[PIPELINE] Pipeline score (10-axes):   ${fidelityScore.overall}%`);
@@ -653,6 +738,28 @@ export class ConversionPipeline {
       console.warn(`[PIPELINE] Phase 8 ZIP: Packaging skipped — ${(zipErr as Error).message}`);
     }
 
+    // ── PHASE 12 (NOUVEAU): Delivery Check — READY vs NEEDS_REPAIR ───────────
+    logger.info({ jobId: ctx.jobId }, '🚦 Phase 12: Delivery Check (READY / NEEDS_REPAIR)');
+    const finalContentValidation = validateAllFiles(enhancedFiles, ctx.sourceLanguage ?? 'dart');
+    const staticVal = runStaticValidationSync(enhancedFiles, ctx.sourceLanguage ?? 'dart');
+    const deliveryCheck: DeliveryCheckResult = runDeliveryCheck(
+      enhancedFiles,
+      finalFidelityScore,
+      finalContentValidation,
+      {
+        tsCompilation:  { attempted: false, success: false, errors: [], warnings: [] },
+        brokenImports:  staticVal.brokenImports,
+        sourceImports:  staticVal.sourceImports,
+        emptyFiles:     staticVal.emptyFiles,
+        criticalTodos:  staticVal.criticalTodos,
+        undefinedRefs:  staticVal.undefinedRefs,
+        missingRoutes:  staticVal.missingRoutes,
+        overallPassed:  staticVal.overallPassed,
+      },
+      appSpec,
+    );
+    console.log(formatDeliveryReport(deliveryCheck));
+
     // ── PHASE 9 FINALE: Conversion Report ────────────────────────────────────
     logger.info({ jobId: ctx.jobId }, '📊 Phase Finale 9: Conversion Report');
     let conversionReportData: { text: string; json: string; markdown: string; html: string } | undefined;
@@ -684,6 +791,15 @@ export class ConversionPipeline {
       console.warn(`[PIPELINE] Phase 9 Report: Generation skipped — ${(rptErr as Error).message}`);
     }
 
+    // ── Phase 8 (fonctionnelle) — Génération test-results.json ───────────────
+    const testResults: TestResultsReport = buildFunctionalTestResults(
+      enhancedFiles,
+      finalFidelityScore,
+      finalContentValidation,
+      appSpec,
+    );
+    console.log(formatTestResultsReport(testResults));
+
     return {
       jobId:      ctx.jobId,
       ir:         validatedIR,
@@ -703,6 +819,14 @@ export class ConversionPipeline {
       // ── PHASE 23/28: Score fidélité composite + rapport auto-correction ─────
       fidelityScore:        finalFidelityScore,
       autoCorrectionReport,
+      // ── PHASE 2.5 (NOUVEAU): ApplicationSpec — source de vérité ─────────────
+      ...(appSpec !== undefined ? { applicationSpec: appSpec } : {}),
+      // ── PHASE 6 (NOUVEAU): Content Validation — SHELL detection ─────────────
+      contentValidation: finalContentValidation,
+      // ── PHASE 12 (NOUVEAU): Delivery Check — READY / NEEDS_REPAIR ───────────
+      deliveryCheck,
+      // ── PHASE 8 fonctionnelle (NOUVEAU): Résultats des tests fonctionnels ────
+      testResults,
       // ── PHASE FINALE: Compilation, ZIP, Rapport ─────────────────────────────
       ...(compilationResult ? {
         compilationResult: {
