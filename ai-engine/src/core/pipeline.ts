@@ -163,7 +163,18 @@ export class ConversionPipeline {
       return;
     }
 
+    // PHASE FINAL: Groq llama-3.3-70b-versatile a 131 072 tokens context window.
+    // Le sourceCode complet est conservé intact — la troncature sur Groq est supprimée.
+    // Chaque fichier source est injecté individuellement dans le prompt par FileGenerator.
+    // Seule limite: AST/IR analysis (50 000 chars max pour la phase initiale d'analyse)
     if (tier === 'free-groq') {
+      // Ne pas tronquer le sourceCode — FileGenerator l'utilise block par block
+      console.log(`[Pipeline] Groq tier: source code preserved intact (${ctx.sourceCode.length} chars) — FileGenerator handles per-file injection`);
+      return;
+    }
+
+    // Legacy path conservé uniquement pour compatibilité — never reached
+    if ((false as boolean) && (tier as string) === 'free-groq-legacy') {
       const limits = AIProvider.getLimits(tier);
       const totalChars = ctx.sourceCode.length;
 
@@ -227,7 +238,7 @@ export class ConversionPipeline {
 
       console.log(`[PIPELINE] FIX BUG#1 smart truncation — totalFiles=${allFileBlocks.length} keptFiles=${keptCount} chars=${newSourceCode.length}/${totalChars}`);
       ctx.sourceCode = newSourceCode;
-    }
+    } // end legacy path
   }
 
   // ── Main pipeline ─────────────────────────────────────────

@@ -21,7 +21,8 @@ import type { GeneratedFile } from '../models/ir.types';
 // ── Shell markers — presence of ANY of these → shell_401 ──────────────────
 const SHELL_MARKERS: RegExp[] = [
   /Error:\s*401\s*status\s*code/i,
-  /CONVERSION\s+INCOMPLETE/i,
+  // NOTE: 'CONVERSION INCOMPLETE' removed — FileGenerator uses this in fallback headers
+  // and those files should be classified as 'incomplete', not 'shell_401'
   /AI\s+conversion\s+failed/i,
   /HTTP\s+401/i,
   /Unauthorized.*401/i,

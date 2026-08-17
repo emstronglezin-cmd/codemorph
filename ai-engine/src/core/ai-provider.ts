@@ -1,8 +1,9 @@
 // ============================================================
 // CodeMorph AI Engine — AI Provider (Hybrid: Free + Pro)
 //
-// Mode FREE  : Groq API (Llama 3.1 8B Instant) — gratuit jusqu'à
-//              14 400 req/jour, latence <1s, API OpenAI-compatible
+// Mode FREE  : Groq API (Llama 3.3 70B Versatile) — gratuit jusqu'à
+//              14 400 req/jour, latence ~1-2s, API OpenAI-compatible
+//              Context window 131 072 tokens — parfait pour gros projets
 //              Fallback statique si GROQ_API_KEY absent
 //
 // Mode PRO   : Clé OpenAI (gpt-4o / gpt-4o-mini) fournie par l'user
@@ -48,11 +49,23 @@ export class AIProvider {
   }
 
   // ── Tier resolution ─────────────────────────────────────────────────────────
+  //
+  // PRIORITÉ: userOpenAI > userAnthropic > Groq > platform > static
+  //
+  // IMPORTANT: La clé OPENAI_API_KEY injectée par le sandbox Genspark
+  // (nFWgUyFVciWjpuCjWdOAVDCHMPBekwWJ) est un token de session non créditée
+  // qui retourne HTTP 401 sur tous les appels de génération.
+  // On la détecte et on skip automatiquement vers Groq.
+  //
+  // Groq llama-3.3-70b-versatile: 131 072 tokens context, gratuit, rapide.
   private resolveTier(): AITier {
-    if (this.userOpenAIKey)                      return 'pro-openai';
-    if (this.userAnthropicKey)                   return 'pro-anthropic';
-    if (appConfig.openaiApiKey)                  return 'platform';
-    if (process.env['GROQ_API_KEY'])             return 'free-groq';
+    if (this.userOpenAIKey)    return 'pro-openai';
+    if (this.userAnthropicKey) return 'pro-anthropic';
+    // Groq prioritaire sur Platform — Groq est le provider primary fonctionnel
+    if (process.env['GROQ_API_KEY']) return 'free-groq';
+    // Platform uniquement si Groq absent ET clé OpenAI valide (commence par 'sk-')
+    const openaiKey = appConfig.openaiApiKey;
+    if (openaiKey && openaiKey.startsWith('sk-')) return 'platform';
     return 'static';
   }
 
@@ -61,7 +74,7 @@ export class AIProvider {
       case 'pro-openai':    return this.userOpenAIKey?.includes('sk-') ? 'gpt-4o' : 'gpt-4o-mini';
       case 'pro-anthropic': return 'claude-3-5-sonnet-20241022';
       case 'platform':      return appConfig.defaultModel ?? 'gpt-4o-mini';
-      case 'free-groq':     return 'llama-3.1-8b-instant';
+      case 'free-groq':     return 'llama-3.3-70b-versatile';
       default:              return 'static';
     }
   }
@@ -74,8 +87,8 @@ export class AIProvider {
     switch (tier) {
       case 'pro-openai':    return { maxInputChars: 200_000, maxTokens: 8192 };
       case 'pro-anthropic': return { maxInputChars: 200_000, maxTokens: 8192 };
-      case 'platform':      return { maxInputChars: 50_000,  maxTokens: 4096 };
-      case 'free-groq':     return { maxInputChars: 15_000,  maxTokens: 2048 };
+      case 'platform':      return { maxInputChars: 80_000,  maxTokens: 8192 };
+      case 'free-groq':     return { maxInputChars: 80_000,  maxTokens: 4096 };
       case 'static':        return { maxInputChars: 5_000,   maxTokens: 0    };
     }
   }

@@ -59,10 +59,15 @@ async function bootstrap(): Promise<void> {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   app.use(errorHandler as any);
 
-  app.listen(port, '0.0.0.0', () => {
+  const server = app.listen(port, '0.0.0.0', () => {
     logger.info(`🤖 CodeMorph AI Engine running on http://0.0.0.0:${port}`);
     logger.info(`📦 Supported: Flutter→React, Flutter→RN, Express→NestJS, Node→NestJS`);
   });
+  // Augmenter le timeout serveur pour les grosses conversions Groq (34+ fichiers)
+  // Groq llama-3.3-70b: ~2-3s par fichier × 34 fichiers ≈ 90-120s
+  server.timeout         = 600_000; // 10 minutes
+  server.keepAliveTimeout = 620_000;
+  server.headersTimeout   = 630_000;
 }
 
 bootstrap().catch((err) => {

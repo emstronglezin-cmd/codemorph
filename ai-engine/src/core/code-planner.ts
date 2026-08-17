@@ -17,6 +17,12 @@ import {
   extractAndConvertBusinessLayers,
   formatExtractionReport,
 } from './business-layer-extractor';
+// PHASE FINAL: File Generator — génération fidèle fichier par fichier
+import {
+  generateFileBatch,
+  extractSourceBlocks,
+  type FileGenerationRequest,
+} from './file-generator';
 
 export interface CodePlan {
   files:   GeneratedFile[];
@@ -340,28 +346,32 @@ export class CodePlanner {
       });
     }
 
-    // ── PHASE 29: Business Layer Extraction & Direct Conversion ───────────────
-    // Si du code source est disponible, convertir directement les couches métier
-    // au lieu de se baser uniquement sur les métadonnées IR
+    // ── PHASE FINAL: File Generator + Business Layer Extraction ──────────────
+    // Stratégie unifiée: analyser le source block par block,
+    // puis générer CHAQUE fichier individuellement avec le source complet injecté.
     if (ctx.sourceCode && ctx.sourceCode.length > 500) {
-      console.log(`\n[CodePlanner] PHASE 29 — Business Layer Direct Conversion from source code...`);
+      console.log(`\n[CodePlanner] PHASE FINAL — Per-file faithful generation from source code...`);
       try {
+        const sourceBlocks = extractSourceBlocks(ctx.sourceCode);
+        console.log(`[CodePlanner] Extracted ${sourceBlocks.length} source blocks`);
+
+        // ── ÉTAPE 1: Business Layer (services, stores, repositories, models, utils) ──
         const bizResult = await extractAndConvertBusinessLayers(
           ctx.sourceCode,
           this.ai,
           ctx.targetFramework ?? 'react-native',
         );
-
         console.log(formatExtractionReport(bizResult));
 
-        // Intégrer les fichiers convertis — remplacer les doublons IR ou ajouter
         const existingPaths = new Set(files.map((f) => f.path));
         let newFilesCount = 0;
         let replacedCount = 0;
 
         for (const converted of bizResult.convertedFiles) {
+          // Accepter même les fichiers partiellement convertis (success=false mais contenu >50 chars)
+          // Les stubs IR (generateZustandStore, generateTypeInterface) sont TOUJOURS remplacés
+          // car BizLayerExtractor a accès au vrai code source
           if (!converted.content || converted.content.length < 50) continue;
-
           const genFile: GeneratedFile = {
             path:     converted.targetPath,
             content:  converted.content,
@@ -369,24 +379,109 @@ export class CodePlanner {
             fromPath: converted.sourcePath,
             warnings: converted.success ? [] : [`Conversion incomplete — ${converted.error ?? 'unknown error'}`],
           };
-
           if (existingPaths.has(converted.targetPath)) {
-            // Remplacer l'entrée IR par la version source directe (meilleure fidélité)
             const idx = files.findIndex((f) => f.path === converted.targetPath);
-            if (idx >= 0) {
-              files[idx] = genFile;
-              replacedCount++;
-            }
+            // Remplacer TOUJOURS le stub IR par la version BizLayer (source réelle convertie)
+            if (idx >= 0) { files[idx] = genFile; replacedCount++; }
           } else {
             files.push(genFile);
             existingPaths.add(converted.targetPath);
             newFilesCount++;
           }
         }
+        console.log(`[CodePlanner] BizLayer: ${newFilesCount} new + ${replacedCount} replaced (${bizResult.successCount}/${bizResult.totalFiles} success)`);
+        // Log des fichiers remplacés pour diagnostic
+        if (replacedCount > 0) {
+          console.log(`[CodePlanner] ✅ BizLayer replaced ${replacedCount} IR stubs with real converted source`);
+        }
 
-        console.log(`[CodePlanner] PHASE 29 business layers: ${newFilesCount} new + ${replacedCount} replaced (${bizResult.successCount} successful conversions)`);
+        // ── ÉTAPE 2: Screens — générer fichier par fichier avec source complet ──
+        // Identifier les écrans screen/* page/* view/* qui n'ont pas encore été
+        // générés ou qui sont des fallbacks (contenu < 200 chars)
+        const screenBlocks = sourceBlocks.filter((b) =>
+          /(?:screen|page|view)\//i.test(b.path) ||
+          /(?:screen|page|view)\./i.test(b.path.split('/').pop() ?? ''),
+        );
+
+        if (screenBlocks.length > 0) {
+          console.log(`\n[CodePlanner] PHASE FINAL Step 2 — Generating ${screenBlocks.length} screens file-by-file...`);
+
+          const screenRequests: FileGenerationRequest[] = screenBlocks.map((block) => {
+            const baseName = block.path.split('/').pop()?.replace(/\.[^.]+$/, '') ?? 'Screen';
+            const screenName = baseName
+              .split(/[_\-]/).map((p) => p.charAt(0).toUpperCase() + p.slice(1)).join('');
+            const slug = screenName.replace(/Screen$/i, '').toLowerCase();
+            const targetPath = `app/${slug}.tsx`;
+
+            return {
+              name:            screenName,
+              targetPath,
+              fileType:        'screen' as const,
+              sourceContent:   block.content,
+              sourcePath:      block.path,
+              targetFramework: ctx.targetFramework ?? 'react-native',
+              ...(ctx.structuralSummary ? { context: ctx.structuralSummary.slice(0, 500) } : {}),
+            };
+          });
+
+          const screenBatch = await generateFileBatch(screenRequests, this.ai);
+
+          for (const genResult of screenBatch.files) {
+            const genFile: GeneratedFile = {
+              path:     genResult.path,
+              content:  genResult.content,
+              language: 'typescript',
+              fromPath: genResult.fromPath,
+              warnings: genResult.warnings,
+            };
+            if (existingPaths.has(genResult.path)) {
+              // Remplacer TOUJOURS si FileGenerator a produit du contenu valide
+              // (même si l'IR stub était non-vide — il ne contient que du scaffold générique)
+              const idx = files.findIndex((f) => f.path === genResult.path);
+              if (idx >= 0 && genResult.content.length > 50) {
+                files[idx] = genFile;
+                replacedCount++;
+              }
+            } else {
+              files.push(genFile);
+              existingPaths.add(genResult.path);
+              newFilesCount++;
+            }
+          }
+          console.log(`[CodePlanner] Screens: ${screenBatch.successCount}/${screenBatch.totalFiles} success`);
+        }
+
+        // ── ÉTAPE 3: Composants non encore générés ──────────────────────────────
+        const widgetBlocks = sourceBlocks.filter((b) =>
+          /(?:widget|component)\//i.test(b.path) && !existingPaths.has(b.path),
+        );
+        if (widgetBlocks.length > 0) {
+          console.log(`\n[CodePlanner] PHASE FINAL Step 3 — Generating ${widgetBlocks.length} components...`);
+          const compRequests: FileGenerationRequest[] = widgetBlocks.map((block) => {
+            const baseName = block.path.split('/').pop()?.replace(/\.[^.]+$/, '') ?? 'Component';
+            const compName = baseName.split(/[_\-]/).map((p) => p.charAt(0).toUpperCase() + p.slice(1)).join('');
+            return {
+              name:            compName,
+              targetPath:      `src/components/${compName}.tsx`,
+              fileType:        'component' as const,
+              sourceContent:   block.content,
+              sourcePath:      block.path,
+              targetFramework: ctx.targetFramework ?? 'react-native',
+            };
+          });
+          const compBatch = await generateFileBatch(compRequests, this.ai);
+          for (const genResult of compBatch.files) {
+            if (!existingPaths.has(genResult.path)) {
+              files.push({ path: genResult.path, content: genResult.content, language: 'typescript', fromPath: genResult.fromPath, warnings: genResult.warnings });
+              existingPaths.add(genResult.path);
+              newFilesCount++;
+            }
+          }
+          console.log(`[CodePlanner] Components: ${compBatch.successCount}/${compBatch.totalFiles} success`);
+        }
+
       } catch (bizErr) {
-        console.warn(`[CodePlanner] PHASE 29 business layer extraction failed: ${(bizErr as Error).message} — using IR-based services only`);
+        console.warn(`[CodePlanner] PHASE FINAL failed: ${(bizErr as Error).message} — using IR-based files only`);
       }
     }
 
