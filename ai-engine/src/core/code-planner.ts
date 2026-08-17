@@ -485,11 +485,27 @@ export class CodePlanner {
       }
     }
 
-    // ── Constants & config ─────────────────────────────────
+    // ── Constants & config — avec URL API extraite du source ───────────────
+    const realApiUrl = ctx.sourceCode
+      ? this.extractApiBaseUrl(ctx.sourceCode)
+      : null;
+
+    const envContent = realApiUrl
+      ? `EXPO_PUBLIC_API_URL=${realApiUrl}\nEXPO_PUBLIC_APP_NAME=${ctx.projectId ?? 'MyApp'}\n`
+      : RN_ENV_EXAMPLE;
+
+    const constantsContent = realApiUrl
+      ? `export const APP_NAME   = process.env['EXPO_PUBLIC_APP_NAME'] ?? '${ctx.projectId ?? 'My App'}';\nexport const API_URL    = process.env['EXPO_PUBLIC_API_URL'] ?? '${realApiUrl}';\nexport const TOKEN_KEY  = 'auth_token';\nexport const USER_KEY   = 'auth_user';\n`
+      : RN_CONSTANTS;
+
+    if (realApiUrl) {
+      console.log(`[CodePlanner] ✅ Real API URL extracted from source: ${realApiUrl}`);
+    }
+
     files.push(
-      this.staticFile('src/constants/index.ts', RN_CONSTANTS),
+      this.staticFile('src/constants/index.ts', constantsContent),
       this.staticFile('src/types/index.ts',     RN_TYPES_INDEX),
-      this.staticFile('.env.example',           RN_ENV_EXAMPLE),
+      this.staticFile('.env.example',           envContent),
       this.staticFile('README.md',              this.generateRNReadme(ctx, files.length + 3)),
     );
 
@@ -2126,6 +2142,35 @@ export function ${name}({ className, children, ...props }: ${name}Props): React.
   }
 
   private pascal(str: string): string { return str.charAt(0).toUpperCase() + str.slice(1); }
+
+  /** Extrait l'URL de base API réelle depuis le code source Dart/Flutter */
+  private extractApiBaseUrl(sourceCode: string): string | null {
+    // Patterns courants dans les projets Flutter/Dart
+    const patterns = [
+      // Dio / http client: baseUrl: 'https://...'
+      /baseUrl\s*[=:]\s*['"]?(https?:\/\/[^'")\s,;]+)/i,
+      // static const / final String apiBaseUrl = '...'
+      /(?:apiBaseUrl|baseUrl|apiUrl|BASE_URL|kBaseUrl|kApiUrl)\s*=\s*['"]?(https?:\/\/[^'")\s,;]+)/i,
+      // String.fromEnvironment avec defaultValue
+      /defaultValue:\s*['"]?(https?:\/\/[^'")\s,;]+)/i,
+      // Uri.parse('https://...')
+      /Uri\.parse\s*\(\s*['"]?(https?:\/\/[^'")\s,;]+)/i,
+      // const/final url = 'https://...'
+      /(?:url|endpoint|host)\s*[=:]\s*['"]?(https?:\/\/[^'")\s,;]+)/i,
+    ];
+
+    for (const pattern of patterns) {
+      const match = sourceCode.match(pattern);
+      if (match?.[1]) {
+        const url = match[1].replace(/\/+$/, ''); // supprimer trailing slash
+        // Filtrer les URLs de dev évidentes
+        if (!url.includes('localhost') && !url.includes('127.0.0.1') && !url.includes('10.0.2.2')) {
+          return url;
+        }
+      }
+    }
+    return null;
+  }
   private methodDecorator(m: string): string { return { GET: 'Get', POST: 'Post', PUT: 'Put', PATCH: 'Patch', DELETE: 'Delete' }[m] ?? 'Get'; }
   private dartTypeToTS(type: string): string {
     const map: Record<string, string> = { String: 'string', int: 'number', double: 'number', bool: 'boolean', dynamic: 'unknown', List: 'unknown[]', Map: 'Record<string,unknown>' };

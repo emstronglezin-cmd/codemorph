@@ -120,7 +120,11 @@ export function validateFileContent(
   }
 
   // ── Check: empty ──────────────────────────────────────────────────────────
-  if (!content.trim() || linesCode === 0) {
+  // RÈGLE: 'empty' = contenu absent ou trivial (< 10 chars non-blancs)
+  // Un fichier entièrement composé de commentaires TODO/fallback = 'incomplete'
+  // (le contenu source est préservé en commentaires — mieux que rien)
+  const trimmedContent = content.trim();
+  if (!trimmedContent || trimmedContent.length < 10) {
     return {
       path, status: 'empty', language: file.language,
       linesTotal, linesCode: 0, todosCount: 0, placeholdersCount: 0,

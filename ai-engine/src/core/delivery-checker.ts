@@ -31,19 +31,23 @@ const CRITICAL_FILE_PATTERNS: Array<{ pattern: RegExp; category: string }> = [
 
 // ── Check: has real navigation ────────────────────────────────────────────────
 function checkNavigation(files: GeneratedFile[]): { pass: boolean; detail: string } {
-  const layoutFile    = files.find((f) => /_layout\.tsx?$/.test(f.path));
+  // Prioriser app/_layout.tsx (root layout Stack) sur app/(tabs)/_layout.tsx (tabs layout)
+  const rootLayoutFile = files.find((f) => /^app\/_layout\.tsx?$/.test(f.path));
+  const anyLayoutFile  = files.find((f) => /_layout\.tsx?$/.test(f.path));
+  const layoutFile     = rootLayoutFile ?? anyLayoutFile;
+
   const hasNavContent = layoutFile
     ? layoutFile.content.includes('Stack.Screen') || layoutFile.content.includes('Tab.Screen') || layoutFile.content.includes('Drawer.Navigator')
     : false;
-  
+
   if (!layoutFile) {
     return { pass: false, detail: 'No _layout.tsx / navigation root file found' };
   }
   if (!hasNavContent) {
-    return { pass: false, detail: '_layout.tsx exists but has no Screen definitions' };
+    return { pass: false, detail: `${layoutFile.path} exists but has no Screen definitions` };
   }
   const screenCount = (layoutFile.content.match(/Stack\.Screen|Tab\.Screen/g) ?? []).length;
-  return { pass: true, detail: `Navigation root found with ${screenCount} screen(s)` };
+  return { pass: true, detail: `Navigation root (${layoutFile.path}) found with ${screenCount} screen(s)` };
 }
 
 // ── Check: API layer is present ───────────────────────────────────────────────
