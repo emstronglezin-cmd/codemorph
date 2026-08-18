@@ -1,9 +1,9 @@
 // ============================================================
 // CodeMorph AI Engine — AI Provider (Hybrid: Free + Pro)
 //
-// Mode FREE  : Groq API (Llama 3.3 70B Versatile) — gratuit jusqu'à
-//              14 400 req/jour, latence ~1-2s, API OpenAI-compatible
-//              Context window 131 072 tokens — parfait pour gros projets
+// Mode FREE  : Groq API — openai/gpt-oss-120b (120B, ~gratuit, rapide)
+//              Modèle principal disponible sur l'API Groq 2025
+//              Context window large — parfait pour gros projets Flutter
 //              Fallback statique si GROQ_API_KEY absent
 //
 // Mode PRO   : Clé OpenAI (gpt-4o / gpt-4o-mini) fournie par l'user
@@ -12,6 +12,11 @@
 // Mode PRO MAX: Clé Anthropic (claude-3-5-sonnet) fournie par l'user
 //
 // Priorité: userOpenAI > userAnthropic > gpt-4o (platform) > groq > static
+//
+// Modèles Groq disponibles (2026-08) :
+//   openai/gpt-oss-120b  ← PRIMARY  (meilleur pour code)
+//   qwen/qwen3.6-27b     ← FALLBACK (produit <think> tags — strippé)
+//   allam-2-7b           ← EMERGENCY
 // ============================================================
 
 import OpenAI from 'openai';
@@ -74,7 +79,9 @@ export class AIProvider {
       case 'pro-openai':    return this.userOpenAIKey?.includes('sk-') ? 'gpt-4o' : 'gpt-4o-mini';
       case 'pro-anthropic': return 'claude-3-5-sonnet-20241022';
       case 'platform':      return appConfig.defaultModel ?? 'gpt-4o-mini';
-      case 'free-groq':     return 'llama-3.3-70b-versatile';
+      // openai/gpt-oss-120b = meilleur modèle disponible sur Groq en 2026
+      // llama-3.3-70b-versatile n'est plus disponible sur cette clé
+      case 'free-groq':     return 'openai/gpt-oss-120b';
       default:              return 'static';
     }
   }
@@ -83,12 +90,14 @@ export class AIProvider {
   getModel(): string { return this.model; }
 
   // ── Limits per tier (applied by ConversionContext in pipeline) ──────────────
+  // IMPORTANT: Groq free tier = 8000 TPM (tokens/minute) pour tous les modèles.
+  // max_tokens GROQ doit rester ≤ 3000 pour permettre 2-3 req/min sans 429.
   static getLimits(tier: AITier): { maxInputChars: number; maxTokens: number } {
     switch (tier) {
       case 'pro-openai':    return { maxInputChars: 200_000, maxTokens: 8192 };
       case 'pro-anthropic': return { maxInputChars: 200_000, maxTokens: 8192 };
       case 'platform':      return { maxInputChars: 80_000,  maxTokens: 8192 };
-      case 'free-groq':     return { maxInputChars: 80_000,  maxTokens: 4096 };
+      case 'free-groq':     return { maxInputChars: 80_000,  maxTokens: 3000 };
       case 'static':        return { maxInputChars: 5_000,   maxTokens: 0    };
     }
   }
@@ -130,23 +139,62 @@ export class AIProvider {
   }
 
   private async groqChat(messages: ChatMessage[], maxTokens: number): Promise<AIResponse> {
-    // Groq is fully OpenAI-compatible — use OpenAI SDK with custom baseURL
+    // Groq free tier = 8000 TPM — cap max_tokens pour rester dans les limites
+    // openai/gpt-oss-120b = primary, openai/gpt-oss-20b = fallback si 429
+    const GROQ_MAX_TOKENS = Math.min(maxTokens, 3000);
     const client = new OpenAI({
       apiKey:  process.env['GROQ_API_KEY']!,
       baseURL: 'https://api.groq.com/openai/v1',
     });
-    const res = await client.chat.completions.create({
-      model:       this.model,
-      messages,
-      max_tokens:  maxTokens,
-      temperature: appConfig.temperature,
-    });
-    return {
-      content:    res.choices[0]?.message?.content ?? '',
-      tokensUsed: res.usage?.total_tokens ?? 0,
-      tier:       'free-groq',
-      model:      this.model,
-    };
+
+    // Modèles à essayer en cascade si 429
+    const GROQ_MODELS = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b'];
+    let lastError: Error | null = null;
+
+    for (const modelId of GROQ_MODELS) {
+      // Retry avec backoff exponentiel (3 tentatives max)
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          const res = await client.chat.completions.create({
+            model:       modelId,
+            messages,
+            max_tokens:  GROQ_MAX_TOKENS,
+            temperature: appConfig.temperature,
+          });
+          let rawContent = res.choices[0]?.message?.content ?? '';
+          // Stripping <think>...</think> (qwen3.6-27b reasoning mode)
+          rawContent = rawContent.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
+          if (modelId !== this.model) {
+            console.log(`[AIProvider] Groq fallback succeeded with ${modelId} (primary ${this.model} was rate-limited)`);
+          }
+          return {
+            content:    rawContent,
+            tokensUsed: res.usage?.total_tokens ?? 0,
+            tier:       'free-groq',
+            model:      modelId,
+          };
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          const is429 = msg.includes('429') || msg.includes('rate limit') || msg.includes('Rate limit');
+          if (is429) {
+            // Extraire le délai Retry-After si présent dans le message
+            const retryMatch = msg.match(/(\d+(?:\.\d+)?)s/);
+            const waitSec = retryMatch?.[1] ? Math.min(parseFloat(retryMatch[1]) + 2, 45) : (attempt + 1) * 15;
+            console.warn(`[AIProvider] Groq 429 on ${modelId} attempt ${attempt+1}/3 — waiting ${waitSec}s...`);
+            await new Promise((r) => setTimeout(r, waitSec * 1000));
+            lastError = err instanceof Error ? err : new Error(msg);
+            // Après 2 tentatives sur 120b, passer au 20b
+            if (attempt >= 1 && modelId === GROQ_MODELS[0]) break;
+          } else {
+            // Erreur non-429 — propager immédiatement
+            throw err;
+          }
+        }
+      }
+    }
+
+    // Tous les modèles ont échoué
+    throw lastError ?? new Error('Groq: all models exhausted');
   }
 
   // ── Anthropic ────────────────────────────────────────────────────────────────

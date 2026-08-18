@@ -65,6 +65,12 @@ const PLACEHOLDER_PATTERNS   = [
   /throw UnimplementedError\(\)/,
   /console\.log\('TODO'\)/i,
 ];
+// Patterns indiquant un output de fallback chunker (source préservée en commentaires)
+const CHUNKER_FALLBACK_PATTERNS = [
+  /\/\/ TODO\(codeMorph\): CONVERSION INCOMPLETE/,
+  /\/\*[\s\S]*?ORIGINAL SOURCE \(dart\)/,
+  /\/\/ TODO: Implement .+ in react-native\/typescript/,
+];
 const VALID_EXPORT_RE        = /export\s+(default|const|function|class|interface|type|enum)\s+\w/;
 const MIN_PRESERVATION_RATIO = 0.25; // au moins 25% des lignes source
 
@@ -84,7 +90,27 @@ function isOutputValid(
     return { valid: false, reason: 'markdown fence residual detected' };
   }
 
-  const lines = content.split('\n').filter((l) => l.trim().length > 0);
+  // Détecter output chunker-fallback: source Dart préservée en commentaires /* */
+  // Ces fichiers ont 0% de code TypeScript réel — invalides même si longs
+  for (const pat of CHUNKER_FALLBACK_PATTERNS) {
+    if (pat.test(content)) {
+      return { valid: false, reason: 'output is chunker fallback (dart source in comments — not real TypeScript)' };
+    }
+  }
+
+  const allLines  = content.split('\n');
+  const codeLines = allLines.filter((l) => {
+    const t = l.trim();
+    return t.length > 0 && !t.startsWith('//') && !t.startsWith('*') && !t.startsWith('/*') && !t.startsWith('#');
+  });
+
+  // Un output avec moins de 5 lignes de vrai code TypeScript est invalide
+  // (même si le fichier est long — c'est du rembourrage de commentaires)
+  if (codeLines.length < 5 && fileType !== 'config') {
+    return { valid: false, reason: `only ${codeLines.length} real code lines (rest is comments/stubs)` };
+  }
+
+  const lines = allLines.filter((l) => l.trim().length > 0);
 
   // Vérifier ratio de préservation (sauf pour configs et utils courts)
   if (sourceLines > 20 && !['config', 'util', 'hook'].includes(fileType)) {
@@ -214,12 +240,19 @@ IMPORTS TO USE (${framework}):
 - Types: import type { XxxModel } from '../types/xxx.types'`;
 }
 
-function buildUserPrompt(req: FileGenerationRequest): string {
-  const truncatedSource = req.sourceContent.length > 12000
-    ? req.sourceContent.slice(0, 12000) + '\n// [source truncated — remaining logic should follow same patterns]'
+function buildUserPrompt(req: FileGenerationRequest, attempt = 0): string {
+  // Augmentation de la fenêtre source: 20k chars pour Groq 70b (131k context)
+  // Le prompt complet (system + user) fait ~24k chars maximum
+  const MAX_SOURCE_CHARS = 20_000;
+  const truncatedSource = req.sourceContent.length > MAX_SOURCE_CHARS
+    ? req.sourceContent.slice(0, MAX_SOURCE_CHARS) + `\n// [source truncated at ${MAX_SOURCE_CHARS} chars — implement remaining methods following the same patterns]`
     : req.sourceContent;
 
-  return `Convert the following Dart/Flutter ${req.fileType} to ${req.targetFramework}.
+  const retryWarning = attempt > 0
+    ? `\n\nCRITICAL: Previous attempt returned ONLY comments or TODO stubs — that is WRONG.\nYou MUST output real TypeScript/TSX code, not Dart code in comment blocks.\nEvery method from the source must be implemented in TypeScript. No /* dart source */ blocks.\n`
+    : '';
+
+  return `Convert the following Dart/Flutter ${req.fileType} to ${req.targetFramework}.${retryWarning}
 
 TARGET FILE: ${req.targetPath}
 SOURCE FILE: ${req.sourcePath}
@@ -230,7 +263,9 @@ ${truncatedSource}
 \`\`\`
 ${req.context ? `\nADDITIONAL CONTEXT:\n${req.context}\n` : ''}
 Output ONLY the complete TypeScript file content for ${req.targetPath}.
-Do not include any markdown, explanations, or file path headers.`;
+Do NOT wrap the source in /* */ comment blocks.
+Do not include any markdown fences, explanations, or file path headers.
+Every function/method from the Dart source must appear as real TypeScript code.`;
 }
 
 // ── Générateur principal ───────────────────────────────────────────────────
@@ -288,34 +323,31 @@ export async function generateSingleFile(
 
   // Génération directe avec retry
   const system = buildSystemPrompt(req.fileType, req.targetFramework);
-  const user   = buildUserPrompt(req);
 
   const maxTokens = tier === 'free-groq' ? 4096
     : tier === 'platform'  ? 8192
     : 8192;
 
-  let lastContent = '';
   const MAX_RETRIES = 2;
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     if (attempt > 0) {
       // Délai avant retry
-      const retryDelay = attempt * 1000;
+      const retryDelay = attempt * 1500;
       console.log(`[FileGenerator] Retry ${attempt}/${MAX_RETRIES} for "${req.name}" in ${retryDelay}ms...`);
       await new Promise((r) => setTimeout(r, retryDelay));
     }
 
-    try {
-      const userMsg = attempt === 0 ? user
-        : `${user}\n\nPREVIOUS ATTEMPT WAS INCOMPLETE (${lastContent.length} chars). Generate the COMPLETE file now. Every method must be fully implemented.`;
+    // buildUserPrompt avec l'index d'attempt pour renforcer le message sur retry
+    const userMsg = buildUserPrompt(req, attempt);
 
+    try {
       const res = await ai.chat(
         [{ role: 'system', content: system }, { role: 'user', content: userMsg }],
         maxTokens,
       );
 
       let content = res.content || '';
-      lastContent = content;
 
       // Nettoyage des fences markdown
       const cleanResult = cleanLLMOutput(content, `file:${req.name}`);

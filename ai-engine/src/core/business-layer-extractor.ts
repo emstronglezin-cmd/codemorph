@@ -767,27 +767,58 @@ export async function convertBusinessLayerFile(
       hadChunking = true;
       todosInserted = assemblyResult.todosInserted;
     } else {
-      // Conversion directe
+      // Conversion directe avec retry renforcé
       const { system, user } = buildConversionPrompt(file, targetFramework, targetPath);
 
       // Budget tokens selon le tier — plus large pour gros fichiers
-      const maxResponseTokens = tier === 'free-groq' ? 4096
+      const maxResponseTokens = tier === 'free-groq' ? 2800
         : tier === 'platform' ? 8192
         : 8192; // pro tiers
 
-      // Retry avec backoff exponentiel si le résultat est vide ou trop court
+      // Helper pour détecter un output de fallback-chunker (source Dart en commentaires)
+      const isChunkerFallback = (text: string): boolean =>
+        /\/\/ TODO\(codeMorph\): CONVERSION INCOMPLETE/.test(text) ||
+        /\/\*[\s\S]*?ORIGINAL SOURCE \(dart\)/.test(text);
+
+      // Helper pour compter les lignes de vrai code (non-commentaires)
+      const countCodeLines = (text: string): number =>
+        text.split('\n').filter((l) => {
+          const t = l.trim();
+          return t.length > 0 && !t.startsWith('//') && !t.startsWith('*') && !t.startsWith('/*');
+        }).length;
+
       const MIN_OUTPUT_CHARS = Math.max(50, Math.floor(file.charCount * 0.2));
+      const MIN_CODE_LINES   = Math.max(5, Math.floor(file.lineCount * 0.15));
+
       let res = await ai.chat(
         [{ role: 'system', content: system }, { role: 'user', content: user }],
         maxResponseTokens,
       );
       content = res.content || '';
 
-      // Retry si output vide ou suspicieusement court
-      if (content.length < MIN_OUTPUT_CHARS && (tier as string) !== 'static') {
-        console.warn(`[BizLayerExtractor] ⚠️  Output too short (${content.length}/${MIN_OUTPUT_CHARS} chars) for "${file.path}" — retrying with stronger prompt...`);
-        await new Promise((r) => setTimeout(r, 1000));
-        const retryUser = `${user}\n\nIMPORTANT: The previous response was incomplete. Output the FULL TypeScript file now. Do not truncate.`;
+      // Retry si: output trop court OU chunker-fallback détecté OU trop peu de lignes de code
+      const needsRetry = (text: string): boolean =>
+        text.length < MIN_OUTPUT_CHARS ||
+        isChunkerFallback(text) ||
+        (file.lineCount > 20 && countCodeLines(text) < MIN_CODE_LINES);
+
+      if (needsRetry(content) && (tier as string) !== 'static') {
+        const reason = isChunkerFallback(content)
+          ? 'output is Dart source in comment blocks (chunker fallback)'
+          : countCodeLines(content) < MIN_CODE_LINES
+            ? `only ${countCodeLines(content)} code lines (need ${MIN_CODE_LINES})`
+            : `too short (${content.length}/${MIN_OUTPUT_CHARS} chars)`;
+
+        console.warn(`[BizLayerExtractor] ⚠️  Retry for "${file.path}": ${reason}`);
+        await new Promise((r) => setTimeout(r, 1200));
+
+        const retryUser = `${user}
+
+CRITICAL: Your previous response was WRONG — you returned Dart source code wrapped in /* */ comment blocks, or empty stubs.
+You MUST output REAL TypeScript code. Every method, class, and function from the Dart source must be implemented in TypeScript.
+Do NOT use /* dart source */ block comments. Do NOT use "TODO: Implement" stubs.
+Output the complete, working TypeScript file now.`;
+
         res = await ai.chat(
           [{ role: 'system', content: system }, { role: 'user', content: retryUser }],
           maxResponseTokens,
@@ -912,9 +943,10 @@ export async function extractAndConvertBusinessLayers(
   let successCount = 0;
   let failedCount = 0;
 
-  // Groq: pause entre les appels pour éviter le rate limit
-  // llama-3.3-70b-versatile: ~300 req/min → 200ms entre appels
-  const GROQ_DELAY_MS = 200;
+  // Groq free tier: 8000 TPM → avec ~3000 tokens/req, max ~2 req/min
+  // Délai conservateur: 22s entre appels pour rester sous la limite
+  // Le retry 429 dans ai-provider.ts gère les dépassements résiduels
+  const GROQ_DELAY_MS = 22_000;
 
   for (let i = 0; i < filesToProcess.length; i++) {
     const file = filesToProcess[i]!;

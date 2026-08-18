@@ -201,12 +201,22 @@ export function validateFileContent(
     const notImplPenalty = Math.min(40, notImplementedCount * 20);
     // Penalty for source imports
     const sourceImportPenalty = Math.min(50, sourceImports.length * 15);
+    // Penalty lourde si le fichier contient des blocs de source Dart préservée en commentaires
+    // (signe d'un output chunker-fallback non converti)
+    const hasChunkerFallback = /\/\/ TODO\(codeMorph\): CONVERSION INCOMPLETE/.test(content) ||
+                               /\/\*[\s\S]*?ORIGINAL SOURCE \(dart\)/.test(content);
+    const chunkerFallbackPenalty = hasChunkerFallback ? 60 : 0;
 
-    const rawScore = Math.round(codeRatio * 100) - todoPenalty - placeholderPenalty - notImplPenalty - sourceImportPenalty;
+    const rawScore = Math.round(codeRatio * 100) - todoPenalty - placeholderPenalty - notImplPenalty - sourceImportPenalty - chunkerFallbackPenalty;
     score = Math.max(0, Math.min(100, rawScore));
 
     // Classify
-    if (score >= 60 && todosCount === 0 && sourceImports.length === 0) {
+    // RÈGLE STRICTE: 'converted' exige:
+    //   - score >= 60
+    //   - 0 TODO(codeMorph) (pas de blocs fallback chunker)
+    //   - 0 imports source (pas de Dart dans le TypeScript)
+    //   - Au moins 10 lignes de code réel (évite les stubs avec 1-2 lignes)
+    if (score >= 60 && todosCount === 0 && sourceImports.length === 0 && linesCode >= 10 && !hasChunkerFallback) {
       status = 'converted';
     } else if (score >= 30 || linesCode >= 5) {
       status = 'incomplete';

@@ -24,12 +24,16 @@ import { cleanLLMOutput } from './output-cleaner';
 
 // ── Seuils de chunking par tier ────────────────────────────────────────────
 // Ces valeurs correspondent aux limites réelles des modèles
+// SEUILS RÉVISÉS — llama-3.3-70b-versatile (Groq) a 131 072 tokens de context window.
+// Le FileGenerator injecte le source complet dans un seul prompt (troncature à 20k chars max).
+// Le chunker classe-par-classe produit des fallbacks TODO inutilisables → désactivé pour Groq.
+// Le threshold 50_000 est largement au-dessus de tout fichier Flutter réel (max ~15k chars).
 export const CHUNK_THRESHOLDS = {
-  'static':       0,       // pas de génération
-  'free-groq':    3_000,   // ~750 tokens — Groq est très limité
-  'platform':     12_000,  // ~3000 tokens
-  'pro-openai':   30_000,  // ~7500 tokens
-  'pro-anthropic':30_000,  // ~7500 tokens
+  'static':       0,        // pas de génération
+  'free-groq':    50_000,   // Groq 70b: 131k context — FileGenerator gère la troncature à 20k
+  'platform':     20_000,   // ~5000 tokens
+  'pro-openai':   40_000,   // ~10000 tokens
+  'pro-anthropic':40_000,   // ~10000 tokens
 } as const;
 
 // ── Types ──────────────────────────────────────────────────────────────────
