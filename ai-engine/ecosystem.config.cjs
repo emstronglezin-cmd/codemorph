@@ -9,7 +9,7 @@ module.exports = {
       AI_PORT:           '5000',
       LOG_LEVEL:         'warn',
       AI_ENGINE_SECRET:  '',
-      GROQ_API_KEY:      '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',
+      GROQ_API_KEY:      '${GROQ_API_KEY}',
     },
     watch: false,
     instances: 1,

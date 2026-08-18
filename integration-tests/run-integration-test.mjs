@@ -26,7 +26,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
-const GROQ_API_KEY = process.env.GROQ_API_KEY ?? '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';
+const GROQ_API_KEY = process.env.GROQ_API_KEY ?? '';
 const AI_ENGINE_URL = process.env.AI_ENGINE_URL ?? 'http://localhost:3002';
 const REPORTS_DIR = join(__dirname, 'reports');
 
