@@ -15,13 +15,60 @@
 //
 // Modèles Groq disponibles (2026-08) :
 //   openai/gpt-oss-120b  ← PRIMARY  (meilleur pour code)
-//   qwen/qwen3.6-27b     ← FALLBACK (produit <think> tags — strippé)
+//   openai/gpt-oss-20b   ← FALLBACK (si 429 sur 120b)
 //   allam-2-7b           ← EMERGENCY
 // ============================================================
 
 import OpenAI from 'openai';
 import Anthropic from '@anthropic-ai/sdk';
 import { appConfig } from '../config/app.config';
+
+// ── Rate Limiter global Groq (8000 TPM) ──────────────────────────────────────
+// Groq free tier = 8000 tokens/minute pour TOUS les modèles combinés.
+// Chaque requête consomme ~2500-5000 tokens (input+output).
+// Pour garantir 0 429 : délai fixe de 35s entre requêtes (soit ~1.7 req/min max).
+// Ce rate limiter est GLOBAL — toutes les instances AIProvider le partagent.
+// Cela remplace les délais adhoc dans BizLayerExtractor et FileGenerator.
+//
+// DESIGN: mutex séquentiel (pas de file multi-consommateur).
+// acquire() retourne quand le slot est libre + le délai de 35s est respecté.
+// release() DOIT être appelé après chaque requête (dans un finally).
+class GroqRateLimiter {
+  private lastRequestEndTime = 0;
+  // 35s entre la FIN d'une requête et le DÉBUT de la suivante
+  // → garantit que la fenêtre TPM (60s) se recharge suffisamment
+  private readonly minIntervalMs = 35_000;
+  // Mutex: une seule requête à la fois
+  private lock: Promise<void> = Promise.resolve();
+
+  async acquire(): Promise<() => void> {
+    // Chaîner les acquisitions pour sérialiser les requêtes
+    let releaseLock!: () => void;
+    const previousLock = this.lock;
+    this.lock = new Promise<void>((resolve) => { releaseLock = resolve; });
+
+    // Attendre que le lock précédent soit libéré
+    await previousLock;
+
+    // Calculer le délai depuis la fin de la dernière requête
+    const elapsed = Date.now() - this.lastRequestEndTime;
+    const waitMs  = elapsed < this.minIntervalMs ? this.minIntervalMs - elapsed : 0;
+
+    if (waitMs > 0) {
+      console.log(`[GroqRateLimiter] ⏳ Waiting ${(waitMs / 1000).toFixed(1)}s before next Groq request`);
+      await new Promise((r) => setTimeout(r, waitMs));
+    }
+
+    // Retourner la fonction release que l'appelant DOIT appeler dans son finally
+    return () => {
+      this.lastRequestEndTime = Date.now();
+      releaseLock();
+    };
+  }
+}
+
+// Singleton global — partagé entre toutes les instances AIProvider
+const groqRateLimiter = new GroqRateLimiter();
 
 export type AITier = 'pro-openai' | 'pro-anthropic' | 'platform' | 'free-groq' | 'static';
 
@@ -141,56 +188,68 @@ export class AIProvider {
   private async groqChat(messages: ChatMessage[], maxTokens: number): Promise<AIResponse> {
     // Groq free tier = 8000 TPM — cap max_tokens pour rester dans les limites
     // openai/gpt-oss-120b = primary, openai/gpt-oss-20b = fallback si 429
-    const GROQ_MAX_TOKENS = Math.min(maxTokens, 3000);
+    const GROQ_MAX_TOKENS = Math.min(maxTokens, 2800);
     const client = new OpenAI({
       apiKey:  process.env['GROQ_API_KEY']!,
       baseURL: 'https://api.groq.com/openai/v1',
     });
 
+    // ── Rate limiting global ──────────────────────────────────────────────────
+    // Acquiert le slot (attend 35s depuis la fin de la dernière requête).
+    // DOIT appeler release() dans un finally pour libérer le slot.
+    const release = await groqRateLimiter.acquire();
+
     // Modèles à essayer en cascade si 429
     const GROQ_MODELS = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b'];
     let lastError: Error | null = null;
 
-    for (const modelId of GROQ_MODELS) {
-      // Retry avec backoff exponentiel (3 tentatives max)
-      for (let attempt = 0; attempt < 3; attempt++) {
-        try {
-          const res = await client.chat.completions.create({
-            model:       modelId,
-            messages,
-            max_tokens:  GROQ_MAX_TOKENS,
-            temperature: appConfig.temperature,
-          });
-          let rawContent = res.choices[0]?.message?.content ?? '';
-          // Stripping <think>...</think> (qwen3.6-27b reasoning mode)
-          rawContent = rawContent.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
-          if (modelId !== this.model) {
-            console.log(`[AIProvider] Groq fallback succeeded with ${modelId} (primary ${this.model} was rate-limited)`);
-          }
-          return {
-            content:    rawContent,
-            tokensUsed: res.usage?.total_tokens ?? 0,
-            tier:       'free-groq',
-            model:      modelId,
-          };
-        } catch (err: unknown) {
-          const msg = err instanceof Error ? err.message : String(err);
-          const is429 = msg.includes('429') || msg.includes('rate limit') || msg.includes('Rate limit');
-          if (is429) {
-            // Extraire le délai Retry-After si présent dans le message
-            const retryMatch = msg.match(/(\d+(?:\.\d+)?)s/);
-            const waitSec = retryMatch?.[1] ? Math.min(parseFloat(retryMatch[1]) + 2, 45) : (attempt + 1) * 15;
-            console.warn(`[AIProvider] Groq 429 on ${modelId} attempt ${attempt+1}/3 — waiting ${waitSec}s...`);
-            await new Promise((r) => setTimeout(r, waitSec * 1000));
-            lastError = err instanceof Error ? err : new Error(msg);
-            // Après 2 tentatives sur 120b, passer au 20b
-            if (attempt >= 1 && modelId === GROQ_MODELS[0]) break;
-          } else {
-            // Erreur non-429 — propager immédiatement
-            throw err;
+    try {
+      for (const modelId of GROQ_MODELS) {
+        // Retry sur 429 résiduel uniquement (le rate limiter gère les cas normaux)
+        for (let attempt = 0; attempt < 2; attempt++) {
+          try {
+            const res = await client.chat.completions.create({
+              model:       modelId,
+              messages,
+              max_tokens:  GROQ_MAX_TOKENS,
+              temperature: appConfig.temperature,
+            });
+            let rawContent = res.choices[0]?.message?.content ?? '';
+            // Stripping <think>...</think> (qwen3.6-27b reasoning mode)
+            rawContent = rawContent.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
+            if (modelId !== this.model) {
+              console.log(`[AIProvider] Groq fallback succeeded with ${modelId} (primary ${this.model} was rate-limited)`);
+            }
+            console.log(`[AIProvider] Groq ✅ ${modelId} — ${res.usage?.total_tokens ?? '?'} tokens used`);
+            return {
+              content:    rawContent,
+              tokensUsed: res.usage?.total_tokens ?? 0,
+              tier:       'free-groq',
+              model:      modelId,
+            };
+          } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            const is429 = msg.includes('429') || msg.includes('rate limit') || msg.includes('Rate limit');
+            if (is429) {
+              // Extraire le délai Retry-After suggéré par l'API Groq
+              const retryMatch = msg.match(/(\d+(?:\.\d+)?)s/);
+              const waitSec = retryMatch?.[1]
+                ? Math.max(parseFloat(retryMatch[1]) + 5, 40)
+                : 45;
+              console.warn(`[AIProvider] Groq 429 on ${modelId} attempt ${attempt+1}/2 — waiting ${waitSec}s (TPM recharge)...`);
+              await new Promise((r) => setTimeout(r, waitSec * 1000));
+              lastError = err instanceof Error ? err : new Error(msg);
+              // Après 1 tentative sur 120b → passer immédiatement au modèle 20b
+              if (modelId === GROQ_MODELS[0]) break;
+            } else {
+              throw err;
+            }
           }
         }
       }
+    } finally {
+      // Libérer le slot — démarre le compte à rebours de 35s pour la prochaine requête
+      release();
     }
 
     // Tous les modèles ont échoué

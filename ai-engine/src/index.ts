@@ -65,8 +65,8 @@ async function bootstrap(): Promise<void> {
   });
   // Augmenter le timeout serveur pour les grosses conversions Groq (34+ fichiers)
   // Groq llama-3.3-70b: ~2-3s par fichier × 34 fichiers ≈ 90-120s
-  server.timeout         = 600_000; // 10 minutes
-  server.keepAliveTimeout = 620_000;
+  server.timeout         = 7_200_000; // 2 heures (19 files × 30s + 5 screens × 22s = ~670s minimum)
+  server.keepAliveTimeout = 7_260_000;
   server.headersTimeout   = 630_000;
 }
 

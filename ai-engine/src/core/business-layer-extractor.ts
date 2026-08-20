@@ -707,11 +707,18 @@ ABSOLUTE RULES:
 5. The output file must be compilable ${outputLang}
 6. The output line count should be at least 60% of the source line count`;
 
+  // Limiter la source à 8000 chars pour rester dans les 8000 TPM Groq
+  // system (~600t) + source (~2000t) + instructions (~200t) + output (2800t) ≈ 5600t
+  const MAX_BIZ_SOURCE_CHARS = 8_000;
+  const truncatedContent = file.content.length > MAX_BIZ_SOURCE_CHARS
+    ? file.content.slice(0, MAX_BIZ_SOURCE_CHARS) + `\n// [source truncated at ${MAX_BIZ_SOURCE_CHARS} chars — implement remaining methods using the same patterns above]`
+    : file.content;
+
   const user = `${specificInstructions}
 
 SOURCE FILE (${file.path}, ${file.lineCount} lines):
 \`\`\`
-${file.content}
+${truncatedContent}
 \`\`\`
 
 Convert the COMPLETE source above to ${targetLabel}.
@@ -810,7 +817,8 @@ export async function convertBusinessLayerFile(
             : `too short (${content.length}/${MIN_OUTPUT_CHARS} chars)`;
 
         console.warn(`[BizLayerExtractor] ⚠️  Retry for "${file.path}": ${reason}`);
-        await new Promise((r) => setTimeout(r, 1200));
+        // Le rate limiter global dans ai-provider.ts gère l'espacement des requêtes.
+        // Pas de délai additionnel ici — évite les doubles attentes.
 
         const retryUser = `${user}
 
@@ -943,10 +951,9 @@ export async function extractAndConvertBusinessLayers(
   let successCount = 0;
   let failedCount = 0;
 
-  // Groq free tier: 8000 TPM → avec ~3000 tokens/req, max ~2 req/min
-  // Délai conservateur: 22s entre appels pour rester sous la limite
-  // Le retry 429 dans ai-provider.ts gère les dépassements résiduels
-  const GROQ_DELAY_MS = 22_000;
+  // NOTE: le rate limiting Groq (35s entre requêtes) est géré globalement
+  // par GroqRateLimiter dans ai-provider.ts — pas de délai adhoc ici.
+  // Cela garantit 0 429 même avec BizLayer + FileGenerator en séquence.
 
   for (let i = 0; i < filesToProcess.length; i++) {
     const file = filesToProcess[i]!;
@@ -959,11 +966,6 @@ export async function extractAndConvertBusinessLayers(
       successCount++;
     } else {
       failedCount++;
-    }
-
-    // Rate limit protection pour Groq
-    if (tier === 'free-groq' && i < filesToProcess.length - 1) {
-      await new Promise((resolve) => setTimeout(resolve, GROQ_DELAY_MS));
     }
   }
 

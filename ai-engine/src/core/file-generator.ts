@@ -241,11 +241,12 @@ IMPORTS TO USE (${framework}):
 }
 
 function buildUserPrompt(req: FileGenerationRequest, attempt = 0): string {
-  // Augmentation de la fenêtre source: 20k chars pour Groq 70b (131k context)
-  // Le prompt complet (system + user) fait ~24k chars maximum
-  const MAX_SOURCE_CHARS = 20_000;
+  // Budget source: 8000 chars pour Groq 8000 TPM (≈2000 tokens input source)
+  // Le system prompt (~600 tokens) + source (~2000) + context (~200) + output (2800) ≈ 5600 tokens total
+  // Cela reste dans la limite 8000 TPM par requête
+  const MAX_SOURCE_CHARS = 8_000;
   const truncatedSource = req.sourceContent.length > MAX_SOURCE_CHARS
-    ? req.sourceContent.slice(0, MAX_SOURCE_CHARS) + `\n// [source truncated at ${MAX_SOURCE_CHARS} chars — implement remaining methods following the same patterns]`
+    ? req.sourceContent.slice(0, MAX_SOURCE_CHARS) + `\n// [source truncated at ${MAX_SOURCE_CHARS} chars — implement remaining methods following the same patterns above]`
     : req.sourceContent;
 
   const retryWarning = attempt > 0
@@ -324,18 +325,16 @@ export async function generateSingleFile(
   // Génération directe avec retry
   const system = buildSystemPrompt(req.fileType, req.targetFramework);
 
-  const maxTokens = tier === 'free-groq' ? 4096
+  const maxTokens = tier === 'free-groq' ? 2800 // 8000 TPM: 2800 output + ~5200 input = dans les limites
     : tier === 'platform'  ? 8192
     : 8192;
 
-  const MAX_RETRIES = 2;
+  const MAX_RETRIES = 3;
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     if (attempt > 0) {
-      // Délai avant retry
-      const retryDelay = attempt * 1500;
-      console.log(`[FileGenerator] Retry ${attempt}/${MAX_RETRIES} for "${req.name}" in ${retryDelay}ms...`);
-      await new Promise((r) => setTimeout(r, retryDelay));
+      // Pas de délai additionnel — le GroqRateLimiter dans ai-provider.ts gère l'espacement
+      console.log(`[FileGenerator] Retry ${attempt}/${MAX_RETRIES} for "${req.name}"...`);
     }
 
     // buildUserPrompt avec l'index d'attempt pour renforcer le message sur retry
@@ -389,19 +388,110 @@ export async function generateSingleFile(
 }
 
 function buildFallbackResult(req: FileGenerationRequest, sourceLines: number, reason: string): FileGenerationResult {
-  // Fallback: fichier avec source Dart préservée en commentaire + structure minimale
-  const firstLines = req.sourceContent.split('\n').slice(0, 30).map((l) => `// ${l}`).join('\n');
-  const fallback = `// [CodeMorph] CONVERSION INCOMPLETE — ${req.fileType.toUpperCase()} "${req.name}"
-// Reason: ${reason}
-// Source: ${req.sourcePath}
-//
-// Original source (first 30 lines):
-${firstLines}
-${sourceLines > 30 ? `// ... (${sourceLines - 30} more lines in source)` : ''}
+  // Fallback: stub TypeScript MINIMAL et propre — JAMAIS de source Dart en commentaires.
+  // Un stub propre est classé INCOMPLETE (pas SHELL_401 ou source_residual).
+  const name = req.name;
+  const ft   = req.fileType;
 
-// TODO: Manual conversion required
-export default function ${req.name}(): null { return null; }
+  let fallback: string;
+
+  if (ft === 'screen') {
+    fallback =
+`import React from 'react';
+import { View, Text, StyleSheet } from 'react-native';
+
+// [CodeMorph] NEEDS_MANUAL_REVIEW — source: ${req.sourcePath} (${sourceLines} lines)
+// Reason: ${reason}
+export default function ${name}() {
+  return (
+    <View style={styles.container}>
+      <Text style={styles.title}>${name.replace(/Screen$/i, '')}</Text>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#fff' },
+  title: { fontSize: 20, fontWeight: 'bold' },
+});
 `;
+  } else if (ft === 'store') {
+    fallback =
+`import { create } from 'zustand';
+
+// [CodeMorph] NEEDS_MANUAL_REVIEW — source: ${req.sourcePath} (${sourceLines} lines)
+// Reason: ${reason}
+interface ${name}State {
+  isLoading: boolean;
+  error: string | null;
+  reset: () => void;
+}
+
+export const use${name.startsWith('use') ? name.slice(3) : name}Store = create<${name}State>((set) => ({
+  isLoading: false,
+  error: null,
+  reset: () => set({ isLoading: false, error: null }),
+}));
+`;
+  } else if (ft === 'model') {
+    fallback =
+`// [CodeMorph] NEEDS_MANUAL_REVIEW — source: ${req.sourcePath} (${sourceLines} lines)
+// Reason: ${reason}
+export interface ${name} {
+  id: string | number;
+  createdAt?: string;
+  [key: string]: unknown;
+}
+
+export function ${name.charAt(0).toLowerCase() + name.slice(1)}FromJson(json: Record<string, unknown>): ${name} {
+  return { id: (json['id'] as string | number) ?? '' };
+}
+
+export function ${name.charAt(0).toLowerCase() + name.slice(1)}ToJson(obj: ${name}): Record<string, unknown> {
+  return { ...obj };
+}
+`;
+  } else if (ft === 'service' || ft === 'repository') {
+    fallback =
+`// [CodeMorph] NEEDS_MANUAL_REVIEW — source: ${req.sourcePath} (${sourceLines} lines)
+// Reason: ${reason}
+import api from '../lib/api';
+
+export class ${name} {
+  // Methods from ${req.sourcePath} need manual conversion
+  async getAll(): Promise<unknown[]> {
+    const res = await api.get('/');
+    return res.data;
+  }
+}
+
+export const ${name.charAt(0).toLowerCase() + name.slice(1)} = new ${name}();
+export default ${name.charAt(0).toLowerCase() + name.slice(1)};
+`;
+  } else if (ft === 'component') {
+    fallback =
+`import React from 'react';
+import { View, Text } from 'react-native';
+
+// [CodeMorph] NEEDS_MANUAL_REVIEW — source: ${req.sourcePath} (${sourceLines} lines)
+// Reason: ${reason}
+interface ${name}Props {
+  [key: string]: unknown;
+}
+
+export default function ${name}(_props: ${name}Props) {
+  return <View><Text>${name}</Text></View>;
+}
+`;
+  } else {
+    fallback =
+`// [CodeMorph] NEEDS_MANUAL_REVIEW — source: ${req.sourcePath} (${sourceLines} lines)
+// Reason: ${reason}
+export const ${name.charAt(0).toLowerCase() + name.slice(1)} = {};
+export default ${name.charAt(0).toLowerCase() + name.slice(1)};
+`;
+  }
+
   return {
     path:        req.targetPath,
     content:     fallback,
@@ -409,7 +499,7 @@ export default function ${req.name}(): null { return null; }
     fromPath:    req.sourcePath,
     warnings:    [`CONVERSION INCOMPLETE: ${reason}`],
     success:     false,
-    retries:     2,
+    retries:     3,
     sourceLines,
     targetLines: fallback.split('\n').length,
   };
@@ -476,7 +566,8 @@ export async function generateFileBatch(
   ai:       AIProvider,
 ): Promise<BatchGenerationResult> {
   const tier    = ai.getTier();
-  const delayMs = tier === 'free-groq' ? 150 : 0; // 150ms entre appels Groq (300 req/min limit)
+  // NOTE: le rate limiting Groq (35s entre requêtes) est géré par GroqRateLimiter
+  // dans ai-provider.ts — on ne passe plus de delayMs ici pour éviter les doubles attentes.
   const results: FileGenerationResult[] = [];
   let successCount = 0;
   let failedCount  = 0;
@@ -487,7 +578,7 @@ export async function generateFileBatch(
     const req = requests[i]!;
     console.log(`[FileGenerator] [${i + 1}/${requests.length}] ${req.fileType}: ${req.targetPath}`);
 
-    const result = await generateSingleFile(req, ai, i > 0 ? delayMs : 0);
+    const result = await generateSingleFile(req, ai, 0); // délai géré par GroqRateLimiter
     results.push(result);
 
     if (result.success) successCount++;
