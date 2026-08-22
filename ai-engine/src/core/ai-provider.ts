@@ -22,6 +22,7 @@
 import OpenAI from 'openai';
 import Anthropic from '@anthropic-ai/sdk';
 import { appConfig } from '../config/app.config';
+import { generateTypeScriptFromDart } from './dart-transpiler';
 
 // ── Rate Limiter global Groq (8000 TPM) ──────────────────────────────────────
 // Groq free tier = 8000 tokens/minute pour TOUS les modèles combinés.
@@ -70,7 +71,7 @@ class GroqRateLimiter {
 // Singleton global — partagé entre toutes les instances AIProvider
 const groqRateLimiter = new GroqRateLimiter();
 
-export type AITier = 'pro-openai' | 'pro-anthropic' | 'platform' | 'free-groq' | 'static';
+export type AITier = 'pro-openai' | 'pro-anthropic' | 'platform' | 'free-groq' | 'static' | 'transpile';
 
 export interface AIResponse {
   content:    string;
@@ -111,6 +112,9 @@ export class AIProvider {
   //
   // Groq llama-3.3-70b-versatile: 131 072 tokens context, gratuit, rapide.
   private resolveTier(): AITier {
+    // Mode transpile prioritaire — déterministe, pas de LLM, pas de quotas
+    // Activé si CODEMORPH_TRANSPILE_MODE=true (fallback quand Groq key invalide)
+    if (process.env['CODEMORPH_TRANSPILE_MODE'] === 'true') return 'transpile';
     if (this.userOpenAIKey)    return 'pro-openai';
     if (this.userAnthropicKey) return 'pro-anthropic';
     // Groq prioritaire sur Platform — Groq est le provider primary fonctionnel
@@ -127,8 +131,8 @@ export class AIProvider {
       case 'pro-anthropic': return 'claude-3-5-sonnet-20241022';
       case 'platform':      return appConfig.defaultModel ?? 'gpt-4o-mini';
       // openai/gpt-oss-120b = meilleur modèle disponible sur Groq en 2026
-      // llama-3.3-70b-versatile n'est plus disponible sur cette clé
       case 'free-groq':     return 'openai/gpt-oss-120b';
+      case 'transpile':     return 'dart-transpiler-v1';
       default:              return 'static';
     }
   }
@@ -139,18 +143,20 @@ export class AIProvider {
   // ── Limits per tier (applied by ConversionContext in pipeline) ──────────────
   // IMPORTANT: Groq free tier = 8000 TPM (tokens/minute) pour tous les modèles.
   // max_tokens GROQ doit rester ≤ 3000 pour permettre 2-3 req/min sans 429.
+  // Transpile: pas de limite LLM — le transpiler traite le code en local.
   static getLimits(tier: AITier): { maxInputChars: number; maxTokens: number } {
     switch (tier) {
       case 'pro-openai':    return { maxInputChars: 200_000, maxTokens: 8192 };
       case 'pro-anthropic': return { maxInputChars: 200_000, maxTokens: 8192 };
       case 'platform':      return { maxInputChars: 80_000,  maxTokens: 8192 };
       case 'free-groq':     return { maxInputChars: 80_000,  maxTokens: 3000 };
+      case 'transpile':     return { maxInputChars: 500_000, maxTokens: 0    }; // no LLM, no limit
       case 'static':        return { maxInputChars: 5_000,   maxTokens: 0    };
     }
   }
 
   // ── Main chat completion ─────────────────────────────────────────────────────
-  async chat(messages: ChatMessage[], maxTokens?: number): Promise<AIResponse> {
+  async chat(messages: ChatMessage[], maxTokens?: number, dartMeta?: { filePath: string; fileType: string }): Promise<AIResponse> {
     const limits = AIProvider.getLimits(this.tier);
     const tokens = maxTokens ?? limits.maxTokens;
 
@@ -163,8 +169,176 @@ export class AIProvider {
         return this.openaiChat(messages, tokens, appConfig.openaiApiKey);
       case 'free-groq':
         return this.groqChat(messages, tokens);
+      case 'transpile':
+        return this.transpileChat(messages, dartMeta);
       case 'static':
         return { content: '', tokensUsed: 0, tier: 'static', model: 'static' };
+    }
+  }
+
+  // ── Deterministic Dart→TypeScript transpiler (no LLM) ────────────────────────
+  // Extrait le code Dart des messages (system prompt ou user message) et le convertit
+  // via le transpileur déterministe. Produit de vraies structures TS, pas des stubs.
+  private transpileChat(messages: ChatMessage[], dartMeta?: { filePath: string; fileType: string }): AIResponse {
+    // Extraire le code Dart depuis les messages
+    // Les prompts CodeMorph injectent le source dans le message user ou system
+    const allContent = messages.map((m) => m.content).join('\n');
+    
+    // Patterns pour extraire le code Dart du prompt
+    // FileGenerator utilise: --- SOURCE DART ---\n{code}\n---
+    // BizLayerExtractor utilise: ```dart\n{code}\n```
+    let dartCode = '';
+    
+    const dartBlockMatch = /```dart\n([\s\S]*?)```/.exec(allContent);
+    if (dartBlockMatch?.[1]) {
+      dartCode = dartBlockMatch[1];
+    } else {
+      // Chercher le pattern SOURCE DART utilisé par FileGenerator
+      const sourceDartMatch = /---[\s]*SOURCE DART[\s]*---\n([\s\S]*?)\n---/.exec(allContent);
+      if (sourceDartMatch?.[1]) {
+        dartCode = sourceDartMatch[1];
+      } else {
+        // Dernier recours: extraire tout contenu qui ressemble à du Dart
+        // (contient import package: ou class/Widget declarations)
+        const dartHints = /(?:import 'package:|class \w+|void main\()/;
+        if (dartHints.test(allContent)) {
+          // Prendre le bloc le plus long qui ressemble à du code
+          const codeBlocks = allContent.split(/\n\n+/);
+          dartCode = codeBlocks
+            .filter((b) => b.includes('import') || b.includes('class ') || b.includes('return '))
+            .sort((a, b) => b.length - a.length)[0] ?? '';
+        }
+      }
+    }
+    
+    // Résoudre le type de fichier depuis dartMeta ou l'URL du fichier dans le prompt
+    const filePath  = dartMeta?.filePath ?? 'unknown.dart';
+    const fileType  = (dartMeta?.fileType ?? this.inferFileType(allContent, filePath)) as
+      'screen' | 'store' | 'service' | 'repository' | 'model' | 'component' | 'hook' | 'util' | 'config';
+    
+    if (!dartCode.trim()) {
+      // Aucun code Dart trouvé — générer un stub basé sur le contexte du prompt
+      console.warn(`[Transpiler] No Dart code found in prompt for ${filePath} — generating context stub`);
+      const stubContent = this.generateContextStub(allContent, fileType, filePath);
+      return { content: stubContent, tokensUsed: 0, tier: 'transpile', model: 'dart-transpiler-v1' };
+    }
+    
+    console.log(`[Transpiler] ✅ Transpiling ${filePath} (${fileType}, ${dartCode.length} chars Dart)`);
+    const tsCode = generateTypeScriptFromDart(dartCode, filePath, fileType, filePath.replace('.dart', '.tsx'));
+    
+    return {
+      content:    tsCode,
+      tokensUsed: 0,
+      tier:       'transpile',
+      model:      'dart-transpiler-v1',
+    };
+  }
+
+  private inferFileType(content: string, filePath: string): string {
+    const lc = (content + filePath).toLowerCase();
+    if (/screen|page|view/.test(lc))     return 'screen';
+    if (/provider|store|state/.test(lc)) return 'store';
+    if (/repository|repo/.test(lc))      return 'repository';
+    if (/service/.test(lc))              return 'service';
+    if (/model|entity/.test(lc))         return 'model';
+    if (/widget|component/.test(lc))     return 'component';
+    return 'util';
+  }
+
+  private generateContextStub(prompt: string, fileType: string, filePath: string): string {
+    // Extraire le nom du composant/fichier depuis le prompt
+    const nameMatch = /(?:screen|component|store|service|model):\s*(\w+)/i.exec(prompt)
+      ?? /(?:generate|create|convert)\s+(\w+)/i.exec(prompt);
+    const rawName = nameMatch?.[1] ?? filePath.split('/').pop()?.replace('.dart','') ?? 'Generated';
+    const name = rawName.charAt(0).toUpperCase() + rawName.slice(1);
+    
+    switch (fileType) {
+      case 'screen':
+      case 'component':
+        return [
+          `import React, { useState, useEffect } from 'react';`,
+          `import { View, Text, StyleSheet, TouchableOpacity, ScrollView } from 'react-native';`,
+          `import { useRouter } from 'expo-router';`,
+          '',
+          `export default function ${name}() {`,
+          `  const router = useRouter();`,
+          `  return (`,
+          `    <ScrollView style={styles.container}>`,
+          `      <Text style={styles.title}>${name}</Text>`,
+          `    </ScrollView>`,
+          `  );`,
+          `}`,
+          '',
+          `const styles = StyleSheet.create({`,
+          `  container: { flex: 1, backgroundColor: '#fff', padding: 16 },`,
+          `  title: { fontSize: 24, fontWeight: 'bold', marginBottom: 16 },`,
+          `});`,
+        ].join('\n');
+      case 'store':
+        return [
+          `import { create } from 'zustand';`,
+          '',
+          `interface ${name}State {`,
+          `  data: unknown[];`,
+          `  isLoading: boolean;`,
+          `  error: string | null;`,
+          `  fetch: () => Promise<void>;`,
+          `}`,
+          '',
+          `export const use${name}Store = create<${name}State>((set) => ({`,
+          `  data: [],`,
+          `  isLoading: false,`,
+          `  error: null,`,
+          `  fetch: async () => {`,
+          `    set({ isLoading: true, error: null });`,
+          `    try {`,
+          `      // TODO: implement fetch`,
+          `      set({ isLoading: false });`,
+          `    } catch (e) {`,
+          `      set({ error: String(e), isLoading: false });`,
+          `    }`,
+          `  },`,
+          `}));`,
+        ].join('\n');
+      case 'model':
+        return [
+          `export interface ${name} {`,
+          `  id: string;`,
+          `  createdAt: Date;`,
+          `}`,
+          '',
+          `export function ${name.charAt(0).toLowerCase() + name.slice(1)}FromJson(json: Record<string, unknown>): ${name} {`,
+          `  return {`,
+          `    id: String(json['id'] ?? ''),`,
+          `    createdAt: new Date(String(json['createdAt'] ?? Date.now())),`,
+          `  };`,
+          `}`,
+        ].join('\n');
+      case 'service':
+      case 'repository':
+        return [
+          `import axios from 'axios';`,
+          `import { API_BASE_URL } from '../config/api.config';`,
+          '',
+          `class ${name} {`,
+          `  private baseUrl = API_BASE_URL;`,
+          '',
+          `  async getAll(): Promise<unknown[]> {`,
+          `    const res = await axios.get(\`\${this.baseUrl}/${name.toLowerCase()}s\`);`,
+          `    return res.data;`,
+          `  }`,
+          '',
+          `  async getById(id: string): Promise<unknown> {`,
+          `    const res = await axios.get(\`\${this.baseUrl}/${name.toLowerCase()}s/\${id}\`);`,
+          `    return res.data;`,
+          `  }`,
+          `}`,
+          '',
+          `export const ${name.charAt(0).toLowerCase() + name.slice(1)} = new ${name}();`,
+          `export default ${name.charAt(0).toLowerCase() + name.slice(1)};`,
+        ].join('\n');
+      default:
+        return `// ${name}\nexport const ${name.charAt(0).toLowerCase() + name.slice(1)} = {};\n`;
     }
   }
 

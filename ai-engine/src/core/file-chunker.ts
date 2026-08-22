@@ -34,6 +34,7 @@ export const CHUNK_THRESHOLDS = {
   'platform':     20_000,   // ~5000 tokens
   'pro-openai':   40_000,   // ~10000 tokens
   'pro-anthropic':40_000,   // ~10000 tokens
+  'transpile':    500_000,  // transpileur local — pas de limite LLM
 } as const;
 
 // ── Types ──────────────────────────────────────────────────────────────────
