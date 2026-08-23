@@ -220,6 +220,8 @@ export class CodePlanner {
       this.staticFile('src/hooks/useApi.ts',    RN_USE_API_HOOK),
       this.staticFile('src/theme/colors.ts',    RN_THEME_COLORS),
       this.staticFile('src/theme/spacing.ts',   RN_THEME_SPACING),
+      // Barrel export — résout les imports '../../theme' des composants UI
+      this.staticFile('src/theme/index.ts',     RN_THEME_INDEX),
       this.staticFile('src/components/ui/Button.tsx',    RN_BUTTON_COMPONENT),
       this.staticFile('src/components/ui/TextInput.tsx', RN_TEXT_INPUT_COMPONENT),
       this.staticFile('src/components/ui/Card.tsx',      RN_CARD_COMPONENT),
@@ -2300,6 +2302,14 @@ export const borderRadius = {
   full: 9999,
 };
 `;
+// Barrel export — résout import { colors, spacing } from '../../theme' dans les composants UI
+// Les composants sont dans src/components/ui/ donc ../../theme = src/theme/index.ts
+const RN_THEME_INDEX = `// src/theme/index.ts — barrel export
+export * from './colors';
+export * from './spacing';
+export * from './typography';
+`;
+
 const RN_BUTTON_COMPONENT = `import React from 'react';
 import { TouchableOpacity, Text, ActivityIndicator, StyleSheet, type TouchableOpacityProps } from 'react-native';
 import { colors, spacing, borderRadius } from '../../theme';

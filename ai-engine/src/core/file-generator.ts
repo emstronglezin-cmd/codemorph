@@ -344,6 +344,7 @@ export async function generateSingleFile(
       const res = await ai.chat(
         [{ role: 'system', content: system }, { role: 'user', content: userMsg }],
         maxTokens,
+        { filePath: req.sourcePath, fileType: req.fileType },
       );
 
       let content = res.content || '';

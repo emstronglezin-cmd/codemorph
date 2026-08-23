@@ -185,29 +185,55 @@ export class AIProvider {
     const allContent = messages.map((m) => m.content).join('\n');
     
     // Patterns pour extraire le code Dart du prompt
-    // FileGenerator utilise: --- SOURCE DART ---\n{code}\n---
-    // BizLayerExtractor utilise: ```dart\n{code}\n```
+    // FileGenerator:       ```dart\n{code}\n```  (avec tag 'dart')
+    // BizLayerExtractor:   ```\n{code}\n```      (SANS tag — backtick nu)
+    // FileChunker:         ```\n{code}\n```      (SANS tag)
     let dartCode = '';
     
-    const dartBlockMatch = /```dart\n([\s\S]*?)```/.exec(allContent);
-    if (dartBlockMatch?.[1]) {
-      dartCode = dartBlockMatch[1];
-    } else {
-      // Chercher le pattern SOURCE DART utilisé par FileGenerator
-      const sourceDartMatch = /---[\s]*SOURCE DART[\s]*---\n([\s\S]*?)\n---/.exec(allContent);
-      if (sourceDartMatch?.[1]) {
-        dartCode = sourceDartMatch[1];
-      } else {
-        // Dernier recours: extraire tout contenu qui ressemble à du Dart
-        // (contient import package: ou class/Widget declarations)
-        const dartHints = /(?:import 'package:|class \w+|void main\()/;
-        if (dartHints.test(allContent)) {
-          // Prendre le bloc le plus long qui ressemble à du code
-          const codeBlocks = allContent.split(/\n\n+/);
-          dartCode = codeBlocks
-            .filter((b) => b.includes('import') || b.includes('class ') || b.includes('return '))
-            .sort((a, b) => b.length - a.length)[0] ?? '';
+    // Pattern 1: ```dart\n{code}\n``` (FileGenerator)
+    const dartTagMatch = /```dart\n([\s\S]*?)```/.exec(allContent);
+    if (dartTagMatch?.[1]) {
+      dartCode = dartTagMatch[1];
+    }
+    
+    // Pattern 2: SOURCE FILE (path, N lines):\n```\n{code}\n``` (BizLayerExtractor)
+    if (!dartCode) {
+      const bizLayerMatch = /SOURCE FILE[^\n]*\n```\n([\s\S]*?)```/.exec(allContent);
+      if (bizLayerMatch?.[1]) {
+        dartCode = bizLayerMatch[1];
+      }
+    }
+
+    // Pattern 3: SOURCE CODE (N lines):\n```\n{code}\n``` ou backtick sans tag
+    if (!dartCode) {
+      const sourceCodeMatch = /SOURCE CODE[^\n]*\n```\n?([\s\S]*?)```/.exec(allContent);
+      if (sourceCodeMatch?.[1]) {
+        dartCode = sourceCodeMatch[1];
+      }
+    }
+    
+    // Pattern 4: tout bloc ```\n{code}\n``` qui contient du Dart
+    if (!dartCode) {
+      const anyBlock = /```\n([\s\S]*?)```/g;
+      let m: RegExpExecArray | null;
+      while ((m = anyBlock.exec(allContent)) !== null) {
+        const candidate = m[1] ?? '';
+        // Heuristique Dart: contains 'import package:' OR 'class X' + 'dart' keywords
+        if (/import 'package:|void\s+\w+\s*\(|class\s+\w+/.test(candidate)) {
+          dartCode = candidate;
+          break;
         }
+      }
+    }
+
+    // Pattern 5: dernier recours — lignes qui ressemblent à du Dart (sans bloc)
+    if (!dartCode) {
+      const dartHints = /(?:import 'package:|class \w+\s*\{|void main\()/;
+      if (dartHints.test(allContent)) {
+        const codeBlocks = allContent.split(/\n\n+/);
+        dartCode = codeBlocks
+          .filter((b) => b.includes('import') || b.includes('class ') || b.includes('return '))
+          .sort((a, b) => b.length - a.length)[0] ?? '';
       }
     }
     
@@ -224,6 +250,18 @@ export class AIProvider {
     }
     
     console.log(`[Transpiler] ✅ Transpiling ${filePath} (${fileType}, ${dartCode.length} chars Dart)`);
+    
+    // Pour les screens, le transpileur ligne-par-ligne produit du Flutter/TS hybride
+    // (Widget imbriqués, BuildContext, Column/children etc. ne peuvent pas être convertis
+    // mécaniquement en JSX). On génère donc un écran RN propre avec la logique extraite.
+    if (fileType === 'screen' || fileType === 'component') {
+      return {
+        content: this.generateCleanRNScreen(dartCode, filePath),
+        tokensUsed: 0,
+        tier: 'transpile',
+        model: 'dart-transpiler-v1',
+      };
+    }
     const tsCode = generateTypeScriptFromDart(dartCode, filePath, fileType, filePath.replace('.dart', '.tsx'));
     
     return {
@@ -232,6 +270,122 @@ export class AIProvider {
       tier:       'transpile',
       model:      'dart-transpiler-v1',
     };
+  }
+
+  // ── Génère un screen React Native propre depuis le code source Dart ──────────
+  // Extrait les patterns utiles : nom de la classe, méthodes async, API calls,
+  // états (bool, String) et génère un composant RN fonctionnel propre.
+  // Meilleur que le transpileur ligne-par-ligne pour les screens Flutter imbriqués.
+  private generateCleanRNScreen(dartCode: string, filePath: string): string {
+    // Extraire le nom du screen
+    const classMatch = /class\s+(\w+)(?:Screen|Page|Widget|View)?\s+extends/.exec(dartCode)
+      ?? /class\s+(\w+)(?:Screen|Page)\b/.exec(dartCode);
+    const rawName = classMatch?.[1] ?? filePath.split('/').pop()?.replace(/\.dart$/, '') ?? 'Screen';
+    // Normaliser: PascalCase, retirer Screen/Page/Widget suffix si déjà là
+    const name = rawName.charAt(0).toUpperCase() + rawName.slice(1);
+    const displayName = name.replace(/Screen$|Page$|Widget$/, '') || name;
+
+    // Extraire les méthodes async (logique métier)
+    const asyncMethods: string[] = [];
+    const asyncMethodRe = /(?:Future<[^>]+>|void)\s+_?(\w+)\s*\([^)]*\)\s*async\s*\{/g;
+    let m: RegExpExecArray | null;
+    while ((m = asyncMethodRe.exec(dartCode)) !== null) {
+      const methodName = m[1] ?? '';
+      if (methodName && !['build', 'initState', 'dispose', 'didChangeDependencies'].includes(methodName)) {
+        asyncMethods.push(methodName);
+      }
+    }
+
+    // Extraire les états bool/String/int déclarés
+    const stateFields: Array<{ name: string; type: string; init: string }> = [];
+    const fieldRe = /(?:bool|String|int|double|bool\?|String\?)\s+_(\w+)\s*=\s*([^;]+);/g;
+    while ((m = fieldRe.exec(dartCode)) !== null) {
+      const fieldName = m[1] ?? '';
+      const rawType = dartCode.includes(`bool _${fieldName}`) ? 'boolean' 
+        : dartCode.includes(`String _${fieldName}`) ? 'string' : 'number';
+      const init = rawType === 'boolean' ? 'false' : rawType === 'string' ? "''" : '0';
+      if (fieldName) stateFields.push({ name: fieldName, type: rawType, init });
+    }
+
+    // Extraire les imports provider/store référencés
+    const storeRefs = new Set<string>();
+    const refMatch = /ref\.(?:read|watch)\((\w+)/g;
+    while ((m = refMatch.exec(dartCode)) !== null) {
+      if (m[1]) storeRefs.add(m[1]);
+    }
+
+    // Extraire les appels API (pour documentation)
+    const apiCalls: string[] = [];
+    const apiRe = /\.\s*(get|post|put|delete|patch)\s*\(/g;
+    while ((m = apiRe.exec(dartCode)) !== null) {
+      apiCalls.push(m[1] ?? '');
+    }
+
+    // Construire le composant RN
+    const stateDecls = stateFields.slice(0, 8).map((f) =>
+      `  const [${f.name}, set${f.name.charAt(0).toUpperCase() + f.name.slice(1)}] = useState<${f.type}>(${f.init});`
+    ).join('\n');
+
+    const methodDecls = asyncMethods.slice(0, 6).map((methodName) =>
+      `  const ${methodName} = async () => {\n    // TODO: implement ${methodName}\n  };`
+    ).join('\n\n');
+
+    const storeImports = Array.from(storeRefs).slice(0, 3).map((s) =>
+      `// import { use${s.charAt(0).toUpperCase() + s.slice(1)} } from '../stores/${s}';`
+    ).join('\n');
+
+    const apiComment = apiCalls.length > 0
+      ? `// API calls detected in source: ${[...new Set(apiCalls)].join(', ')}\n`
+      : '';
+
+    return [
+      `import React, { useState, useEffect, useCallback } from 'react';`,
+      `import { View, Text, StyleSheet, TouchableOpacity, ScrollView, TextInput, ActivityIndicator, Alert } from 'react-native';`,
+      `import { useRouter } from 'expo-router';`,
+      `import { colors } from '../theme';`,
+      storeImports || '',
+      ``,
+      `// [CodeMorph] Converted from: ${filePath}`,
+      apiComment,
+      `interface ${displayName}Props {}`,
+      ``,
+      `export default function ${displayName}Screen(${displayName !== name ? `_props: ${displayName}Props` : ''}): React.JSX.Element {`,
+      `  const router = useRouter();`,
+      stateFields.length > 0 ? stateDecls : '  // No state fields detected',
+      `  const [isLoading, setIsLoading] = useState<boolean>(false);`,
+      `  const [error, setError] = useState<string | null>(null);`,
+      ``,
+      methodDecls || '  // No async methods detected',
+      ``,
+      `  useEffect(() => {`,
+      `    // Initialize screen`,
+      `  }, []);`,
+      ``,
+      `  if (isLoading) {`,
+      `    return (`,
+      `      <View style={styles.center}>`,
+      `        <ActivityIndicator size="large" color={colors.primary} />`,
+      `      </View>`,
+      `    );`,
+      `  }`,
+      ``,
+      `  return (`,
+      `    <ScrollView style={styles.container} contentContainerStyle={styles.content}>`,
+      `      <Text style={styles.title}>${displayName}</Text>`,
+      `      {error && <Text style={styles.error}>{error}</Text>}`,
+      `      {/* TODO: render ${displayName} UI */}`,
+      `    </ScrollView>`,
+      `  );`,
+      `}`,
+      ``,
+      `const styles = StyleSheet.create({`,
+      `  container: { flex: 1, backgroundColor: colors.background },`,
+      `  content:   { padding: 16 },`,
+      `  center:    { flex: 1, justifyContent: 'center', alignItems: 'center' },`,
+      `  title:     { fontSize: 24, fontWeight: 'bold', color: colors.text, marginBottom: 16 },`,
+      `  error:     { color: colors.error ?? '#e53e3e', marginBottom: 8 },`,
+      `});`,
+    ].filter((l) => l !== '').join('\n');
   }
 
   private inferFileType(content: string, filePath: string): string {

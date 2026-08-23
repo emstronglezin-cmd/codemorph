@@ -146,6 +146,43 @@ function transpileLine(line: string, ctx: TranspileContext): string {
 
   // Arrow functions: => already valid in TS
 
+  // ── Flutter/Riverpod class patterns → React/TS equivalents ─────────────────
+  // ConsumerStatefulWidget / ConsumerWidget / StatefulWidget → commented
+  l = l.replace(/\bextends\s+ConsumerStatefulWidget\b/g, '/* extends ConsumerStatefulWidget → React FC */');
+  l = l.replace(/\bextends\s+ConsumerWidget\b/g, '/* extends ConsumerWidget → React FC */');
+  l = l.replace(/\bextends\s+ConsumerState<[^>]+>/g, '/* extends ConsumerState → React FC state */');
+  l = l.replace(/\bextends\s+StatefulWidget\b/g, '/* extends StatefulWidget → React FC */');
+  l = l.replace(/\bextends\s+StatelessWidget\b/g, '/* extends StatelessWidget → React FC */');
+  l = l.replace(/\bextends\s+State<[^>]+>/g, '/* extends State → React FC state */');
+  l = l.replace(/\bConsumerState<[^>]+>/g, 'React.FC');
+  // Widget build(BuildContext context) → render(): JSX.Element
+  l = l.replace(/\bWidget\s+build\s*\(\s*BuildContext\s+context[^)]*\)/g, 'render(): React.JSX.Element');
+  // BuildContext → unknown
+  l = l.replace(/\bBuildContext\b/g, 'unknown /* BuildContext */');
+  // GlobalKey<FormState>() → useRef
+  l = l.replace(/\bGlobalKey<FormState>\s*\(\)/g, 'useRef(null) /* FormKey */');
+  l = l.replace(/\bGlobalKey<[^>]+>\s*\(\)/g, 'useRef(null)');
+  // TextEditingController → ref text
+  l = l.replace(/\bnew\s+TextEditingController\s*\(\)/g, "{ text: '' }");
+  l = l.replace(/\bTextEditingController\s*\(\)/g, "{ text: '' }");
+  l = l.replace(/\bTextEditingController\b/g, '{ text: string }');
+  // FocusNode → ref
+  l = l.replace(/\bFocusNode\s*\(\)/g, 'useRef(null)');
+  l = l.replace(/\bFocusNode\b/g, 'unknown /* FocusNode */');
+  // super.key pattern
+  l = l.replace(/\{super\.key\}/g, '');
+  l = l.replace(/super\.key[,;\s]/g, '');
+  // ref.read / ref.watch (Riverpod) → zustand hook
+  l = l.replace(/\bref\.read\s*\(/g, 'useStore(');
+  l = l.replace(/\bref\.watch\s*\(/g, 'useStore(');
+  l = l.replace(/\.notifier\b/g, '');
+  // ScaffoldMessenger → Alert
+  l = l.replace(/ScaffoldMessenger\.of\s*\([^)]*\)\.showSnackBar\s*\(/g, 'alert(');
+  // Navigator → useRouter
+  l = l.replace(/Navigator\.of\s*\([^)]*\)\.push(?:Named|Replacement|AndRemoveUntil)?\s*\(/g, 'router.push(');
+  l = l.replace(/Navigator\.of\s*\([^)]*\)\.pop\s*\(\)/g, 'router.back()');
+  l = l.replace(/Navigator\.pop\s*\([^)]*\)/g, 'router.back()');
+
   // abstract class → abstract class (same)
   // extends → extends (same)
   // implements → implements (same)

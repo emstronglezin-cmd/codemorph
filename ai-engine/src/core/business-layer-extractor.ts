@@ -797,9 +797,11 @@ export async function convertBusinessLayerFile(
       const MIN_OUTPUT_CHARS = Math.max(50, Math.floor(file.charCount * 0.2));
       const MIN_CODE_LINES   = Math.max(5, Math.floor(file.lineCount * 0.15));
 
+      const dartMeta = { filePath: file.path, fileType: file.layerType };
       let res = await ai.chat(
         [{ role: 'system', content: system }, { role: 'user', content: user }],
         maxResponseTokens,
+        dartMeta,
       );
       content = res.content || '';
 
@@ -809,7 +811,7 @@ export async function convertBusinessLayerFile(
         isChunkerFallback(text) ||
         (file.lineCount > 20 && countCodeLines(text) < MIN_CODE_LINES);
 
-      if (needsRetry(content) && (tier as string) !== 'static') {
+      if (needsRetry(content) && (tier as string) !== 'static' && (tier as string) !== 'transpile') {
         const reason = isChunkerFallback(content)
           ? 'output is Dart source in comment blocks (chunker fallback)'
           : countCodeLines(content) < MIN_CODE_LINES
@@ -817,8 +819,6 @@ export async function convertBusinessLayerFile(
             : `too short (${content.length}/${MIN_OUTPUT_CHARS} chars)`;
 
         console.warn(`[BizLayerExtractor] ⚠️  Retry for "${file.path}": ${reason}`);
-        // Le rate limiter global dans ai-provider.ts gère l'espacement des requêtes.
-        // Pas de délai additionnel ici — évite les doubles attentes.
 
         const retryUser = `${user}
 
@@ -830,6 +830,7 @@ Output the complete, working TypeScript file now.`;
         res = await ai.chat(
           [{ role: 'system', content: system }, { role: 'user', content: retryUser }],
           maxResponseTokens,
+          dartMeta,
         );
         content = res.content || '';
       }

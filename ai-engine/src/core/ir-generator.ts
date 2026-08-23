@@ -47,6 +47,14 @@ export class IRGenerator {
       return this.buildStaticIR(ctx, ast, arch);
     }
 
+    // FIX: transpile tier — build IR from AST without any AI call
+    // IRGenerator calling ai.chat() in transpile mode returns a context stub (not IR JSON)
+    // → IR has 0 screens → businessLogic=0/100. Fix: infer directly from AST.
+    if (tier === 'transpile') {
+      console.log(`[IRGenerator] transpile tier — building IR from AST (no AI call)`);
+      return this.buildTranspileIR(ctx, ast, arch);
+    }
+
     // ── FIX PHASE 21: For Groq (free-groq) with 2048 token limit ──────────
     // The problem: with 2048 tokens, JSON responses get truncated → JSON.parse fails
     // → generateUIGraph returns { screens: [], components: [] } → only 4 files
@@ -263,6 +271,69 @@ export class IRGenerator {
       })),
       stateFlow: [],
     };
+  }
+
+  // ── Transpile IR — build from AST without any AI call ────────────────────
+  // Called when tier === 'transpile'. Avoids feeding ai.chat() which in transpile
+  // mode returns a context stub (not JSON) → causing IR.screens = 0 → businessLogic=0
+  private buildTranspileIR(ctx: ConversionContext, ast: ASTResult, arch: ArchResult): IRGenerationResult {
+    const uiGraph = this.inferUIGraphFromAST(ast, ctx);
+    const frameworkMap = FRAMEWORK_DEP_MAPS[`${ctx.sourceFramework}->${ctx.targetFramework}`];
+
+    // Build minimal backend graph from service/repository files
+    const beFiles = ast.files.filter((f) => /service|repository|repo/i.test(f.path));
+    const backendGraph: IRDocument['backendGraph'] = {
+      routes:      [],
+      services:    beFiles.filter((f) => /service/i.test(f.path)).map((f) => ({
+        name:         f.classes[0] ?? f.path.split('/').pop()?.replace('.dart','') ?? 'Service',
+        methods:      f.functions.slice(0, 8).map((fn) => ({ name: fn, params: [], returnType: 'Promise<unknown>', async: true })),
+        dependencies: [],
+      })),
+      entities:    [],
+      middlewares: [],
+    };
+
+    // Build data layer from model files
+    const modelFiles = ast.files.filter((f) => /model|entity/i.test(f.path));
+    const dataLayer: IRDocument['dataLayer'] = {
+      models:        modelFiles.map((f) => ({
+        name:      f.classes[0] ?? f.path.split('/').pop()?.replace('.dart','') ?? 'Model',
+        table:     (f.classes[0] ?? 'model').toLowerCase() + 's',
+        fields:    [{ name: 'id', type: 'String', nullable: false, unique: true, primary: true }],
+        relations: [],
+      })),
+      relationships: [],
+      migrations:    [],
+    };
+
+    const sourceMetrics: IRSourceMetrics = {
+      screensCount:   uiGraph.screens?.length ?? 0,
+      modelsCount:    dataLayer.models?.length ?? 0,
+      servicesCount:  backendGraph.services?.length ?? 0,
+      endpointsCount: 0,
+      storesCount:    0,
+      assetsCount:    ast.assetFiles?.length ?? 0,
+      featuresDetected: [...(ast.statePatterns ?? []), ...(ast.externalServices ?? [])],
+    };
+
+    const knowledgeGraph = this.buildKnowledgeGraph(uiGraph, backendGraph, dataLayer, ast);
+    const designTokens   = this.extractDesignTokens(ast);
+
+    const ir: IRDocument = {
+      projectMeta:   this.buildProjectMeta(ctx, ast, arch),
+      architecture:  this.buildArchitecture(arch),
+      uiGraph,
+      backendGraph,
+      dataLayer,
+      dependencyMap: frameworkMap ?? { keep: [], replace: [], remove: [], add: [] },
+      conversionPlan: this.buildConversionPlan(ctx, arch),
+      validation: { ...this.buildValidation(ctx, ast, arch), sourceMetrics },
+      knowledgeGraph,
+      ...(designTokens ? { designTokens } : {}),
+    };
+
+    console.log(`[IRGenerator] transpile IR built — screens=${uiGraph.screens.length} services=${backendGraph.services.length} models=${dataLayer.models.length}`);
+    return { ir, tokensUsed: 0 };
   }
 
   // ── Static IR (no AI — Free tier fallback) ────────────────────────────────

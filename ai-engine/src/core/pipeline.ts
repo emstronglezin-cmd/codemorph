@@ -922,7 +922,8 @@ export class ConversionPipeline {
     const isFlutterTarget = files.some((f) => /\.dart$/.test(f.path));
     const screenPattern = isFlutterTarget
       ? /\/(screens?|pages?|views?)\/[^/]+\.dart$/
-      : /\/(screens?|pages?|app)\/[^/]+\.tsx?$/;
+      // FIX: match both /app/login.tsx AND app/login.tsx (leading slash optional)
+      : /(?:^|\/)(?:screens?|pages?|app)\/[^/]+\.tsx?$/;
     const screenExclude = isFlutterTarget
       ? /loading|error|empty|splash_screen/
       : /layout|index|\(tabs\)/;
