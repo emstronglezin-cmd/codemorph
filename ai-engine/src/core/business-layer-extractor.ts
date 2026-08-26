@@ -489,9 +489,9 @@ export function generateTargetPath(
 
   // React Native (default)
   switch (layerType) {
-    case 'service':
     case 'repository':
-    case 'datasource':   return `src/services/${camel}.ts`;
+    case 'datasource':   return `src/repositories/${camel}.ts`;
+    case 'service':      return `src/services/${camel}.ts`;
     case 'store':
     case 'provider':
     case 'bloc':

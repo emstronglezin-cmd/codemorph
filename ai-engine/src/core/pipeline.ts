@@ -1059,7 +1059,8 @@ export class ConversionPipeline {
     const generatedRepos = files.filter((f) =>
       isFlutterTarget
         ? /\/(repo(?:sitori(?:es|y))?|datasource)\/[^/]+\.dart$/.test(f.path)
-        : /\/(repo(?:sitori(?:es|y))?|dao)\/[^/]+\.(ts|js)$/.test(f.path)
+        // FIX: RN repos now go to src/repositories/ — match that path
+        : /(?:^|\/)(?:repo(?:sitori(?:es|y))?|dao)\/[^/]+\.(ts|js)$/.test(f.path)
     ).length;
     const repoScore: number | null = nawareRatio(generatedRepos, sourceRepos, repoPresent);
     details.push({
@@ -1280,7 +1281,13 @@ export class ConversionPipeline {
     const sourceEntities      = (ir.dataLayer?.models?.length ?? 0);
     const sourceMigrations    = (ir.dataLayer?.migrations?.length ?? 0);
     const dataSourcePresent   = presence.dataLayer;
-    const genEntities         = files.filter((f) => /\.entity\.(ts|js)$/.test(f.path)).length;
+    // FIX: React Native génère src/types/*.types.ts (pas *.entity.ts comme NestJS)
+    // Les deux patterns sont équivalents dans leur contexte respectif
+    const genEntities         = files.filter((f) =>
+      /\.entity\.(ts|js)$/.test(f.path) ||
+      /\/types\/\w+\.types\.(ts|js)$/.test(f.path) ||
+      /\/models\/\w+\.(ts|js)$/.test(f.path)
+    ).length;
     const genMigrations       = files.filter((f) => /migration|migrate/.test(f.path)).length;
     const dataTotal           = sourceEntities + sourceMigrations;
     const dataScore: number | null = nawareRatio(genEntities + genMigrations, dataTotal, dataSourcePresent);

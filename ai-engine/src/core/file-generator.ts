@@ -113,11 +113,16 @@ function isOutputValid(
   const lines = allLines.filter((l) => l.trim().length > 0);
 
   // Vérifier ratio de préservation (sauf pour configs et utils courts)
-  if (sourceLines > 20 && !['config', 'util', 'hook'].includes(fileType)) {
+  // TRANSPILE: screen/component Flutter (300-500L) → RN (~100-150L) — ratio faible est normal
+  // On exclut screen/component du ratio check; on vérifie juste > 40 lignes
+  if (sourceLines > 20 && !['config', 'util', 'hook', 'screen', 'component'].includes(fileType)) {
     const ratio = lines.length / sourceLines;
     if (ratio < MIN_PRESERVATION_RATIO) {
       return { valid: false, reason: `too short relative to source (${lines.length}/${sourceLines} lines = ${(ratio * 100).toFixed(0)}%)` };
     }
+  }
+  if (['screen', 'component'].includes(fileType) && lines.length < 40) {
+    return { valid: false, reason: `screen too short (${lines.length} lines) — need >=40 for real RN screen` };
   }
 
   // Vérifier présence d'un export valide pour les fichiers TS
