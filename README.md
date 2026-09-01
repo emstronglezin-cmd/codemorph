@@ -330,3 +330,12 @@ interface IRDocument {
 ## 📄 License
 
 MIT © 2024 CodeMorph
+
+
+## Deployment Status
+
+> Last updated: 2026-09-01
+
+- **AI Engine**: CODEMORPH_TRANSPILE_MODE=true — deterministic Flutter→RN transpiler active
+- **Latest**: commit 36f324e — scanner/trajet screens + dataLayer + ratio validation transpile
+- **Fidelity**: Movia 91/100, TodoApp 80/100
