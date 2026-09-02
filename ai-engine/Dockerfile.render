@@ -2,6 +2,7 @@
 # CodeMorph AI Engine — Dockerfile pour Render Free Tier
 # Runtime: Node.js 20 Alpine
 # Build context: repo root (docker context = .)
+# Phase 27: fix SEC-01 + heartbeat watchdog
 # ============================================================
 
 # ── Stage 1: deps ────────────────────────────────────────────
