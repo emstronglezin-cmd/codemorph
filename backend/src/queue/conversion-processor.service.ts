@@ -213,6 +213,12 @@ export class ConversionProcessorService {
       this.logger.log(`[PIPELINE] ✅ AI dispatch OK — aiJobId=${aiJobId}, en attente du callback Phase 27`);
       this.logger.log(`[PIPELINE] ═══════════════════════════════════════════════`);
 
+      // FIX PHASE 27 — HEARTBEAT : toucher updatedAt toutes les 30s pendant l'attente du callback
+      // Le watchdog (CONVERTING_STALE_MINUTES=60min) lit updatedAt.
+      // Sans heartbeat, un job CONVERTING depuis >60min serait tué même si l'AI Engine tourne encore.
+      // On lance le heartbeat en fire-and-forget — il s'arrête tout seul quand le job change de statut.
+      void this.runHeartbeat(jobId, 30_000);
+
       // Comptabiliser l'utilisation AI
       await this.quotaService.incrementConversions(dto.userId, plan);
 
@@ -239,5 +245,41 @@ export class ConversionProcessorService {
       // Relancer pour que Bull/MemoryQueue gère le retry
       throw err;
     }
+  }
+
+  // ── Heartbeat fire-and-forget ──────────────────────────
+  // FIX PHASE 27 — Tant qu'un job est CONVERTING, on touche updatedAt
+  // toutes les `intervalMs` millisecondes pour signaler "je suis vivant".
+  // Le watchdog (CONVERTING_STALE_MINUTES=60min basé sur updatedAt) ne tuera
+  // pas ce job tant que le heartbeat tourne.
+  // S'arrête automatiquement quand le job passe en DONE, FAILED ou après 2h max.
+  private async runHeartbeat(jobId: string, intervalMs: number): Promise<void> {
+    const MAX_DURATION_MS = 2 * 60 * 60 * 1000; // 2h max
+    const startedAt = Date.now();
+    let iterations = 0;
+
+    while (Date.now() - startedAt < MAX_DURATION_MS) {
+      await new Promise<void>((resolve) => setTimeout(resolve, intervalMs));
+      iterations++;
+
+      try {
+        const job = await this.jobsService.findById(jobId);
+        if (job.status !== JobStatus.CONVERTING) {
+          this.logger.debug(
+            `[Heartbeat] Job ${jobId} — status=${job.status} (not CONVERTING) → stopping heartbeat after ${iterations} iterations`,
+          );
+          return;
+        }
+        // Mettre à jour updatedAt pour signaler activité
+        await this.jobsService.heartbeat(jobId);
+        this.logger.debug(`[Heartbeat] Job ${jobId} — alive (iteration=${iterations})`);
+      } catch (e) {
+        // Job supprimé ou erreur DB → arrêter le heartbeat
+        this.logger.warn(`[Heartbeat] Job ${jobId} — error, stopping: ${(e as Error).message}`);
+        return;
+      }
+    }
+
+    this.logger.warn(`[Heartbeat] Job ${jobId} — max duration (2h) reached, stopping`);
   }
 }

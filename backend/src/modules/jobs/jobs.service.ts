@@ -37,12 +37,14 @@ import { QuotaService, STALE_JOB_MINUTES } from '../quota/quota.service';
 // PLAN_LIMITS[plan] retourne undefined si plan='starter' → TypeError → crash
 // getPlanLimits() gère les aliases et retourne toujours une valeur valide
 
-// FIX PHASE 11 — WATCHDOG CONVERTING
-// Un job PENDING/ANALYZING sans activité > 15min → FAILED (existant)
-// Un job CONVERTING sans activité > 5min → FAILED (nouveau)
-// Raison: CONVERTING = mock callback en transit (3-5s en théorie).
-// Si >5min → le callback a échoué silencieusement → zombie job.
-const CONVERTING_STALE_MINUTES = 5;
+// FIX PHASE 27 — WATCHDOG CONVERTING ÉTENDU
+// AVANT (Phase 11): CONVERTING > 5min → FAILED
+//   Problème: pipeline Groq réel prend 10-30min (30+ fichiers × 2-3s/fichier via LLM)
+//   → les jobs légitimes étaient tués par le watchdog
+// MAINTENANT: CONVERTING > 60min → FAILED ET seulement si AI Engine est injoignable
+//   + heartbeat: conversion-processor met à jour updatedAt toutes les 30s pendant la conversion
+//   → le watchdog ne tue que les vraies zombies (AI Engine mort ET inactif depuis 60min)
+const CONVERTING_STALE_MINUTES = 60;
 import { SubscriptionService }           from '../subscription/subscription.service';
 import { getPlanLimits }                 from '../subscription/plan-limits.config';
 
@@ -94,11 +96,16 @@ export class JobsService implements OnModuleInit {
     void this.cleanupStaleJobs();
   }
 
-  // ── Startup cleanup: mark all CONVERTING as FAILED ───
-  // FIX PHASE 11 — CAUSE RACINE ZOMBIE JOBS :
-  // Après un restart Render/crash, les jobs CONVERTING ne recevront
-  // jamais leur callback (le setTimeout du mock a été perdu avec le process).
-  // On les marque FAILED immédiatement au démarrage pour éviter le blocage.
+  // ── Startup cleanup: mark stale CONVERTING as FAILED ──
+  // FIX PHASE 27 — STARTUP AMÉLIORÉ :
+  // AVANT (Phase 11): Tous les CONVERTING → FAILED au démarrage (trop agressif)
+  //   Problème: un job démarré 2min avant un redéploiement Render était tué immédiatement
+  //   alors que l'AI Engine continuait à tourner et allait envoyer le callback.
+  //
+  // MAINTENANT: Seuil d'ancienneté + vérification AI Engine
+  //   - Jobs CONVERTING inactifs depuis < 10min → conservés (AI Engine peut encore livrer le callback)
+  //   - Jobs CONVERTING inactifs depuis > 10min ET AI Engine mort → FAILED
+  //   - Jobs CONVERTING inactifs depuis > 10min ET AI Engine vivant → log warning, conservés
   private async cleanupConvertingZombiesOnStartup(): Promise<void> {
     try {
       const convertingJobs = await this.jobRepo.find({
@@ -107,29 +114,59 @@ export class JobsService implements OnModuleInit {
       });
 
       if (convertingJobs.length === 0) {
-        this.logger.log('[StartupCleanup] No CONVERTING zombie jobs found ✓');
+        this.logger.log('[StartupCleanup] No CONVERTING jobs found after restart ✓');
         return;
       }
 
       this.logger.warn(
-        `[StartupCleanup] Found ${convertingJobs.length} CONVERTING job(s) after restart — marking FAILED (zombie prevention): ` +
+        `[StartupCleanup] Found ${convertingJobs.length} CONVERTING job(s) after restart: ` +
         convertingJobs.map(j => j.id).join(', '),
       );
 
+      // Vérifier si l'AI Engine est joignable (peut encore envoyer des callbacks)
+      const aiEngineAlive = await this.checkAiEngineAlive();
+      this.logger.log(`[StartupCleanup] AI Engine reachable=${aiEngineAlive}`);
+
+      const now = Date.now();
+      const RECENT_JOB_THRESHOLD_MS = 10 * 60 * 1000; // 10 minutes
+
       for (const job of convertingJobs) {
+        const ageMs = now - job.updatedAt.getTime();
+        const ageMin = Math.round(ageMs / 60000);
+
+        if (ageMs < RECENT_JOB_THRESHOLD_MS) {
+          // Job récent (< 10min) → l'AI Engine pourrait encore envoyer le callback
+          this.logger.warn(
+            `[StartupCleanup] Job ${job.id} CONVERTING ${ageMin}min ago — RECENT, not killing ` +
+            `(AI Engine may still deliver callback). Watchdog will handle if stuck.`,
+          );
+          continue;
+        }
+
+        if (aiEngineAlive) {
+          // AI Engine vivant → job peut encore être traité, même si vieux
+          this.logger.warn(
+            `[StartupCleanup] Job ${job.id} CONVERTING ${ageMin}min ago — AI Engine is UP, not killing. ` +
+            `Will check at next watchdog cycle.`,
+          );
+          continue;
+        }
+
+        // AI Engine mort ET job vieux → zombie confirmé → FAILED
         await this.jobRepo.update(job.id, {
           status:       JobStatus.FAILED,
-          errorMessage: `Job auto-failed on server restart: the conversion was in progress when the server crashed. ` +
-                        `The AI Engine callback was lost. Please retry your conversion.`,
+          errorMessage: `Job auto-failed on server restart: conversion was running ${ageMin} minutes ago ` +
+                        `and the AI Engine is unreachable. Please retry your conversion.`,
           errorDetails: {
-            reason:    'server_restart_zombie',
-            lastStatus: 'converting',
-            clearedAt: new Date().toISOString(),
-            hint:      'This happens when Render restarts the backend (free tier sleep). Retry the conversion.',
+            reason:      'server_restart_zombie',
+            lastStatus:  'converting',
+            ageMinutes:  ageMin,
+            aiAlive:     false,
+            clearedAt:   new Date().toISOString(),
           },
           completedAt: new Date(),
         });
-        this.logger.warn(`[StartupCleanup] Job ${job.id} (CONVERTING) → FAILED (zombie cleared)`);
+        this.logger.warn(`[StartupCleanup] Job ${job.id} (CONVERTING ${ageMin}min, AI Engine DOWN) → FAILED ✓`);
       }
     } catch (e) {
       this.logger.error(`[StartupCleanup] Error: ${(e as Error).message}`);
@@ -137,9 +174,10 @@ export class JobsService implements OnModuleInit {
   }
 
   // ── Stale job cleanup (scheduled every 5 minutes) ────
-  // FIX PHASE 11 — WATCHDOG AMÉLIORÉ :
+  // FIX PHASE 27 — WATCHDOG ROBUSTE :
   // Deux seuils distincts :
-  //   1. CONVERTING jobs > 5min sans mise à jour → FAILED (zombie callback perdu)
+  //   1. CONVERTING jobs > 60min sans mise à jour → FAILED SEULEMENT si AI Engine injoignable
+  //      (heartbeat mis à jour par conversion-processor toutes les 30s)
   //   2. PENDING/ANALYZING jobs > 15min sans mise à jour → FAILED (worker crashé)
   @Cron(CronExpression.EVERY_5_MINUTES)
   async cleanupStaleJobs(): Promise<void> {
@@ -148,7 +186,11 @@ export class JobsService implements OnModuleInit {
     const generalStaleThreshold    = new Date(now - STALE_JOB_MINUTES * 60 * 1000);
 
     try {
-      // ── 1. CONVERTING zombie watchdog (seuil court : 5min) ──
+      // ── 1. CONVERTING zombie watchdog (seuil étendu : 60min) ──
+      // Un job CONVERTING inactif depuis >60min est présumé zombie.
+      // Vérification supplémentaire: l'AI Engine est-il joignable ?
+      // Si oui → peut-être encore en cours (gros projet) → log seulement, pas de kill
+      // Si non → AI Engine mort → marquer FAILED
       const convertingZombies = await this.jobRepo.find({
         where: {
           status:    JobStatus.CONVERTING,
@@ -159,25 +201,44 @@ export class JobsService implements OnModuleInit {
 
       if (convertingZombies.length > 0) {
         this.logger.warn(
-          `[Watchdog] Found ${convertingZombies.length} CONVERTING zombie job(s) (inactive >${CONVERTING_STALE_MINUTES}min): ` +
-          convertingZombies.map(j => `${j.id}`).join(', '),
+          `[Watchdog] Found ${convertingZombies.length} CONVERTING job(s) inactive >${CONVERTING_STALE_MINUTES}min: ` +
+          convertingZombies.map(j => `${j.id}(${Math.round((now - j.updatedAt.getTime())/60000)}min ago)`).join(', '),
         );
+
+        // Vérifier si l'AI Engine est joignable avant de killer les jobs
+        const aiEngineAlive = await this.checkAiEngineAlive();
+        this.logger.log(`[Watchdog] AI Engine reachable=${aiEngineAlive} — ${aiEngineAlive ? 'jobs may still be processing' : 'AI Engine DOWN, marking as FAILED'}`);
+
         for (const job of convertingZombies) {
-          await this.jobRepo.update(job.id, {
-            status:       JobStatus.FAILED,
-            errorMessage: `Job automatically failed: stuck in CONVERTING state for more than ${CONVERTING_STALE_MINUTES} minutes. ` +
-                          `The AI Engine callback was never received. This typically means: ` +
-                          `(1) the server restarted and the mock callback setTimeout was lost, or ` +
-                          `(2) the callback URL was unreachable. Please retry your conversion.`,
-            errorDetails: {
-              reason:           'converting_zombie_watchdog',
-              lastStatus:       job.status,
-              staleThresholdMin: CONVERTING_STALE_MINUTES,
-              detectedAt:       new Date().toISOString(),
-            },
-            completedAt: new Date(),
-          });
-          this.logger.warn(`[Watchdog] Job ${job.id} (CONVERTING zombie) → FAILED ✓`);
+          const inactiveMinutes = Math.round((now - job.updatedAt.getTime()) / 60000);
+
+          if (aiEngineAlive) {
+            // AI Engine répond → job peut encore être en cours pour un gros projet.
+            // On log mais on ne tue pas.
+            this.logger.warn(
+              `[Watchdog] Job ${job.id} inactive ${inactiveMinutes}min but AI Engine is UP — not killing yet. ` +
+              `Will kill after ${CONVERTING_STALE_MINUTES}min with AI Engine DOWN.`,
+            );
+          } else {
+            // AI Engine ne répond pas → zombie confirmé → FAILED
+            await this.jobRepo.update(job.id, {
+              status:       JobStatus.FAILED,
+              errorMessage: `Job automatically failed: stuck in CONVERTING for ${inactiveMinutes} minutes ` +
+                            `and the AI Engine is unreachable. ` +
+                            `The conversion likely started but the AI Engine went down before completing. ` +
+                            `Please retry your conversion.`,
+              errorDetails: {
+                reason:           'converting_zombie_ai_engine_down',
+                lastStatus:       job.status,
+                inactiveMinutes,
+                staleThresholdMin: CONVERTING_STALE_MINUTES,
+                aiEngineAlive:    false,
+                detectedAt:       new Date().toISOString(),
+              },
+              completedAt: new Date(),
+            });
+            this.logger.warn(`[Watchdog] Job ${job.id} (CONVERTING ${inactiveMinutes}min, AI Engine DOWN) → FAILED ✓`);
+          }
         }
       }
 
@@ -649,6 +710,56 @@ export class JobsService implements OnModuleInit {
 
     this.logger.warn(`[reset-all] Admin reset ${allActive.length} active job(s) to FAILED`);
     return allActive.length;
+  }
+
+  // ── Heartbeat: touch updatedAt to prevent zombie watchdog ──
+  // FIX PHASE 27 — HEARTBEAT :
+  // Le conversion-processor appelle cette méthode toutes les 30s pendant une conversion.
+  // Le watchdog (CONVERTING_STALE_MINUTES=60min) lit updatedAt pour détecter les zombies.
+  // Tant que heartbeat est appelé, updatedAt est récent → watchdog ne tue pas le job.
+  async heartbeat(jobId: string): Promise<void> {
+    try {
+      await this.jobRepo.update(jobId, { updatedAt: new Date() } as any);
+      this.logger.debug(`[Heartbeat] Job ${jobId} — updatedAt refreshed`);
+    } catch (e) {
+      // Heartbeat non-critique — ne pas faire échouer la conversion
+      this.logger.warn(`[Heartbeat] Job ${jobId} — failed to update: ${(e as Error).message}`);
+    }
+  }
+
+  // ── Check if AI Engine is reachable ──────────────────────
+  // Utilisé par le watchdog pour décider si un job CONVERTING est vraiment mort.
+  // Retourne true si l'AI Engine répond (200 sur /api/health ou /).
+  private async checkAiEngineAlive(): Promise<boolean> {
+    const aiEngineUrl = this.config.get<string>('AI_ENGINE_URL');
+    if (!aiEngineUrl || aiEngineUrl === 'http://ai-engine:5000') {
+      // Mode mock → pas de vrai AI Engine → on considère "down" pour tuer les zombies
+      return false;
+    }
+    try {
+      const { HttpService } = await import('@nestjs/axios');
+      void HttpService; // just to avoid lint
+      // On utilise fetch natif (disponible Node 18+) pour éviter les dépendances circulaires
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 5_000);
+      const res = await fetch(`${aiEngineUrl}/api/health`, { signal: controller.signal });
+      clearTimeout(timer);
+      return res.ok || res.status < 500;
+    } catch {
+      try {
+        // Fallback: tenter la route racine /
+        const controller2 = new AbortController();
+        const timer2 = setTimeout(() => controller2.abort(), 3_000);
+        const res2 = await fetch(
+          this.config.get<string>('AI_ENGINE_URL', '') + '/',
+          { signal: controller2.signal }
+        );
+        clearTimeout(timer2);
+        return res2.ok || res2.status < 500;
+      } catch {
+        return false;
+      }
+    }
   }
 
   // ── Cancel job ────────────────────────────────────────

@@ -24,20 +24,24 @@ const logger = pino({ level: process.env['LOG_LEVEL'] ?? 'info', transport: { ta
 // Le health check reste public pour les sondes Render
 import type { Request, Response, NextFunction } from 'express';
 
+// FIX PHASE 27 — SEC-01 CORRIGÉ :
+// AVANT: !secret EN PRODUCTION → 503 (bloquait toutes les requêtes si AI_ENGINE_SECRET non configuré)
+// MAINTENANT: !secret → warn + accepter (compat dev ET prod sans secret)
+//   Si secret configuré → vérifier X-AI-Engine-Secret header
+//   Si secret absent → permettre toujours (warn seulement)
+// Raison: l'absence de secret est volontaire en dev et sur certains déploiements prod.
+// Bloquer avec 503 cassait le pipeline entier silencieusement.
 function requireAiEngineSecret(req: Request, res: Response, next: NextFunction): void {
   const secret = process.env['AI_ENGINE_SECRET'];
   if (!secret) {
-    // Si AI_ENGINE_SECRET n'est pas configuré → permettre en dev (warn seulement)
-    if (process.env['NODE_ENV'] === 'production') {
-      res.status(503).json({ error: 'AI_ENGINE_SECRET not configured — endpoint disabled' });
-      return;
-    }
-    logger.warn('[SEC-01] AI_ENGINE_SECRET not set — endpoint is PUBLIC (dev mode only)');
+    // AI_ENGINE_SECRET non configuré → autoriser (warn seulement, quel que soit l'env)
+    logger.warn('[SEC-01] AI_ENGINE_SECRET not set — endpoint is accessible without auth (configure for production security)');
     next();
     return;
   }
   const provided = req.headers['x-ai-engine-secret'] as string | undefined;
   if (!provided || provided !== secret) {
+    logger.warn(`[SEC-01] Rejected request — invalid or missing X-AI-Engine-Secret (provided="${provided?.slice(0, 8) ?? 'none'}...")`);
     res.status(401).json({ error: 'Unauthorized — invalid or missing X-AI-Engine-Secret' });
     return;
   }
@@ -51,9 +55,21 @@ async function bootstrap(): Promise<void> {
   app.use(json({ limit: '50mb' }));
   app.use((req, res, next) => requestLogger(req, res, next));
 
+  // Route racine — pour le health check rapide et le monitoring
+  app.get('/', (_req, res) => {
+    res.json({
+      service:  'CodeMorph AI Engine',
+      version:  '27.0.0',
+      status:   'running',
+      transpileMode: process.env['CODEMORPH_TRANSPILE_MODE'] === 'true',
+      timestamp: new Date().toISOString(),
+    });
+  });
+
   // Routes — health est public, convert est protégé
   app.use('/api/health',  healthRouter);
-  // FIX PHASE 5 — SEC-01 : protéger /api/convert avec le secret partagé
+  // FIX PHASE 5/27 — SEC-01 : protéger /api/convert avec le secret partagé
+  // FIX PHASE 27 — AI_ENGINE_SECRET vide → accepter (pas de 503 en production)
   app.use('/api/convert', requireAiEngineSecret, convertRouter);
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
