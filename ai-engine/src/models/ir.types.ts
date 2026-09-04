@@ -293,6 +293,12 @@ export interface ConversionContext {
    * Format :  "STRUCTURAL_SUMMARY:\n screens=N, services=M, ..."
    */
   structuralSummary?: string | undefined;
+  /**
+   * URL de progression — si fourni, le pipeline envoie des mises à jour HTTP POST
+   * pendant la conversion (phase actuelle, fichiers X/Y, appels AI, durée, etc.)
+   * Format : POST { jobId, phase, filesDone, filesTotal, aiCalls, elapsedMs, message }
+   */
+  progressUrl?: string | undefined;
 }
 
 export interface ConversionOptions {

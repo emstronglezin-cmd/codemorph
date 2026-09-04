@@ -50,6 +50,8 @@ import { validateAllFiles, formatContentReport }          from './content-valida
 import { runStaticValidationSync }                        from './static-validator';
 import { runDeliveryCheck, formatDeliveryReport }         from './delivery-checker';
 import { buildFunctionalTestResults, formatTestResultsReport } from './functional-test-runner';
+// PHASE 28 PERF FIX: progression temps-réel
+import { ProgressReporter }                               from './progress-reporter';
 import type {
   ApplicationSpec, ContentValidationReport,
   DeliveryCheckResult, TestResultsReport,
@@ -247,6 +249,11 @@ export class ConversionPipeline {
     const tier = ConversionPipeline.resolveTier(opts);
     logger.info({ jobId: ctx.jobId, tier }, '🚀 Pipeline started');
 
+    // ── PHASE 28 PERF FIX: Progression temps-réel ────────────────────────────
+    const reporter = new ProgressReporter(ctx.progressUrl, ctx.jobId);
+    // Compter les fichiers sources pour le total
+    const sourceFileCount = (ctx.sourceCode.match(/\/\/\s*=+\s*FILE:/g) ?? []).length || 1;
+
     // ── PHASE 25 Partie F : Métriques timing par phase ───────
     const phaseTimings: Record<string, number> = {};
     const phaseStart = (phase: string) => { phaseTimings[`${phase}_start`] = Date.now(); };
@@ -262,6 +269,7 @@ export class ConversionPipeline {
     // les compteurs screens/services/stores même si le code est tronqué.
     ctx.structuralSummary = this.buildStructuralSummary(ctx.sourceCode);
     console.log(`[PIPELINE] Structural summary built BEFORE truncation: ${ctx.structuralSummary.slice(0, 200)}`);
+    console.log(`[PIPELINE] ⏱️  Source: ${sourceFileCount} files detected, ${ctx.sourceCode.length} chars`);
 
     // Enforce per-tier input limits
     this.enforceLimits(ctx, tier);
@@ -278,6 +286,7 @@ export class ConversionPipeline {
 
     // ── PHASE 1: AST Analysis (no AI) — avec cache ────────
     phaseStart('ast');
+    reporter.report('phase_1_ast', 'AST Analysis', 0, sourceFileCount, `Analyzing ${sourceFileCount} source files…`);
     logger.info({ jobId: ctx.jobId }, '📊 Phase 1: AST Analysis');
     let astResult: Awaited<ReturnType<ASTAnalyzer['analyze']>>;
     const cachedAst = pipelineCache.astCache.get(cacheKey) as typeof astResult | undefined;
@@ -319,6 +328,7 @@ export class ConversionPipeline {
 
     // ── PHASE 2: Architecture Detection — avec cache ───────
     phaseStart('arch');
+    reporter.report('phase_2_arch', 'Architecture Detection', 0, sourceFileCount, 'Detecting app architecture (1 AI call)…');
     logger.info({ jobId: ctx.jobId, tier }, '🏗️  Phase 2: Architecture Detection');
     let archResult: Awaited<ReturnType<ArchitectureDetector['detect']>>;
     const cachedArch = pipelineCache.archCache.get(cacheKey) as typeof archResult | undefined;
@@ -353,6 +363,7 @@ export class ConversionPipeline {
       console.warn(`[PIPELINE] Phase 2.5: AppSpec build failed — ${(specErr as Error).message} (continuing without spec)`);
     }
     phaseStart('ir');
+    reporter.report('phase_3_ir', 'IR Generation', 0, sourceFileCount, 'Building Intermediate Representation (3-5 AI calls)…');
     logger.info({ jobId: ctx.jobId, tier }, '⚙️  Phase 3: IR Generation + Knowledge Graph');
     let irDocument: Awaited<ReturnType<IRGenerator['generate']>>;
     const cachedIR = pipelineCache.irCache.get(cacheKey) as typeof irDocument | undefined;
@@ -428,6 +439,8 @@ export class ConversionPipeline {
 
     // ── PHASE 5: Target Code Plan — avec cache ─────────────
     phaseStart('planning');
+    reporter.report('phase_5_planning', 'Code Planning + File Generation', 0, sourceFileCount,
+      `Generating ${sourceFileCount} files (parallel, 3 concurrent AI calls)…`);
     logger.info({ jobId: ctx.jobId, tier }, '📋 Phase 5: Code Planning (Reconstruction + Visual Fidelity)');
     let plan: Awaited<ReturnType<CodePlanner['plan']>>;
     const planCacheKey = buildCacheKey(cacheKey, ctx.targetFramework ?? '', tier);

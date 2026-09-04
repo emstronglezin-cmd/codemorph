@@ -947,31 +947,33 @@ export async function extractAndConvertBusinessLayers(
     console.warn(`[BizLayerExtractor] ⚠️  Tier "${tier}": processing only ${filesToProcess.length}/${sourceFiles.length} files (limit: ${maxFiles})`);
   }
 
-  // 3. Convertir chaque fichier
-  const convertedFiles: ConvertedBusinessFile[] = [];
-  let successCount = 0;
-  let failedCount = 0;
+  // 3. Convertir chaque fichier — PARALLÈLE (PERF FIX Phase 28)
+  // Le semaphore GroqRateLimiter (MAX_CONCURRENT=3) sérialise automatiquement
+  // les appels Groq. On lance tout en Promise.all pour maximiser le débit
+  // sans saturer l'API.
+  //
+  // AVANT: séquentiel — 20 fichiers × 35s = 700s
+  // APRÈS: 3 en parallèle — 7 batches × 8s = ~56s  (+appels API réels)
+  const resultSlots: ConvertedBusinessFile[] = new Array(filesToProcess.length);
+  const startBizMs = Date.now();
 
-  // NOTE: le rate limiting Groq (35s entre requêtes) est géré globalement
-  // par GroqRateLimiter dans ai-provider.ts — pas de délai adhoc ici.
-  // Cela garantit 0 429 même avec BizLayer + FileGenerator en séquence.
+  await Promise.all(
+    filesToProcess.map(async (file, i) => {
+      console.log(`[BizLayerExtractor] [${i + 1}/${filesToProcess.length}] queued: ${file.layerType}: ${file.path}`);
+      const result = await convertBusinessLayerFile(file, ai, targetFramework);
+      resultSlots[i] = result;
+      const elapsed = ((Date.now() - startBizMs) / 1000).toFixed(0);
+      console.log(`[BizLayerExtractor] [${i + 1}/${filesToProcess.length}] done ${elapsed}s: ${file.path} → ${result.success ? '✅' : '❌'}`);
+    }),
+  );
 
-  for (let i = 0; i < filesToProcess.length; i++) {
-    const file = filesToProcess[i]!;
-    console.log(`[BizLayerExtractor] Converting [${i + 1}/${filesToProcess.length}] ${file.layerType}: ${file.path}`);
-
-    const result = await convertBusinessLayerFile(file, ai, targetFramework);
-    convertedFiles.push(result);
-
-    if (result.success) {
-      successCount++;
-    } else {
-      failedCount++;
-    }
-  }
+  const convertedFiles: ConvertedBusinessFile[] = resultSlots.filter(Boolean);
+  const successCount = convertedFiles.filter((r) => r.success).length;
+  const failedCount  = convertedFiles.filter((r) => !r.success).length;
+  const totalBizElapsed = ((Date.now() - startBizMs) / 1000).toFixed(1);
 
   console.log(`[BizLayerExtractor] ══════ EXTRACTION COMPLETE ══════`);
-  console.log(`[BizLayerExtractor] Total: ${filesToProcess.length} files | ✅ ${successCount} success | ❌ ${failedCount} failed`);
+  console.log(`[BizLayerExtractor] Total: ${filesToProcess.length} files | ✅ ${successCount} success | ❌ ${failedCount} failed | ${totalBizElapsed}s`);
   console.log(`[BizLayerExtractor] ════════════════════════════════\n`);
 
   return {

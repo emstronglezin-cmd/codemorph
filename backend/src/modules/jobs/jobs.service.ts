@@ -539,14 +539,18 @@ export class JobsService implements OnModuleInit {
     const renderUrl  = process.env['RENDER_EXTERNAL_URL'];
     const apiUrl = apiUrlEnv
       ?? (renderUrl ? `${renderUrl}/api/v1` : 'http://localhost:4000/api/v1');
-    const callbackUrl = `${apiUrl}/jobs/${job.id}/callback`;
+    const callbackUrl  = `${apiUrl}/jobs/${job.id}/callback`;
+    // PHASE 28 PERF FIX: URL de progression temps-réel
+    // L'AI Engine envoie des mises à jour toutes les 5s pendant la conversion.
+    // Le backend stocke le dernier état dans le job pour le frontend.
+    const progressUrl = `${apiUrl}/jobs/${job.id}/progress`;
 
     // FIX PHASE 20 — DIAG: log complet pour diagnostiquer les problèmes de callbackUrl en production
     // Si API_URL et RENDER_EXTERNAL_URL ne sont pas définis → callbackUrl = localhost (inaccessible depuis AI Engine)
     this.logger.log(
       `[PIPELINE] callbackUrl resolution — API_URL=${apiUrlEnv ?? '(not set)'} ` +
       `RENDER_EXTERNAL_URL=${renderUrl ?? '(not set)'} ` +
-      `→ callbackUrl=${callbackUrl}`,
+      `→ callbackUrl=${callbackUrl} progressUrl=${progressUrl}`,
     );
     if (!apiUrlEnv && !renderUrl) {
       this.logger.warn(
@@ -570,6 +574,7 @@ export class JobsService implements OnModuleInit {
         files,
         goalPrompt:     goalPrompt ?? '',
         callbackUrl,
+        progressUrl,
       });
     } catch (err) {
       this.logger.error(

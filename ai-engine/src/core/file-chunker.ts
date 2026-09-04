@@ -532,10 +532,8 @@ export async function convertLargeFile(
     );
     results.push(result);
 
-    // Pause entre les chunks pour respecter les rate limits Groq
-    if (tier === 'free-groq' && chunk.index < chunks.length - 1) {
-      await new Promise((r) => setTimeout(r, 500));
-    }
+    // PERF FIX (Phase 28): Délai 500ms supprimé — géré par GroqRateLimiter (8s min interval)
+    // Le rate limiting est centralilsé dans ai-provider.ts, pas ici.
   }
 
   // ── Assembler les chunks convertis ───────────────────────
@@ -578,9 +576,7 @@ async function convertByNaiveChunks(
     const result = await convertChunk(chunk, ai, targetFramework, sourceFramework, fileContext, irContext);
     results.push(result);
 
-    if (ai.getTier() === 'free-groq') {
-      await new Promise((r) => setTimeout(r, 800));
-    }
+    // PERF FIX (Phase 28): Délai 800ms supprimé — géré par GroqRateLimiter (8s min interval)
   }
 
   return assembleChunks(results, targetFramework, lines.length);

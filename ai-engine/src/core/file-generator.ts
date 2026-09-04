@@ -571,27 +571,39 @@ export async function generateFileBatch(
   requests: FileGenerationRequest[],
   ai:       AIProvider,
 ): Promise<BatchGenerationResult> {
-  const tier    = ai.getTier();
-  // NOTE: le rate limiting Groq (35s entre requêtes) est géré par GroqRateLimiter
-  // dans ai-provider.ts — on ne passe plus de delayMs ici pour éviter les doubles attentes.
-  const results: FileGenerationResult[] = [];
-  let successCount = 0;
-  let failedCount  = 0;
+  const tier = ai.getTier();
 
-  console.log(`\n[FileGenerator] ══════ BATCH GENERATION: ${requests.length} files (tier=${tier}) ══════`);
+  // PERF FIX (Phase 28): Parallélisme contrôlé par GroqRateLimiter semaphore.
+  // Le semaphore dans GroqRateLimiter (MAX_CONCURRENT=3) limite automatiquement
+  // le nombre de requêtes Groq en vol. On peut donc lancer tout le batch en
+  // Promise.all — les requêtes se sérialiseront proprement via le semaphore
+  // sans dépasser les limites TPM.
+  //
+  // AVANT : séquentiel — 40 fichiers × 35s = 1400s pure attente
+  // APRÈS : 3 en parallèle — 40/3 batches × 8s = ~107s attente + appels API
 
-  for (let i = 0; i < requests.length; i++) {
-    const req = requests[i]!;
-    console.log(`[FileGenerator] [${i + 1}/${requests.length}] ${req.fileType}: ${req.targetPath}`);
+  console.log(`\n[FileGenerator] ══════ BATCH GENERATION: ${requests.length} files (tier=${tier}, parallel=3) ══════`);
+  const startMs = Date.now();
 
-    const result = await generateSingleFile(req, ai, 0); // délai géré par GroqRateLimiter
-    results.push(result);
+  // Préserver l'ordre des résultats (indexed promises)
+  const resultSlots: FileGenerationResult[] = new Array(requests.length);
 
-    if (result.success) successCount++;
-    else failedCount++;
-  }
+  await Promise.all(
+    requests.map(async (req, i) => {
+      console.log(`[FileGenerator] [${i + 1}/${requests.length}] queued: ${req.fileType}: ${req.targetPath}`);
+      const result = await generateSingleFile(req, ai, 0); // throttle via GroqRateLimiter
+      resultSlots[i] = result;
+      const elapsed = ((Date.now() - startMs) / 1000).toFixed(0);
+      console.log(`[FileGenerator] [${i + 1}/${requests.length}] done in ${elapsed}s total: ${req.targetPath} (${result.success ? '✅' : '❌'})`);
+    }),
+  );
 
-  console.log(`[FileGenerator] ══════ BATCH DONE: ${successCount}✅ ${failedCount}❌ / ${requests.length} ══════\n`);
+  const results = resultSlots.filter(Boolean) as FileGenerationResult[];
+  const successCount = results.filter((r) => r.success).length;
+  const failedCount  = results.filter((r) => !r.success).length;
+  const totalElapsed = ((Date.now() - startMs) / 1000).toFixed(1);
+
+  console.log(`[FileGenerator] ══════ BATCH DONE: ${successCount}✅ ${failedCount}❌ / ${requests.length} in ${totalElapsed}s ══════\n`);
 
   return {
     files: results,

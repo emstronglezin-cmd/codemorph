@@ -40,6 +40,7 @@ convertRouter.post('/', async (req: Request, res: Response, next: NextFunction):
       targetFramework,
       userGoal,
       callbackUrl,
+      progressUrl,
       options,
     } = req.body as {
       jobId?:          string;
@@ -50,6 +51,7 @@ convertRouter.post('/', async (req: Request, res: Response, next: NextFunction):
       targetFramework: string;
       userGoal?:       string;
       callbackUrl?:    string;
+      progressUrl?:    string;  // URL pour les mises à jour de progression (PHASE 28)
       options?:        Record<string, unknown>;
     };
 
@@ -86,6 +88,7 @@ convertRouter.post('/', async (req: Request, res: Response, next: NextFunction):
       sourceFramework: sourceFramework ?? sourceLanguage ?? 'typescript',
       targetFramework: targetFramework,
       ...(userGoal !== undefined ? { userGoal } : {}),
+      ...(progressUrl ? { progressUrl } : {}),
       options: {
         preserveComments:   (options?.preserveComments as boolean) ?? true,
         generateTests:      (options?.generateTests as boolean) ?? true,

@@ -25,6 +25,7 @@ export interface AiConvertRequest {
   files:          Array<{ path: string; content: string }>;
   goalPrompt?:    string;
   callbackUrl:    string;
+  progressUrl?:   string;  // PHASE 28: URL de progression temps-réel
   options?: {
     maxFiles?:       number;
     maxLinesOfCode?: number;
@@ -141,6 +142,7 @@ export class AiEngineClient {
       targetFramework: req.targetLanguage,  // alias: language = framework pour l'AI Engine
       userGoal:        req.goalPrompt ?? '',
       callbackUrl:     req.callbackUrl,
+      ...(req.progressUrl ? { progressUrl: req.progressUrl } : {}),
       options:         req.options,
     };
 
