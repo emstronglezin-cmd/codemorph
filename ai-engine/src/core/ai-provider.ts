@@ -23,6 +23,7 @@ import OpenAI from 'openai';
 import Anthropic from '@anthropic-ai/sdk';
 import { appConfig } from '../config/app.config';
 import { generateTypeScriptFromDart } from './dart-transpiler';
+import { getJobLogger } from './structured-logger';
 
 // ── Rate Limiter global Groq — Token-Bucket TPM-aware (PHASE 28 PERF FIX) ────
 //
@@ -228,19 +229,19 @@ export class AIProvider {
   }
 
   // ── Main chat completion ─────────────────────────────────────────────────────
-  async chat(messages: ChatMessage[], maxTokens?: number, dartMeta?: { filePath: string; fileType: string }): Promise<AIResponse> {
+  async chat(messages: ChatMessage[], maxTokens?: number, dartMeta?: { filePath: string; fileType: string }, jobId?: string): Promise<AIResponse> {
     const limits = AIProvider.getLimits(this.tier);
     const tokens = maxTokens ?? limits.maxTokens;
 
     switch (this.tier) {
       case 'pro-openai':
-        return this.openaiChat(messages, tokens, this.userOpenAIKey!);
+        return this.openaiChat(messages, tokens, this.userOpenAIKey!, jobId);
       case 'pro-anthropic':
-        return this.anthropicChat(messages, tokens);
+        return this.anthropicChat(messages, tokens, jobId);
       case 'platform':
-        return this.openaiChat(messages, tokens, appConfig.openaiApiKey);
+        return this.openaiChat(messages, tokens, appConfig.openaiApiKey, jobId);
       case 'free-groq':
-        return this.groqChat(messages, tokens);
+        return this.groqChat(messages, tokens, jobId);
       case 'transpile':
         return this.transpileChat(messages, dartMeta);
       case 'static':
@@ -1303,23 +1304,33 @@ export class AIProvider {
   }
 
   // ── OpenAI / Groq (same SDK — Groq is OpenAI-compatible) ────────────────────
-  private async openaiChat(messages: ChatMessage[], maxTokens: number, apiKey: string): Promise<AIResponse> {
-    const client = new OpenAI({ apiKey });
-    const res = await client.chat.completions.create({
-      model:       this.model,
-      messages,
-      max_tokens:  maxTokens,
-      temperature: appConfig.temperature,
-    });
-    return {
-      content:    res.choices[0]?.message?.content ?? '',
-      tokensUsed: res.usage?.total_tokens ?? 0,
-      tier:       this.tier,
-      model:      this.model,
-    };
+  private async openaiChat(messages: ChatMessage[], maxTokens: number, apiKey: string, jobId?: string): Promise<AIResponse> {
+    const jlog = jobId ? getJobLogger(jobId) : undefined;
+    const t0 = Date.now();
+    jlog?.aiCallStart({ provider: 'openai', model: this.model, phase: 'ai_call', inputTokensEst: maxTokens });
+    try {
+      const client = new OpenAI({ apiKey });
+      const res = await client.chat.completions.create({
+        model:       this.model,
+        messages,
+        max_tokens:  maxTokens,
+        temperature: appConfig.temperature,
+      });
+      const tokensUsed = res.usage?.total_tokens ?? 0;
+      jlog?.aiCallEnd({ provider: 'openai', model: this.model, phase: 'ai_call', durationMs: Date.now() - t0, tokensUsed, success: true });
+      return {
+        content:    res.choices[0]?.message?.content ?? '',
+        tokensUsed,
+        tier:       this.tier,
+        model:      this.model,
+      };
+    } catch (err) {
+      jlog?.aiCallEnd({ provider: 'openai', model: this.model, phase: 'ai_call', durationMs: Date.now() - t0, tokensUsed: 0, success: false, error: (err as Error).message });
+      throw err;
+    }
   }
 
-  private async groqChat(messages: ChatMessage[], maxTokens: number): Promise<AIResponse> {
+  private async groqChat(messages: ChatMessage[], maxTokens: number, jobId?: string): Promise<AIResponse> {
     // Groq free tier = 8000 TPM — cap max_tokens pour rester dans les limites
     // openai/gpt-oss-120b = primary, openai/gpt-oss-20b = fallback si 429
     const GROQ_MAX_TOKENS = Math.min(maxTokens, 2800);
@@ -1328,19 +1339,25 @@ export class AIProvider {
       baseURL: 'https://api.groq.com/openai/v1',
     });
 
+    const jlog = jobId ? getJobLogger(jobId) : undefined;
+
     // ── Rate limiting global (token-bucket + semaphore) ───────────────────────
-    // acquire() :  • attend un slot concurrent libre (max 3 en parallèle)
-    //              • délai minimal 8s entre requêtes (vs 35s avant — PERF FIX)
-    //              • backoff automatique si TPM window saturée
-    // release(tokens) : libère le slot + enregistre la consommation réelle
+    const waitStart = Date.now();
     const release = await groqRateLimiter.acquire();
+    const waitedMs = Date.now() - waitStart;
+    if (waitedMs > 500) {
+      jlog?.aiRateLimit(waitedMs, `semaphore/TPM wait (inflight=${groqRateLimiter.inflight}/${3}, sent=${groqRateLimiter.totalRequestsSent})`);
+    }
 
     // Modèles à essayer en cascade si 429
     const GROQ_MODELS = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b'];
     let lastError: Error | null = null;
     let tokensUsed = 0;
+    const callStart = Date.now();
 
     try {
+      jlog?.aiCallStart({ provider: 'groq', model: this.model, phase: 'ai_call', inputTokensEst: GROQ_MAX_TOKENS });
+
       for (const modelId of GROQ_MODELS) {
         // Retry sur 429 résiduel uniquement (le token-bucket gère les cas normaux)
         for (let attempt = 0; attempt < 2; attempt++) {
@@ -1355,10 +1372,14 @@ export class AIProvider {
             // Stripping <think>...</think> (qwen3.6-27b reasoning mode)
             rawContent = rawContent.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
             tokensUsed = res.usage?.total_tokens ?? 0;
+            const durationMs = Date.now() - callStart;
+
             if (modelId !== this.model) {
+              jlog?.warn(`Groq fallback succeeded: ${modelId} (primary ${this.model} was rate-limited)`);
               console.log(`[AIProvider] Groq fallback succeeded with ${modelId} (primary ${this.model} was rate-limited)`);
             }
-            console.log(`[AIProvider] Groq ✅ ${modelId} — ${tokensUsed} tokens | inflight=${groqRateLimiter.inflight} sent=${groqRateLimiter.totalRequestsSent}`);
+            jlog?.aiCallEnd({ provider: 'groq', model: modelId, phase: 'ai_call', durationMs, tokensUsed, success: true });
+            console.log(`[AIProvider] Groq ✅ ${modelId} — ${tokensUsed} tokens | ${durationMs}ms | inflight=${groqRateLimiter.inflight} sent=${groqRateLimiter.totalRequestsSent} | waited=${waitedMs}ms`);
             return {
               content:    rawContent,
               tokensUsed,
@@ -1373,13 +1394,16 @@ export class AIProvider {
               const retryMatch = msg.match(/(\d+(?:\.\d+)?)s/);
               const waitSec = retryMatch?.[1]
                 ? Math.max(parseFloat(retryMatch[1]) + 3, 20)
-                : 30;  // Réduit de 45s à 30s (+ Retry-After précis extrait)
+                : 30;
+              const retryWaitMs = waitSec * 1000;
+              jlog?.aiRetry(attempt + 1, 2, `Groq 429 on ${modelId}`, retryWaitMs);
               console.warn(`[AIProvider] Groq 429 on ${modelId} attempt ${attempt+1}/2 — waiting ${waitSec}s (Retry-After respected)...`);
-              await new Promise((r) => setTimeout(r, waitSec * 1000));
+              await new Promise((r) => setTimeout(r, retryWaitMs));
               lastError = err instanceof Error ? err : new Error(msg);
               // Après 1 tentative sur 120b → passer immédiatement au modèle 20b
               if (modelId === GROQ_MODELS[0]) break;
             } else {
+              jlog?.aiCallEnd({ provider: 'groq', model: modelId, phase: 'ai_call', durationMs: Date.now() - callStart, tokensUsed: 0, success: false, error: msg });
               throw err;
             }
           }
@@ -1391,31 +1415,37 @@ export class AIProvider {
     }
 
     // Tous les modèles ont échoué
+    jlog?.aiCallEnd({ provider: 'groq', model: this.model, phase: 'ai_call', durationMs: Date.now() - callStart, tokensUsed: 0, success: false, error: lastError?.message ?? 'all models exhausted' });
     throw lastError ?? new Error('Groq: all models exhausted');
   }
 
   // ── Anthropic ────────────────────────────────────────────────────────────────
-  private async anthropicChat(messages: ChatMessage[], maxTokens: number): Promise<AIResponse> {
-    const client = new Anthropic({ apiKey: this.userAnthropicKey! });
-    const systemMsg = messages.find((m) => m.role === 'system')?.content ?? '';
-    const userMsgs  = messages
-      .filter((m) => m.role !== 'system')
-      .map((m) => ({ role: m.role as 'user' | 'assistant', content: m.content }));
+  private async anthropicChat(messages: ChatMessage[], maxTokens: number, jobId?: string): Promise<AIResponse> {
+    const jlog = jobId ? getJobLogger(jobId) : undefined;
+    const t0 = Date.now();
+    jlog?.aiCallStart({ provider: 'anthropic', model: this.model, phase: 'ai_call', inputTokensEst: maxTokens });
+    try {
+      const client = new Anthropic({ apiKey: this.userAnthropicKey! });
+      const systemMsg = messages.find((m) => m.role === 'system')?.content ?? '';
+      const userMsgs  = messages
+        .filter((m) => m.role !== 'system')
+        .map((m) => ({ role: m.role as 'user' | 'assistant', content: m.content }));
 
-    const res = await client.messages.create({
-      model:       this.model,
-      max_tokens:  maxTokens,
-      system:      systemMsg,
-      messages:    userMsgs,
-    });
+      const res = await client.messages.create({
+        model:       this.model,
+        max_tokens:  maxTokens,
+        system:      systemMsg,
+        messages:    userMsgs,
+      });
 
-    const content = res.content[0]?.type === 'text' ? res.content[0].text : '';
-    return {
-      content,
-      tokensUsed: res.usage.input_tokens + res.usage.output_tokens,
-      tier:       'pro-anthropic',
-      model:      this.model,
-    };
+      const content = res.content[0]?.type === 'text' ? res.content[0].text : '';
+      const tokensUsed = res.usage.input_tokens + res.usage.output_tokens;
+      jlog?.aiCallEnd({ provider: 'anthropic', model: this.model, phase: 'ai_call', durationMs: Date.now() - t0, tokensUsed, success: true });
+      return { content, tokensUsed, tier: 'pro-anthropic', model: this.model };
+    } catch (err) {
+      jlog?.aiCallEnd({ provider: 'anthropic', model: this.model, phase: 'ai_call', durationMs: Date.now() - t0, tokensUsed: 0, success: false, error: (err as Error).message });
+      throw err;
+    }
   }
 }
 

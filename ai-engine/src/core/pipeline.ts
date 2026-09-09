@@ -15,8 +15,13 @@
 //   STEP 4: TypeScript Issue Detection (import-verifier.ts)
 //   STEP 5: Source↔Generated Fidelity Comparison (fidelity-comparator.ts)
 // ============================================================
-import pino from 'pino';
 import { pipelineCache, buildCacheKey } from './pipeline-cache';
+import pino from 'pino';
+import { getJobLogger } from './structured-logger';
+
+// Fallback logger for private methods (uses getJobLogger when jobId available)
+const _pipelineLogger = pino({ level: process.env['LOG_LEVEL'] ?? 'info' });
+const logger = _pipelineLogger;
 
 import type {
   ConversionContext, ConversionResult,
@@ -52,12 +57,15 @@ import { runDeliveryCheck, formatDeliveryReport }         from './delivery-check
 import { buildFunctionalTestResults, formatTestResultsReport } from './functional-test-runner';
 // PHASE 28 PERF FIX: progression temps-réel
 import { ProgressReporter }                               from './progress-reporter';
+// PHASE 29: Fidelity Engine (source vs ZIP comparison)
+import {
+  computeFidelityReport, analyzeSource,
+  fidelityReportToMarkdown, fidelityReportToHTML,
+} from './fidelity-engine';
 import type {
   ApplicationSpec, ContentValidationReport,
   DeliveryCheckResult, TestResultsReport,
 } from '../models/ir.types';
-
-const logger = pino({ level: process.env['LOG_LEVEL'] ?? 'info' });
 
 export interface PipelineOptions {
   userOpenAIKey?:    string;
@@ -247,7 +255,9 @@ export class ConversionPipeline {
   async run(ctx: ConversionContext, opts?: PipelineOptions): Promise<ConversionResult> {
     const startTime = Date.now();
     const tier = ConversionPipeline.resolveTier(opts);
-    logger.info({ jobId: ctx.jobId, tier }, '🚀 Pipeline started');
+    const jlog = getJobLogger(ctx.jobId);
+    jlog.phaseStart('startup', { tier, action: 'pipeline_start' });
+    jlog.info('🚀 Pipeline started', { tier });
 
     // ── PHASE 28 PERF FIX: Progression temps-réel ────────────────────────────
     const reporter = new ProgressReporter(ctx.progressUrl, ctx.jobId);
@@ -261,7 +271,7 @@ export class ConversionPipeline {
       const elapsed = Date.now() - (phaseTimings[`${phase}_start`] ?? Date.now());
       phaseTimings[phase] = elapsed;
       delete phaseTimings[`${phase}_start`];
-      logger.info({ jobId: ctx.jobId, phase, elapsedMs: elapsed }, `⏱️  Phase timing: ${phase}=${elapsed}ms`);
+      jlog.info(`⏱️  Phase timing: ${phase}=${elapsed}ms`, { jobId: ctx.jobId, phase, elapsedMs: elapsed });
     };
 
     // ── FIX "sourceCode tronqué" — étape 1 : résumé structurel avant truncation ──
@@ -282,17 +292,17 @@ export class ConversionPipeline {
     // ── PHASE 25 Partie C : Cache key basé sur sourceCode + tier ──
     // Permet d'éviter tous les appels AI si on a déjà analysé ce code
     const cacheKey = buildCacheKey(ctx.sourceCode, tier, ctx.sourceLanguage ?? '', ctx.targetFramework ?? '');
-    logger.info({ jobId: ctx.jobId, cacheKey: cacheKey.slice(0, 12) + '…' }, '🔑 Cache key computed');
+    jlog.info('🔑 Cache key computed', { jobId: ctx.jobId, cacheKey: cacheKey.slice(0, 12) + '…' });
 
     // ── PHASE 1: AST Analysis (no AI) — avec cache ────────
     phaseStart('ast');
     reporter.report('phase_1_ast', 'AST Analysis', 0, sourceFileCount, `Analyzing ${sourceFileCount} source files…`);
-    logger.info({ jobId: ctx.jobId }, '📊 Phase 1: AST Analysis');
+    jlog.info('📊 Phase 1: AST Analysis', { jobId: ctx.jobId });
     let astResult: Awaited<ReturnType<ASTAnalyzer['analyze']>>;
     const cachedAst = pipelineCache.astCache.get(cacheKey) as typeof astResult | undefined;
     if (cachedAst) {
       astResult = cachedAst;
-      logger.info({ jobId: ctx.jobId }, '✅ Phase 1: AST — cache HIT (0 tokens)');
+      jlog.info('✅ Phase 1: AST — cache HIT (0 tokens)', { jobId: ctx.jobId });
     } else {
       astResult = await this.astAnalyzer.analyze(ctx);
       pipelineCache.astCache.set(cacheKey, astResult);
@@ -329,12 +339,12 @@ export class ConversionPipeline {
     // ── PHASE 2: Architecture Detection — avec cache ───────
     phaseStart('arch');
     reporter.report('phase_2_arch', 'Architecture Detection', 0, sourceFileCount, 'Detecting app architecture (1 AI call)…');
-    logger.info({ jobId: ctx.jobId, tier }, '🏗️  Phase 2: Architecture Detection');
+    jlog.info('🏗️  Phase 2: Architecture Detection', { jobId: ctx.jobId, tier });
     let archResult: Awaited<ReturnType<ArchitectureDetector['detect']>>;
     const cachedArch = pipelineCache.archCache.get(cacheKey) as typeof archResult | undefined;
     if (cachedArch) {
       archResult = cachedArch;
-      logger.info({ jobId: ctx.jobId }, '✅ Phase 2: Architecture — cache HIT (0 tokens)');
+      jlog.info('✅ Phase 2: Architecture — cache HIT (0 tokens)', { jobId: ctx.jobId });
     } else {
       archResult = await architectureDetector.detect(ctx, astResult);
       pipelineCache.archCache.set(cacheKey, archResult);
@@ -344,7 +354,7 @@ export class ConversionPipeline {
     // ── PHASE 2.5: Application Spec Builder (Phases 1-3 du cahier des charges) ─
     // RÈGLE ABSOLUE: Construire la spec AVANT toute génération de fichiers.
     // La spec devient la source de vérité pour toute la reconstruction.
-    logger.info({ jobId: ctx.jobId }, '📋 Phase 2.5: Application Spec Builder (exhaustive source analysis)');
+    jlog.info('📋 Phase 2.5: Application Spec Builder (exhaustive source analysis)', { jobId: ctx.jobId });
     let appSpec: ApplicationSpec | undefined;
     try {
       appSpec = buildApplicationSpec(
@@ -364,12 +374,12 @@ export class ConversionPipeline {
     }
     phaseStart('ir');
     reporter.report('phase_3_ir', 'IR Generation', 0, sourceFileCount, 'Building Intermediate Representation (3-5 AI calls)…');
-    logger.info({ jobId: ctx.jobId, tier }, '⚙️  Phase 3: IR Generation + Knowledge Graph');
+    jlog.info('⚙️  Phase 3: IR Generation + Knowledge Graph', { jobId: ctx.jobId, tier });
     let irDocument: Awaited<ReturnType<IRGenerator['generate']>>;
     const cachedIR = pipelineCache.irCache.get(cacheKey) as typeof irDocument | undefined;
     if (cachedIR) {
       irDocument = cachedIR;
-      logger.info({ jobId: ctx.jobId }, '✅ Phase 3: IR — cache HIT (0 tokens)');
+      jlog.info('✅ Phase 3: IR — cache HIT (0 tokens)', { jobId: ctx.jobId });
     } else {
       irDocument = await irGenerator.generate(ctx, astResult, archResult);
       pipelineCache.irCache.set(cacheKey, irDocument);
@@ -424,13 +434,13 @@ export class ConversionPipeline {
 
     // ── PHASE 4: Mapping Engine — avec cache ───────────────
     phaseStart('mapping');
-    logger.info({ jobId: ctx.jobId }, '🗺️  Phase 4: Mapping Engine');
+    jlog.info('🗺️  Phase 4: Mapping Engine', { jobId: ctx.jobId });
     let mappedIR: Awaited<ReturnType<MappingEngine['map']>>;
     const mappingCacheKey = buildCacheKey(cacheKey, ctx.targetFramework ?? '');
     const cachedMapping = pipelineCache.mappingCache.get(mappingCacheKey) as typeof mappedIR | undefined;
     if (cachedMapping) {
       mappedIR = cachedMapping;
-      logger.info({ jobId: ctx.jobId }, '✅ Phase 4: Mapping — cache HIT');
+      jlog.info('✅ Phase 4: Mapping — cache HIT', { jobId: ctx.jobId });
     } else {
       mappedIR = await this.mappingEngine.map(ctx, irDocument.ir as never);
       pipelineCache.mappingCache.set(mappingCacheKey, mappedIR);
@@ -441,13 +451,13 @@ export class ConversionPipeline {
     phaseStart('planning');
     reporter.report('phase_5_planning', 'Code Planning + File Generation', 0, sourceFileCount,
       `Generating ${sourceFileCount} files (parallel, 3 concurrent AI calls)…`);
-    logger.info({ jobId: ctx.jobId, tier }, '📋 Phase 5: Code Planning (Reconstruction + Visual Fidelity)');
+    jlog.info('📋 Phase 5: Code Planning (Reconstruction + Visual Fidelity)', { jobId: ctx.jobId, tier });
     let plan: Awaited<ReturnType<CodePlanner['plan']>>;
     const planCacheKey = buildCacheKey(cacheKey, ctx.targetFramework ?? '', tier);
     const cachedPlan = pipelineCache.planCache.get(planCacheKey) as typeof plan | undefined;
     if (cachedPlan) {
       plan = cachedPlan;
-      logger.info({ jobId: ctx.jobId }, '✅ Phase 5: Plan — cache HIT (0 tokens)');
+      jlog.info('✅ Phase 5: Plan — cache HIT (0 tokens)', { jobId: ctx.jobId });
     } else {
       plan = await codePlanner.plan(ctx, mappedIR);
       // Ne mettre en cache que si le plan est suffisamment bon (éviter de cacher un plan dégradé)
@@ -496,32 +506,32 @@ export class ConversionPipeline {
     // BUG-P27-07 FIX: logCoherenceCheck retourne { hasCriticalMismatch, missingScreens, missingServices }
     const coherenceResult = this.logCoherenceCheck(astResult, mappedIR, plan.files, ctx.jobId);
     if (coherenceResult.hasCriticalMismatch) {
-      logger.warn({
+      jlog.warn('⚠️  Coherence: Critical mismatch — Phase 8 will run at full iterations to recover fidelity', {
         jobId: ctx.jobId,
         missingScreens:  coherenceResult.missingScreens,
         missingServices: coherenceResult.missingServices,
-      }, '⚠️  Coherence: Critical mismatch — Phase 8 will run at full iterations to recover fidelity');
+      });
       console.warn(`[PIPELINE] ⚠️  Mismatch critique détecté: ${coherenceResult.missingScreens} écrans manquants, ${coherenceResult.missingServices} services manquants → Phase 8 forcée`);
     }
 
     // ── PHASE 6: IR Validation ─────────────────────────────
     phaseStart('validation');
-    logger.info({ jobId: ctx.jobId }, '✅ Phase 6: IR Validation');
+    jlog.info('✅ Phase 6: IR Validation', { jobId: ctx.jobId });
     const validatedIR = await this.irValidator.validate(mappedIR);
     phaseEnd('validation');
 
     // ── PHASE 6.5: Layer Detection (SOURCE_PRESENT par couche) ──────────────
     // Doit être exécuté avant le calcul du score pour passer layerDetection
-    logger.info({ jobId: ctx.jobId }, '🔍 Phase 6.5: Source Layer Detection');
+    jlog.info('🔍 Phase 6.5: Source Layer Detection', { jobId: ctx.jobId });
     const layerDetection = detectSourceLayers(ctx.sourceCode, astResult, archResult);
     console.log(`\n================ LAYER DETECTION ================`);
     console.log(summarizeLayerPresence(layerDetection));
     console.log(`=================================================\n`);
 
     // ── PHASE 7: Fidelity Score multi-axes (N/A-aware) ─────────────────────
-    logger.info({ jobId: ctx.jobId, tier }, '📐 Phase 7: Fidelity Score Calculation (N/A-aware)');
+    jlog.info('📐 Phase 7: Fidelity Score Calculation (N/A-aware)', { jobId: ctx.jobId, tier });
     const fidelityScore = this.calculateFidelityScore(validatedIR, plan.files, layerDetection);
-    logger.info({
+    jlog.info(`📊 Phase 7: Fidelity Score — Overall: ${fidelityScore.overall}% (${fidelityScore.applicableAxes.length} axes applicables, ${fidelityScore.naAxes.length} N/A)`, {
       jobId: ctx.jobId,
       overall:        fidelityScore.overall,
       businessLogic:  fidelityScore.businessLogic,
@@ -531,10 +541,10 @@ export class ConversionPipeline {
       uiFidelity:     fidelityScore.uiFidelity,
       applicableAxes: fidelityScore.applicableAxes,
       naAxes:         fidelityScore.naAxes,
-    }, `📊 Phase 7: Fidelity Score — Overall: ${fidelityScore.overall}% (${fidelityScore.applicableAxes.length} axes applicables, ${fidelityScore.naAxes.length} N/A)`);
+    });
 
     // ── PHASE 8: Auto-correction boucle (max 3 itérations) ─────────────────
-    logger.info({ jobId: ctx.jobId, tier }, '🔄 Phase 8: Auto-correction Loop');
+    jlog.info('🔄 Phase 8: Auto-correction Loop', { jobId: ctx.jobId, tier });
     const { correctedPlan, autoCorrectionReport } = await this.autoCorrectLoop(
       ctx, validatedIR, plan, fidelityScore, tier, codePlanner,
     );
@@ -544,7 +554,7 @@ export class ConversionPipeline {
 
     // ── PHASE 28 STEP 9: Import Verification finale ──────────────────────────
     // Vérification finale des imports après toutes les phases de correction
-    logger.info({ jobId: ctx.jobId }, '🔍 Phase 9 (Phase 28): Final Import Verification');
+    jlog.info('🔍 Phase 9 (Phase 28): Final Import Verification', { jobId: ctx.jobId });
     const finalImportResult = verifyAndFixImports(correctedPlan.files);
     const finalFiles = finalImportResult.files;
     const finalReport = finalImportResult.report;
@@ -554,7 +564,7 @@ export class ConversionPipeline {
 
     // ── PHASE 6 (NOUVEAU): Content Validation — SHELL file detection ─────────
     // RÈGLE ABSOLUE: Un fichier SHELL_401 ne compte JAMAIS comme converti.
-    logger.info({ jobId: ctx.jobId }, '🔬 Phase 6-CV: Content Validation (SHELL detection)');
+    jlog.info('🔬 Phase 6-CV: Content Validation (SHELL detection)', { jobId: ctx.jobId });
     const contentValidation: ContentValidationReport = validateAllFiles(
       finalFiles,
       ctx.sourceLanguage ?? 'dart',
@@ -562,25 +572,25 @@ export class ConversionPipeline {
     console.log(formatContentReport(contentValidation));
 
     // ── PHASE 7 (NOUVEAU): Static Validation ─────────────────────────────────
-    logger.info({ jobId: ctx.jobId }, '✅ Phase 7-SV: Static Validation');
+    jlog.info('✅ Phase 7-SV: Static Validation', { jobId: ctx.jobId });
     void runStaticValidationSync; // Phase 7 static validation is run in Phase 12 block below
 
     // ── PHASE 28 STEP 10: Source ↔ Generated Comparison ─────────────────────
     // Comparaison granulaire: classes, fonctions, méthodes, services, repositories
-    logger.info({ jobId: ctx.jobId }, '🔬 Phase 10 (Phase 28): Source ↔ Generated Comparison');
+    jlog.info('🔬 Phase 10 (Phase 28): Source ↔ Generated Comparison', { jobId: ctx.jobId });
     const fidelityComparison = runFidelityComparison(
       ctx.sourceCode,
       finalFiles,
       ctx.sourceLanguage ?? 'dart',
     );
-    logger.info({
+    jlog.info(`🔬 Phase 10: Fidelity Comparator — Overall: ${fidelityComparison.scores.overall}%`, {
       jobId: ctx.jobId,
       comparatorScore: fidelityComparison.scores.overall,
       missing: fidelityComparison.missing.length,
       classes: fidelityComparison.scores.classes,
       services: fidelityComparison.scores.services,
       repositories: fidelityComparison.scores.repositories,
-    }, `🔬 Phase 10: Fidelity Comparator — Overall: ${fidelityComparison.scores.overall}%`);
+    });
 
     // ── PHASE 28 STEP 11: Fusionner les scores (10 axes + comparateur) ───────
     // Le score final intègre les deux sources: score existant + comparateur granulaire
@@ -678,30 +688,26 @@ export class ConversionPipeline {
     console.log(`Cache stats      : ast=${cacheStats['ast']?.size ?? 0} ir=${cacheStats['ir']?.size ?? 0} plan=${cacheStats['plan']?.size ?? 0}`);
     console.log(`==============================\n`);
 
-    logger.info({
-      jobId: ctx.jobId,
+    jlog.summary({
+      filesGenerated: finalFiles.length,
+      fidelityScore:  finalFidelityScore.overall,
+      tokensTotal:    tokensUsed,
+      success:        true,
+    });
+    jlog.phaseEnd('done', {
       durationMs,
       tier,
-      tokensUsed,
       estimatedCostUSD,
       finalScore: finalFidelityScore.overall,
       comparatorScore: fidelityComparison.scores.overall,
       iterations: autoCorrectionReport.iterations,
-      filesGenerated: finalFiles.length,
       importsFixed: finalReport.importsFixed,
-      phaseTimes: {
-        ast:      phaseTimings['ast'] ?? 0,
-        arch:     phaseTimings['arch'] ?? 0,
-        ir:       phaseTimings['ir'] ?? 0,
-        mapping:  phaseTimings['mapping'] ?? 0,
-        planning: phaseTimings['planning'] ?? 0,
-      },
-    }, '✨ Pipeline completed (Phase 28)');
+    });
 
     // ── PHASE 4 FINALE: UI Fidelity Extractor ───────────────────────────────
     // Extraire les tokens de design depuis les fichiers source
     // et les injecter dans les fichiers générés si thème manquant
-    logger.info({ jobId: ctx.jobId }, '🎨 Phase Finale 4: UI Fidelity Extraction');
+    jlog.info('🎨 Phase Finale 4: UI Fidelity Extraction', { jobId: ctx.jobId });
     let enhancedFiles = finalFiles;
     try {
       // Parser les fichiers source pour extraire les tokens
@@ -735,7 +741,7 @@ export class ConversionPipeline {
     }
 
     // ── PHASE 5 FINALE: Compilation Dart/Flutter ─────────────────────────────
-    logger.info({ jobId: ctx.jobId }, '🔨 Phase Finale 5: Dart/Flutter Compilation');
+    jlog.info('🔨 Phase Finale 5: Dart/Flutter Compilation', { jobId: ctx.jobId });
     let compilationResult: CompilationResult | undefined;
     const isFlutterTarget = enhancedFiles.some((f) => /\.dart$/.test(f.path));
     if (isFlutterTarget) {
@@ -749,7 +755,7 @@ export class ConversionPipeline {
     }
 
     // ── PHASE 8 FINALE: ZIP Packaging ───────────────────────────────────────
-    logger.info({ jobId: ctx.jobId }, '📦 Phase Finale 8: ZIP Packaging');
+    jlog.info('📦 Phase Finale 8: ZIP Packaging', { jobId: ctx.jobId });
     let zipResult: ZipPackageResult | undefined;
     try {
       zipResult = await packageToZip(
@@ -763,7 +769,7 @@ export class ConversionPipeline {
     }
 
     // ── PHASE 12 (NOUVEAU): Delivery Check — READY vs NEEDS_REPAIR ───────────
-    logger.info({ jobId: ctx.jobId }, '🚦 Phase 12: Delivery Check (READY / NEEDS_REPAIR)');
+    jlog.info('🚦 Phase 12: Delivery Check (READY / NEEDS_REPAIR)', { jobId: ctx.jobId });
     const finalContentValidation = validateAllFiles(enhancedFiles, ctx.sourceLanguage ?? 'dart');
     const staticVal = runStaticValidationSync(enhancedFiles, ctx.sourceLanguage ?? 'dart');
     const deliveryCheck: DeliveryCheckResult = runDeliveryCheck(
@@ -785,7 +791,7 @@ export class ConversionPipeline {
     console.log(formatDeliveryReport(deliveryCheck));
 
     // ── PHASE 9 FINALE: Conversion Report ────────────────────────────────────
-    logger.info({ jobId: ctx.jobId }, '📊 Phase Finale 9: Conversion Report');
+    jlog.info('📊 Phase Finale 9: Conversion Report', { jobId: ctx.jobId });
     let conversionReportData: { text: string; json: string; markdown: string; html: string } | undefined;
     try {
       const report: ConversionReport = buildConversionReport({
@@ -824,16 +830,127 @@ export class ConversionPipeline {
     );
     console.log(formatTestResultsReport(testResults));
 
+    // ── PHASE 29: Fidelity Engine — Source vs ZIP comparison (12 axes) ────────
+    jlog.phaseStart('fidelity_check', { action: 'source_vs_zip_comparison' });
+    let fidelityEngineReport: ReturnType<typeof computeFidelityReport> | undefined;
+    let sourceAnalysis: ReturnType<typeof analyzeSource> | undefined;
+    const reportFilesToInject: { path: string; content: string }[] = [];
+
+    try {
+      // 1. Source analysis (avant le score)
+      sourceAnalysis = analyzeSource(ctx.jobId, ctx.sourceCode, ctx.sourceFramework ?? 'flutter');
+      jlog.info(`📊 Source analysis: ${sourceAnalysis.screens} screens, ${sourceAnalysis.services} services, ${sourceAnalysis.apiEndpoints} API endpoints`, {
+        screens: sourceAnalysis.screens,
+        services: sourceAnalysis.services,
+        apiEndpoints: sourceAnalysis.apiEndpoints,
+        stateClasses: sourceAnalysis.stateClasses,
+      });
+
+      // 2. Fidelity engine — compare raw source vs generated files
+      fidelityEngineReport = computeFidelityReport({
+        jobId:           ctx.jobId,
+        sourceCode:      ctx.sourceCode,
+        generatedFiles:  enhancedFiles,
+        sourceFramework: ctx.sourceFramework ?? 'flutter',
+        targetFramework: ctx.targetFramework ?? 'react-native',
+      });
+
+      const fe = fidelityEngineReport;
+      console.log(`\n[PHASE 29] ═══ FIDELITY ENGINE (source vs ZIP) ═══`);
+      console.log(`[PHASE 29] Overall Fidelity Score: ${fe.overallFidelityScore}% (${fe.verdict})`);
+      console.log(`[PHASE 29] Applicable axes: ${fe.applicableAxes.join(', ')}`);
+      console.log(`[PHASE 29] N/A axes: ${fe.naAxes.join(', ')}`);
+      console.log(`[PHASE 29] Identical: ${fe.totalIdentical}  Transformed: ${fe.totalTransformed}  Missing: ${fe.totalMissing}  Added: ${fe.totalAdded}`);
+      for (const ax of fe.axes) {
+        const scoreStr = ax.score === null ? 'N/A' : `${ax.score}%`;
+        const missingStr = ax.missing.length > 0 ? ` ⚠️ missing: ${ax.missing.slice(0, 3).join(', ')}` : '';
+        console.log(`[PHASE 29]   ${ax.axis.padEnd(14)}: ${scoreStr}${missingStr}`);
+      }
+      console.log(`[PHASE 29] ═════════════════════════════════════════\n`);
+
+      jlog.phaseEnd('fidelity_check', { fidelityEngineScore: fe.overallFidelityScore, verdict: fe.verdict });
+
+      // 3. Générer les 4 fichiers de rapport à injecter dans le ZIP
+      const now = new Date().toISOString();
+
+      // source-analysis.json
+      reportFilesToInject.push({
+        path: '_codemorph-reports/source-analysis.json',
+        content: JSON.stringify({ generatedAt: now, jobId: ctx.jobId, ...sourceAnalysis as object }, null, 2),
+      });
+
+      // conversion-report.json
+      const conversionJson = {
+        generatedAt: now,
+        jobId: ctx.jobId,
+        projectName: ctx.projectId ?? 'project',
+        conversionType: `${ctx.sourceFramework ?? 'unknown'} → ${ctx.targetFramework ?? 'unknown'}`,
+        durationMs,
+        aiTier: tier,
+        filesGenerated: enhancedFiles.length,
+        fidelityScore: {
+          pipeline: finalFidelityScore.overall,
+          engine: fe.overallFidelityScore,
+          verdict: fe.verdict,
+        },
+        axes: fe.axes.map((ax) => ({
+          axis: ax.axis,
+          score: ax.score,
+          status: ax.status,
+          sourceCount: ax.sourceCount,
+          targetCount: ax.targetCount,
+          missing: ax.missing.slice(0, 10),
+          identical: ax.identical.slice(0, 10),
+          transformed: ax.transformed.slice(0, 10),
+        })),
+        phaseTimings,
+      };
+      reportFilesToInject.push({
+        path: '_codemorph-reports/conversion-report.json',
+        content: JSON.stringify(conversionJson, null, 2),
+      });
+
+      // conversion-report.md
+      reportFilesToInject.push({
+        path: '_codemorph-reports/conversion-report.md',
+        content: fidelityReportToMarkdown(fe),
+      });
+
+      // fidelity-report.html
+      reportFilesToInject.push({
+        path: '_codemorph-reports/fidelity-report.html',
+        content: fidelityReportToHTML(fe),
+      });
+
+      jlog.info(`📁 4 report files generated for ZIP injection`, {
+        files: reportFilesToInject.map((f) => f.path),
+      });
+
+    } catch (feErr) {
+      jlog.warn(`Fidelity Engine skipped: ${(feErr as Error).message}`);
+      console.warn(`[PHASE 29] Fidelity Engine error: ${(feErr as Error).message}`);
+    }
+
+    // Injecter les rapports dans les fichiers finaux (pour ZIP + retour client)
+    const filesWithReports: typeof enhancedFiles = [
+      ...enhancedFiles,
+      ...reportFilesToInject.map((f) => ({
+        path:    f.path,
+        content: f.content,
+        language: f.path.endsWith('.json') ? 'json' : f.path.endsWith('.md') ? 'markdown' : 'html',
+      })),
+    ];
+
     return {
       jobId:      ctx.jobId,
       ir:         validatedIR,
-      files:      enhancedFiles,
+      files:      filesWithReports,
       summary:    {
         ...correctedPlan.summary,
-        totalFiles:      enhancedFiles.length,
-        successfulFiles: enhancedFiles.filter((f) => !f.warnings?.length).length,
-        totalLines:      enhancedFiles.reduce((a, f) => a + f.content.split('\n').length, 0),
-        convertedLines:  enhancedFiles.reduce((a, f) => a + f.content.split('\n').length, 0),
+        totalFiles:      filesWithReports.length,
+        successfulFiles: filesWithReports.filter((f) => !f.warnings?.length).length,
+        totalLines:      filesWithReports.reduce((a, f) => a + f.content.split('\n').length, 0),
+        convertedLines:  filesWithReports.reduce((a, f) => a + f.content.split('\n').length, 0),
       },
       tokensUsed,
       durationMs,
