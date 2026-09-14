@@ -1203,6 +1203,12 @@ final ${this.toCamel(name)}Provider = AsyncNotifierProvider<${name}Notifier, dyn
       ? (tier === 'free-groq' ? 2000 : tier === 'platform' ? 4000 : 6000)
       : (tier === 'free-groq' ? 1600 : tier === 'platform' ? 2000 : 4000);
 
+    // PHASE 30 FIX: MAX_FLUTTER_SCREEN_CHARS 8_000→32_000 (Groq) / 80_000 (autres)
+    const MAX_FLUTTER_SCREEN_CHARS = tier === 'free-groq' ? 32_000 : 80_000;
+    const truncatedSourceForFlutter = sourceFileContent.length > MAX_FLUTTER_SCREEN_CHARS
+      ? sourceFileContent.slice(0, MAX_FLUTTER_SCREEN_CHARS) + '\n// ... (source truncated — remaining methods must still be converted based on naming patterns)'
+      : sourceFileContent;
+
     const ctxLines = [
       purpose      ? `Screen purpose: ${purpose}`           : '',
       bizLogic     ? `Business logic: ${bizLogic}`          : '',
@@ -1234,7 +1240,7 @@ ${hasSource ? '- Source code provided: convert EVERY method/function, preserve a
 
 SOURCE (${screenSourcePath ?? name}, ${sourceFileContent.split('\n').length} lines):
 \`\`\`
-${sourceFileContent.length > 8000 ? sourceFileContent.slice(0, 8000) + '\n// ... (truncated)' : sourceFileContent}
+${truncatedSourceForFlutter}
 \`\`\`
 
 ${ctxLines ? `CONTEXT:\n${ctxLines}` : ''}
@@ -1544,6 +1550,13 @@ lib/
     // Si source non disponible: prompt basé sur métadonnées IR (fallback)
     const hasSourceCode = sourceFileContent.length > 100;
     const targetLabel = framework === 'react' ? 'React + TypeScript + TailwindCSS' : 'React Native (Expo Router) + TypeScript';
+    // PHASE 30 FIX: déclarer tier ICI (avant les prompts) pour MAX_SCREEN_CHARS
+    const tierForScreen    = this.ai.getTier();
+    // PHASE 30 FIX: MAX_SCREEN_CHARS 8_000→32_000 (Groq 131K context) / 80_000 (autres)
+    const MAX_SCREEN_CHARS = tierForScreen === 'free-groq' ? 32_000 : 80_000;
+    const truncatedSourceForRN = sourceFileContent.length > MAX_SCREEN_CHARS
+      ? sourceFileContent.slice(0, MAX_SCREEN_CHARS) + '\n// ... (source truncated — remaining methods must still be converted based on naming patterns)'
+      : sourceFileContent;
 
     // PHASE 29: System Prompt amélioré avec règle de fidélité source
     const systemPrompt = `You are an AI Software Architect specialized in software reconstruction and multi-framework migration.
@@ -1574,7 +1587,7 @@ ${hasSourceCode ? '- The source code is provided — EVERY function/method must 
 
 SOURCE FILE (${screenSourcePath ?? name}, ${sourceFileContent.split('\n').length} lines):
 \`\`\`
-${sourceFileContent.length > 8000 ? sourceFileContent.slice(0, 8000) + '\n// ... (truncated for token limit — all methods must still be converted)' : sourceFileContent}
+${truncatedSourceForRN}
 \`\`\`
 
 ${ctxLines ? `ADDITIONAL CONTEXT (from IR analysis):\n${ctxLines}` : ''}
@@ -1599,10 +1612,10 @@ Return ONLY the complete file content.`;
     console.log(`Est. tokens       : ~${Math.ceil(promptChars / 4)}`);
     // Budget tokens selon le tier et la présence de code source
     // PHASE 29: Si source disponible, allouer plus de tokens pour la conversion complète
-    const tier = this.ai.getTier();
+    // PHASE 30: utiliser tierForScreen (déjà déclaré plus haut, evite doublon const)
     const maxResponseTokens = hasSourceCode
-      ? (tier === 'free-groq' ? 1800 : tier === 'platform' ? 3500 : 6000)
-      : (tier === 'free-groq' ? 1600 : tier === 'platform' ? 2000 : 4000);
+      ? (tierForScreen === 'free-groq' ? 1800 : tierForScreen === 'platform' ? 3500 : 6000)
+      : (tierForScreen === 'free-groq' ? 1600 : tierForScreen === 'platform' ? 2000 : 4000);
 
     console.log(`\n================ PROMPT (generateScreenFile: ${name}) ================`);
     console.log(`Characters        : ${systemPrompt.length + userPrompt.length}`);

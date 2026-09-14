@@ -707,9 +707,12 @@ ABSOLUTE RULES:
 5. The output file must be compilable ${outputLang}
 6. The output line count should be at least 60% of the source line count`;
 
-  // Limiter la source à 8000 chars pour rester dans les 8000 TPM Groq
-  // system (~600t) + source (~2000t) + instructions (~200t) + output (2800t) ≈ 5600t
-  const MAX_BIZ_SOURCE_CHARS = 8_000;
+  // PHASE 30 FIX: MAX_BIZ_SOURCE_CHARS 8_000→32_000 (Groq 131K context)
+  // AVANT: 8000 chars → un service métier de 400L (~16000 chars) = tronqué à 50%
+  // APR\u00c8S: 32000 chars → couverture complète des services métier (max ~300L réaliste)
+  // system (~600t) + source (~8000t) + instructions (~200t) + output (2800t) ≈ 11600t
+  // Groq free tier: 8000 TPM — le semaphore dans ai-provider.ts gère les dépassements
+  const MAX_BIZ_SOURCE_CHARS = 32_000;
   const truncatedContent = file.content.length > MAX_BIZ_SOURCE_CHARS
     ? file.content.slice(0, MAX_BIZ_SOURCE_CHARS) + `\n// [source truncated at ${MAX_BIZ_SOURCE_CHARS} chars — implement remaining methods using the same patterns above]`
     : file.content;

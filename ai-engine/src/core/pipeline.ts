@@ -309,6 +309,30 @@ export class ConversionPipeline {
     }
     phaseEnd('ast');
 
+    // ── PHASE 30: GATE CHECK AST — STOP si aucun fichier trouvé ──────────────
+    // Sans fichiers parsés, TOUT le pipeline produit un résultat fictif.
+    // Cause probable: format ZIP incorrect, marqueurs FILE absents, ou sourceCode vide.
+    {
+      const astDurationMs = phaseTimings['ast'] ?? 0;
+      jlog.info(`[GATE-AST] files=${astResult.files.length} durationMs=${astDurationMs}`, {
+        jobId: ctx.jobId, step: 'gate_ast', status: astResult.files.length > 0 ? 'PASS' : 'FAIL',
+        filesCount: astResult.files.length,
+      });
+      if (astResult.files.length === 0) {
+        const errMsg = `GATE-AST FAIL: 0 files parsed from sourceCode (${ctx.sourceCode.length} chars). `
+          + `Format expected: "// === FILE: path ===\\ncontent". `
+          + `Verify ZIP upload → ai-engine.client.ts conversion → sourceCode format.`;
+        jlog.error(errMsg, new Error(errMsg), { jobId: ctx.jobId, step: 'gate_ast' });
+        throw new Error(`[CodeMorph] Pipeline aborted at AST step: ${errMsg}`);
+      }
+      // Avertissement si très peu de fichiers (possible parsing partiel)
+      if (astResult.files.length < 3 && sourceFileCount > 5) {
+        jlog.warn(`[GATE-AST] ⚠️  Only ${astResult.files.length} files parsed but ${sourceFileCount} markers detected — possible format mismatch`, {
+          jobId: ctx.jobId, filesFound: astResult.files.length, markersFound: sourceFileCount,
+        });
+      }
+    }
+
     // ── LOG STRUCTURÉ: AST ────────────────────────────────
     console.log(`\n================ AST ================`);
     console.log(`Files found      : ${astResult.files.length}`);
@@ -403,6 +427,42 @@ export class ConversionPipeline {
     }
     console.log(`==============================\n`);
 
+    // ── PHASE 30: GATE CHECK IR — STOP si IR vide sur projet non-trivial ────────
+    // Si IR retourne 0 écrans alors que l'AST a trouvé des fichiers screen, c'est
+    // une défaillance réelle: le pipeline génèrerait des templates génériques (HomeScreen, etc.)
+    // au lieu de la vraie application.
+    {
+      const irScreensCheck = irDocument.ir.uiGraph?.screens?.length ?? 0;
+      const irModelsCheck  = irDocument.ir.dataLayer?.models?.length ?? 0;
+      const astScreenFiles = astResult.files.filter((f) => /screen|page|view/i.test(f.path)).length;
+      const irDurationMs   = phaseTimings['ir'] ?? 0;
+
+      jlog.info(`[GATE-IR] screens=${irScreensCheck} models=${irModelsCheck} durationMs=${irDurationMs}`, {
+        jobId: ctx.jobId, step: 'gate_ir', status: 'check',
+        irScreens: irScreensCheck, astScreenFiles,
+      });
+
+      // On n'arrête PAS ici (l'inferUIGraphFromAST peut compenser),
+      // mais on log un avertissement EXPLICITE si l'extraction AI a échoué
+      if (irScreensCheck === 0 && astScreenFiles > 0) {
+        jlog.warn(
+          `[GATE-IR] ⚠️  IR has 0 screens despite ${astScreenFiles} screen files in AST. `
+          + `inferUIGraphFromAST fallback will be used. Check Groq response quality.`,
+          { jobId: ctx.jobId, step: 'gate_ir', astScreenFiles, irScreens: 0 },
+        );
+        console.warn(`[PIPELINE] ⚠️  GATE-IR: IR=0 screens from ${astScreenFiles} source screen files → AST fallback actif. Possible causes: Groq JSON truncation, token limit, or rate limit`);
+      }
+
+      // ARRÊT si IR complètement vide ET pas de fallback possible
+      if (irScreensCheck === 0 && astScreenFiles === 0 && astResult.files.length > 5) {
+        jlog.warn(
+          `[GATE-IR] ⚠️  IR=0 screens AND AST=0 screen files on a ${astResult.files.length}-file project. `
+          + `Proceeding with pure AST-inferred IR — quality will be lower.`,
+          { jobId: ctx.jobId, step: 'gate_ir', filesTotal: astResult.files.length },
+        );
+      }
+    }
+
     // ── LOG STRUCTURÉ: IR ─────────────────────────────────
     const ir = irDocument.ir;
     const irScreens    = ir.uiGraph?.screens?.length ?? 0;
@@ -467,6 +527,34 @@ export class ConversionPipeline {
       }
     }
     phaseEnd('planning');
+
+    // ── PHASE 30: GATE CHECK PLANNING — STOP si aucun fichier généré ─────────
+    {
+      const planningDurationMs = phaseTimings['planning'] ?? 0;
+      jlog.info(`[GATE-PLAN] files=${plan.files.length} lines=${plan.summary.totalLines} durationMs=${planningDurationMs}`, {
+        jobId: ctx.jobId, step: 'gate_plan', status: plan.files.length > 0 ? 'PASS' : 'FAIL',
+        filesCount: plan.files.length,
+      });
+
+      if (plan.files.length === 0) {
+        const errMsg = `GATE-PLAN FAIL: Code Planner generated 0 files. `
+          + `Source had ${astResult.files.length} files, IR had ${irDocument.ir.uiGraph?.screens?.length ?? 0} screens. `
+          + `Check code-planner.ts → generateFileBatch() → AI response.`;
+        jlog.error(errMsg, new Error(errMsg), { jobId: ctx.jobId, step: 'gate_plan' });
+        throw new Error(`[CodeMorph] Pipeline aborted at Code Planning step: ${errMsg}`);
+      }
+
+      // Avertissement si très peu de fichiers vs source
+      const expectedMinFiles = Math.max(3, Math.floor(astResult.files.length * 0.3));
+      if (plan.files.length < expectedMinFiles) {
+        jlog.warn(
+          `[GATE-PLAN] ⚠️  Only ${plan.files.length} files generated vs ${astResult.files.length} source files `
+          + `(expected ≥${expectedMinFiles}). Possible quality issue.`,
+          { jobId: ctx.jobId, step: 'gate_plan', generated: plan.files.length, source: astResult.files.length },
+        );
+        console.warn(`[PIPELINE] ⚠️  GATE-PLAN: ${plan.files.length} generated / ${astResult.files.length} source (expected ≥${expectedMinFiles})`);
+      }
+    }
 
     // ── LOG STRUCTURÉ: RESULT (après planning) ────────────
     const _isFlutterPlan = plan.files.some((f) => /\.dart$/.test(f.path));
@@ -751,6 +839,39 @@ export class ConversionPipeline {
         console.log(`[PIPELINE] Phase 5 Dart: success=${compilationResult.success} errors=${compilationResult.errors.length} warnings=${compilationResult.warnings.length} fixed=${compilationResult.filesFixed} dartAvail=${compilationResult.dartAvailable}`);
       } catch (compErr) {
         console.warn(`[PIPELINE] Phase 5 Dart: Compilation skipped — ${(compErr as Error).message}`);
+      }
+    }
+
+    // ── PHASE 30: GATE CHECK ZIP INPUT — vérifier les fichiers avant packaging ─
+    {
+      const shellFiles  = enhancedFiles.filter((f) => /NEEDS_MANUAL_REVIEW|NEEDS_IMPLEMENTATION/.test(f.content));
+      const emptyFiles  = enhancedFiles.filter((f) => !f.content || f.content.trim().length < 50);
+      const realFiles   = enhancedFiles.length - shellFiles.length - emptyFiles.length;
+
+      jlog.info(`[GATE-ZIP] total=${enhancedFiles.length} real=${realFiles} shells=${shellFiles.length} empty=${emptyFiles.length}`, {
+        jobId: ctx.jobId, step: 'gate_zip',
+        totalFiles: enhancedFiles.length, realFiles, shellFiles: shellFiles.length, emptyFiles: emptyFiles.length,
+      });
+
+      if (shellFiles.length > 0) {
+        jlog.warn(
+          `[GATE-ZIP] ⚠️  ${shellFiles.length} stub/shell files detected in output: ${shellFiles.slice(0, 5).map((f) => f.path).join(', ')}${shellFiles.length > 5 ? '...' : ''}`,
+          { jobId: ctx.jobId, step: 'gate_zip', shellPaths: shellFiles.map((f) => f.path) },
+        );
+      }
+
+      if (emptyFiles.length > 0) {
+        jlog.warn(
+          `[GATE-ZIP] ⚠️  ${emptyFiles.length} empty files detected: ${emptyFiles.slice(0, 3).map((f) => f.path).join(', ')}`,
+          { jobId: ctx.jobId, step: 'gate_zip', emptyPaths: emptyFiles.map((f) => f.path) },
+        );
+      }
+
+      if (realFiles === 0 && enhancedFiles.length > 0) {
+        const errMsg = `GATE-ZIP FAIL: ALL ${enhancedFiles.length} generated files are stubs/empty. `
+          + `This indicates a complete AI generation failure. Check Groq responses.`;
+        jlog.error(errMsg, new Error(errMsg), { jobId: ctx.jobId, step: 'gate_zip' });
+        throw new Error(`[CodeMorph] Pipeline aborted before ZIP: ${errMsg}`);
       }
     }
 

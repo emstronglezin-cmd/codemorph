@@ -548,17 +548,16 @@ Return ONLY valid JSON. No markdown. No explanation.`;
       return { data: fallback, tokens: 0 };
     }
 
-    // ── FIX PHASE 24 — BUG #2 CRITIQUE ──────────────────────────────────────
-    // AVANT: uiFiles.slice(0, 8) × content.slice(0, 200) = 1600 chars de contexte
-    // Un projet Flutter 221 fichiers → 95% du code ignoré → 0 screens extraits
+    // PHASE 30 FIX: Augmenter drastiquement le contexte pour Groq (131K tokens)
+    // AVANT: 15 fichiers × 500 chars = 7500 chars → extraction très pauvre
+    // APR\u00c8S: 30 fichiers × 2000 chars = 60 000 chars → extraction complète
     //
-    // Fix:
-    //   - Groq (2048 tokens): 15 fichiers × 500 chars = 7500 chars
-    //   - Platform/Pro (4096+): 25 fichiers × 1000 chars = 25 000 chars
-    // Priorité: fichiers screen avant widgets
-    const isGroq       = maxTokens <= 2048;
-    const maxFiles     = isGroq ? 15 : 25;
-    const maxPerFile   = isGroq ? 500 : 1000;
+    // Groq llama-3.3-70b-versatile: 131 072 tokens input
+    // system prompt (~600t) + filesCtx (~15000t) + instructions (~200t) + output (1800t) ≈ 17600t
+    // → Bien dans les limites, même avec 30 fichiers × 2000 chars
+    const isGroq       = maxTokens <= 4096; // Groq: maxTokens=3000 dans getLimits()
+    const maxFiles     = isGroq ? 30 : 40;    // PHASE 30: 15→30 (Groq), 25→40 (autres)
+    const maxPerFile   = isGroq ? 2000 : 4000; // PHASE 30: 500→2000 (Groq), 1000→4000 (autres)
 
     // Trier: fichiers screens/pages d'abord, puis widgets
     const sortedUiFiles = [...uiFiles].sort((a, b) => {
@@ -604,9 +603,9 @@ Return JSON:
 
 RULES: Use REAL names from source. Max 15 screens, 20 components. ONLY valid JSON.`;
 
-    // FIX BUG #4 + #10: Utiliser plus de tokens pour la réponse + log prompt
-    // AVANT: Math.min(1400, maxTokens) — avec MASTER_SYSTEM_PROMPT ~600 tokens, reste ~800 pour JSON
-    // FIX: augmenter à min(1800, maxTokens) pour permettre plus d'écrans dans la réponse
+    // PHASE 30 FIX: Augmenter la réponse max pour permettre plus d'écrans dans le JSON
+    // AVANT: Math.min(1800, maxTokens) — insuffisant pour 30 écrans avec businessLogic
+    // APR\u00c8S: Math.min(3500, maxTokens) — permet jusqu'à ~15 écrans complets avec metadata
     const promptChars = this.MASTER_SYSTEM_PROMPT.length + prompt.length;
     const estimatedPromptTokens = Math.ceil(promptChars / 4);
     console.log(`\n================ PROMPT (generateUIGraph) ================`);
@@ -624,14 +623,13 @@ RULES: Use REAL names from source. Max 15 screens, 20 components. ONLY valid JSO
     console.log(`==============================\n`);
 
     try {
-      // PHASE 25 Partie B: UIGraph utilise le MASTER_SYSTEM_PROMPT complet (analyse principale)
-      // C'est le seul appel qui mérite le prompt complet — les autres utilisent le prompt court
+      // PHASE 30 FIX: UIGraph — augmenter la réponse max (3500 tokens = ~15 écrans complets)
       const res = await this.ai.chat(
         [
           { role: 'system', content: this.MASTER_SYSTEM_PROMPT },
           { role: 'user',   content: prompt },
         ],
-        Math.min(1800, maxTokens), // FIX BUG #4: 1800 au lieu de 1400
+        Math.min(3500, maxTokens), // PHASE 30: 1800→3500 tokens réponse
       );
       const data = this.tryParseJSON<IRDocument['uiGraph']>(res.content || '{}', fallback);
       data.screens = data.screens ?? []; data.components = data.components ?? [];

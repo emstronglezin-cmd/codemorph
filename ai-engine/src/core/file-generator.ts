@@ -72,7 +72,9 @@ const CHUNKER_FALLBACK_PATTERNS = [
   /\/\/ TODO: Implement .+ in react-native\/typescript/,
 ];
 const VALID_EXPORT_RE        = /export\s+(default|const|function|class|interface|type|enum)\s+\w/;
-const MIN_PRESERVATION_RATIO = 0.25; // au moins 25% des lignes source
+// PHASE 30 FIX: 0.25→0.50 — 25% était trop permissif (75% du code pouvait disparaître)
+// Groq llama-3.3-70b-versatile a 131K tokens — on peut exiger 50% de préservation
+const MIN_PRESERVATION_RATIO = 0.50; // au moins 50% des lignes source
 
 // ── Détection si un output est valide ─────────────────────────────────────
 
@@ -112,17 +114,18 @@ function isOutputValid(
 
   const lines = allLines.filter((l) => l.trim().length > 0);
 
-  // Vérifier ratio de préservation (sauf pour configs et utils courts)
-  // TRANSPILE: screen/component Flutter (300-500L) → RN (~100-150L) — ratio faible est normal
-  // On exclut screen/component du ratio check; on vérifie juste > 40 lignes
-  if (sourceLines > 20 && !['config', 'util', 'hook', 'screen', 'component'].includes(fileType)) {
+  // PHASE 30 FIX: Vérifier ratio de préservation sur TOUS les types (sauf config)
+  // screen/component inclus maintenant: Flutter screen 300L → RN doit faire ≥150L
+  // Groq génère ~ la même quantité de code TypeScript qu'il y a de Dart
+  if (sourceLines > 20 && !['config', 'util'].includes(fileType)) {
     const ratio = lines.length / sourceLines;
     if (ratio < MIN_PRESERVATION_RATIO) {
-      return { valid: false, reason: `too short relative to source (${lines.length}/${sourceLines} lines = ${(ratio * 100).toFixed(0)}%)` };
+      return { valid: false, reason: `too short relative to source (${lines.length}/${sourceLines} lines = ${(ratio * 100).toFixed(0)}% < ${(MIN_PRESERVATION_RATIO * 100).toFixed(0)}% threshold)` };
     }
   }
-  if (['screen', 'component'].includes(fileType) && lines.length < 40) {
-    return { valid: false, reason: `screen too short (${lines.length} lines) — need >=40 for real RN screen` };
+  // PHASE 30 FIX: screen/component minimum 80 lignes (40 était trop bas pour un vrai écran RN)
+  if (['screen', 'component'].includes(fileType) && lines.length < 80) {
+    return { valid: false, reason: `screen too short (${lines.length} lines) — need >=80 for real RN screen with business logic` };
   }
 
   // Vérifier présence d'un export valide pour les fichiers TS
@@ -245,11 +248,14 @@ IMPORTS TO USE (${framework}):
 - Types: import type { XxxModel } from '../types/xxx.types'`;
 }
 
-function buildUserPrompt(req: FileGenerationRequest, attempt = 0): string {
-  // Budget source: 8000 chars pour Groq 8000 TPM (≈2000 tokens input source)
-  // Le system prompt (~600 tokens) + source (~2000) + context (~200) + output (2800) ≈ 5600 tokens total
-  // Cela reste dans la limite 8000 TPM par requête
-  const MAX_SOURCE_CHARS = 8_000;
+function buildUserPrompt(req: FileGenerationRequest, attempt = 0, tier?: string): string {
+  // PHASE 30 FIX: MAX_SOURCE_CHARS 8_000→32_000 pour Groq (131K tokens context window)
+  // AVANT: 8000 chars ≈ 2000 tokens — un fichier Flutter moyen (300L) = ~12000 chars → tronqué à 67%
+  // APRÈS: 32000 chars ≈ 8000 tokens — couverture complète des fichiers Flutter standards
+  // Note: system prompt (~600t) + source (~8000t) + context (~200t) + output (2800t) ≈ 11600t
+  //       Groq free tier: 8000 TPM — si dépassement: le semaphore + retry gèrent
+  // Pour tier platform/pro: 131K context → 80000 chars (pas de problème)
+  const MAX_SOURCE_CHARS = (tier === 'free-groq') ? 32_000 : 80_000;
   const truncatedSource = req.sourceContent.length > MAX_SOURCE_CHARS
     ? req.sourceContent.slice(0, MAX_SOURCE_CHARS) + `\n// [source truncated at ${MAX_SOURCE_CHARS} chars — implement remaining methods following the same patterns above]`
     : req.sourceContent;
@@ -343,7 +349,8 @@ export async function generateSingleFile(
     }
 
     // buildUserPrompt avec l'index d'attempt pour renforcer le message sur retry
-    const userMsg = buildUserPrompt(req, attempt);
+    // PHASE 30: passer le tier pour ajuster MAX_SOURCE_CHARS (32K Groq, 80K autres)
+    const userMsg = buildUserPrompt(req, attempt, tier);
 
     try {
       const res = await ai.chat(

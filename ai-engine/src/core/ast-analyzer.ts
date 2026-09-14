@@ -497,11 +497,12 @@ export class ASTAnalyzer {
     variables:  string[];
     tokensUsed: number;
   }> {
-    // ── PHASE 22: Prompt enrichi — extraction complète Étape 1 du Prompt Maître V2 ──
-    // Demande à l'IA d'identifier TOUTES les entités: classes, fonctions, exports, variables globales
-    // + patterns de state management + connexions externes
-    const filesSummary = files.slice(0, 4).map((f) =>
-      `FILE: ${f.path}\n${f.content.slice(0, 400)}`
+    // PHASE 30 FIX: Augmenter le contexte AST (4×400→10×1500 chars)
+    // AVANT: 4 fichiers × 400 chars = 1600 chars → trop peu pour détecter les patterns
+    // APR\u00c8S: 10 fichiers × 1500 chars = 15000 chars → détection correcte des patterns
+    // Groq 131K context: pas de problème avec 15000 chars + prompt ~1000 chars
+    const filesSummary = files.slice(0, 10).map((f) =>
+      `FILE: ${f.path}\nCLASSES: ${f.classes.slice(0, 8).join(', ')}\nFUNCS: ${f.functions.slice(0, 5).join(', ')}\n${f.content.slice(0, 1500)}`
     ).join('\n---\n');
 
     const prompt = `You are a senior reverse-engineering engineer analyzing a ${ctx.sourceFramework} codebase.
