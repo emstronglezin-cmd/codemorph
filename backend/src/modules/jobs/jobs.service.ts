@@ -41,10 +41,19 @@ import { QuotaService, STALE_JOB_MINUTES } from '../quota/quota.service';
 // AVANT (Phase 11): CONVERTING > 5min → FAILED
 //   Problème: pipeline Groq réel prend 10-30min (30+ fichiers × 2-3s/fichier via LLM)
 //   → les jobs légitimes étaient tués par le watchdog
-// MAINTENANT: CONVERTING > 60min → FAILED ET seulement si AI Engine est injoignable
-//   + heartbeat: conversion-processor met à jour updatedAt toutes les 30s pendant la conversion
-//   → le watchdog ne tue que les vraies zombies (AI Engine mort ET inactif depuis 60min)
-const CONVERTING_STALE_MINUTES = 60;
+// FIX PHASE 31 — WATCHDOG ABSOLU (startedAt) :
+//   PROBLÈME CRITIQUE IDENTIFIÉ : le heartbeat backend (conversion-processor.service.ts)
+//   met à jour `updatedAt` toutes les 30s pendant la conversion.
+//   → Un job bloqué dans l'AI Engine voit son `updatedAt` rester frais.
+//   → La condition LessThan(updatedAt, 60min) n'est JAMAIS remplie pendant que le heartbeat tourne.
+//   → Même si elle était remplie, aiEngineAlive=true bloquait le kill.
+//   SOLUTION : double seuil :
+//   1. updatedAt > 60min (heartbeat mort) + AI Engine DOWN → FAILED (comportement existant)
+//   2. startedAt > 120min (timeout absolu) → FAILED même si AI Engine UP et heartbeat actif
+//      Car l'AI Engine a ses propres timeouts (8min IR Phase 31, 90s/appel Groq) et ne
+//      peut pas légitimement dépasser 120min sur aucun projet réel.
+const CONVERTING_STALE_MINUTES     = 60;   // heartbeat-based: updatedAt > 60min
+const CONVERTING_ABSOLUTE_MAX_MIN  = 120;  // absolute: startedAt > 120min → kill même si AI Engine UP
 import { SubscriptionService }           from '../subscription/subscription.service';
 import { getPlanLimits }                 from '../subscription/plan-limits.config';
 
@@ -174,56 +183,110 @@ export class JobsService implements OnModuleInit {
   }
 
   // ── Stale job cleanup (scheduled every 5 minutes) ────
-  // FIX PHASE 27 — WATCHDOG ROBUSTE :
-  // Deux seuils distincts :
-  //   1. CONVERTING jobs > 60min sans mise à jour → FAILED SEULEMENT si AI Engine injoignable
-  //      (heartbeat mis à jour par conversion-processor toutes les 30s)
-  //   2. PENDING/ANALYZING jobs > 15min sans mise à jour → FAILED (worker crashé)
+  // FIX PHASE 31 — WATCHDOG ABSOLU : deux passes indépendantes
+  // Passe A — Timeout absolu (startedAt > 120min) :
+  //   Tue même si AI Engine UP et heartbeat actif.
+  //   Rationale: l'AI Engine a des timeouts internes (8min IR, 90s/appel Groq).
+  //   Aucun pipeline réel ne dure >120min. Si c'est le cas, c'est un zombie.
+  // Passe B — Heartbeat mort (updatedAt > 60min) + AI Engine DOWN :
+  //   Comportement Phase 27 préservé. Kill uniquement si AI Engine injoignable.
+  //   (Si AI Engine UP mais heartbeat mort, log seulement — cas rare)
   @Cron(CronExpression.EVERY_5_MINUTES)
   async cleanupStaleJobs(): Promise<void> {
     const now = Date.now();
-    const convertingStaleThreshold = new Date(now - CONVERTING_STALE_MINUTES * 60 * 1000);
-    const generalStaleThreshold    = new Date(now - STALE_JOB_MINUTES * 60 * 1000);
+    const convertingStaleThreshold   = new Date(now - CONVERTING_STALE_MINUTES * 60 * 1000);
+    const convertingAbsoluteThreshold = new Date(now - CONVERTING_ABSOLUTE_MAX_MIN * 60 * 1000);
+    const generalStaleThreshold       = new Date(now - STALE_JOB_MINUTES * 60 * 1000);
 
     try {
-      // ── 1. CONVERTING zombie watchdog (seuil étendu : 60min) ──
-      // Un job CONVERTING inactif depuis >60min est présumé zombie.
-      // Vérification supplémentaire: l'AI Engine est-il joignable ?
-      // Si oui → peut-être encore en cours (gros projet) → log seulement, pas de kill
-      // Si non → AI Engine mort → marquer FAILED
+      // ── PASSE A — Timeout absolu sur startedAt (FIX PHASE 31) ──────────────────
+      // Cherche les jobs CONVERTING dont startedAt > 120min.
+      // Ces jobs sont tués inconditionnellement même si AI Engine UP,
+      // car le pipeline AI Engine a ses propres timeouts internes.
+      // Note: on filtre sur startedAt (non null) pour éviter de tuer des jobs
+      // qui n'ont pas encore démarré (startedAt null = pas encore dispatché).
+      const absoluteTimeoutZombies = await this.jobRepo
+        .createQueryBuilder('job')
+        .where('job.status = :status', { status: JobStatus.CONVERTING })
+        .andWhere('job.startedAt IS NOT NULL')
+        .andWhere('job.startedAt < :threshold', { threshold: convertingAbsoluteThreshold })
+        .select(['job.id', 'job.userId', 'job.status', 'job.updatedAt', 'job.startedAt', 'job.type'])
+        .getMany();
+
+      if (absoluteTimeoutZombies.length > 0) {
+        this.logger.warn(
+          `[Watchdog-AbsoluteTimeout] Found ${absoluteTimeoutZombies.length} CONVERTING job(s) started >${CONVERTING_ABSOLUTE_MAX_MIN}min ago (hard timeout): ` +
+          absoluteTimeoutZombies.map(j => `${j.id}(started ${Math.round((now - j.startedAt!.getTime()) / 60000)}min ago)`).join(', '),
+        );
+        for (const job of absoluteTimeoutZombies) {
+          const runningMinutes = Math.round((now - job.startedAt!.getTime()) / 60000);
+          await this.jobRepo.update(job.id, {
+            status:       JobStatus.FAILED,
+            errorMessage: `Job automatically failed: conversion has been running for ${runningMinutes} minutes ` +
+                          `which exceeds the maximum allowed duration of ${CONVERTING_ABSOLUTE_MAX_MIN} minutes. ` +
+                          `The AI pipeline has internal timeouts (8min IR, 90s per call) and cannot legitimately ` +
+                          `exceed this limit. Please retry your conversion.`,
+            errorDetails: {
+              reason:              'converting_absolute_timeout',
+              lastStatus:          job.status,
+              runningMinutes,
+              absoluteMaxMinutes:  CONVERTING_ABSOLUTE_MAX_MIN,
+              startedAt:           job.startedAt!.toISOString(),
+              detectedAt:          new Date().toISOString(),
+            },
+            completedAt: new Date(),
+          });
+          this.logger.warn(
+            `[Watchdog-AbsoluteTimeout] Job ${job.id} (CONVERTING ${runningMinutes}min since startedAt, hard limit=${CONVERTING_ABSOLUTE_MAX_MIN}min) → FAILED ✓`,
+          );
+        }
+      }
+
+      // ── PASSE B — Heartbeat mort (updatedAt > 60min) ───────────────────────────
+      // Comportement Phase 27 préservé.
+      // Un job CONVERTING dont updatedAt > 60min = heartbeat mort (conversion-processor crashé?).
+      // Si AI Engine DOWN → zombie confirmé → FAILED.
+      // Si AI Engine UP → log seulement (cas peu probable si PASSE A a fait son travail).
+      // Note: on exclut les jobs déjà traités par PASSE A (startedAt > 120min)
+      // pour éviter les doubles logs.
       const convertingZombies = await this.jobRepo.find({
         where: {
           status:    JobStatus.CONVERTING,
           updatedAt: LessThan(convertingStaleThreshold),
         },
-        select: ['id', 'userId', 'status', 'updatedAt', 'type'],
+        select: ['id', 'userId', 'status', 'updatedAt', 'startedAt', 'type'],
       });
 
-      if (convertingZombies.length > 0) {
+      // Filtrer les jobs déjà pris en charge par PASSE A
+      const absoluteIds = new Set(absoluteTimeoutZombies.map(j => j.id));
+      const heartbeatZombies = convertingZombies.filter(j => !absoluteIds.has(j.id));
+
+      if (heartbeatZombies.length > 0) {
         this.logger.warn(
-          `[Watchdog] Found ${convertingZombies.length} CONVERTING job(s) inactive >${CONVERTING_STALE_MINUTES}min: ` +
-          convertingZombies.map(j => `${j.id}(${Math.round((now - j.updatedAt.getTime())/60000)}min ago)`).join(', '),
+          `[Watchdog] Found ${heartbeatZombies.length} CONVERTING job(s) with dead heartbeat (updatedAt >${CONVERTING_STALE_MINUTES}min): ` +
+          heartbeatZombies.map(j => `${j.id}(${Math.round((now - j.updatedAt.getTime())/60000)}min inactive)`).join(', '),
         );
 
-        // Vérifier si l'AI Engine est joignable avant de killer les jobs
+        // Vérifier si l'AI Engine est joignable
         const aiEngineAlive = await this.checkAiEngineAlive();
-        this.logger.log(`[Watchdog] AI Engine reachable=${aiEngineAlive} — ${aiEngineAlive ? 'jobs may still be processing' : 'AI Engine DOWN, marking as FAILED'}`);
+        this.logger.log(`[Watchdog] AI Engine reachable=${aiEngineAlive} — ${aiEngineAlive ? 'heartbeat dead but AI Engine UP (log only)' : 'AI Engine DOWN, marking as FAILED'}`);
 
-        for (const job of convertingZombies) {
+        for (const job of heartbeatZombies) {
           const inactiveMinutes = Math.round((now - job.updatedAt.getTime()) / 60000);
 
           if (aiEngineAlive) {
-            // AI Engine répond → job peut encore être en cours pour un gros projet.
-            // On log mais on ne tue pas.
+            // AI Engine UP mais heartbeat mort depuis >60min.
+            // Cas rare: conversion-processor crashé mais pipeline AI toujours actif?
+            // On log uniquement — PASSE A tuera le job au prochain cycle si startedAt > 120min.
             this.logger.warn(
-              `[Watchdog] Job ${job.id} inactive ${inactiveMinutes}min but AI Engine is UP — not killing yet. ` +
-              `Will kill after ${CONVERTING_STALE_MINUTES}min with AI Engine DOWN.`,
+              `[Watchdog] Job ${job.id} heartbeat dead ${inactiveMinutes}min but AI Engine UP — ` +
+              `PASSE A (absolute timeout) will handle if startedAt > ${CONVERTING_ABSOLUTE_MAX_MIN}min.`,
             );
           } else {
-            // AI Engine ne répond pas → zombie confirmé → FAILED
+            // AI Engine DOWN + heartbeat mort → zombie confirmé → FAILED
             await this.jobRepo.update(job.id, {
               status:       JobStatus.FAILED,
-              errorMessage: `Job automatically failed: stuck in CONVERTING for ${inactiveMinutes} minutes ` +
+              errorMessage: `Job automatically failed: no heartbeat for ${inactiveMinutes} minutes ` +
                             `and the AI Engine is unreachable. ` +
                             `The conversion likely started but the AI Engine went down before completing. ` +
                             `Please retry your conversion.`,
@@ -237,7 +300,7 @@ export class JobsService implements OnModuleInit {
               },
               completedAt: new Date(),
             });
-            this.logger.warn(`[Watchdog] Job ${job.id} (CONVERTING ${inactiveMinutes}min, AI Engine DOWN) → FAILED ✓`);
+            this.logger.warn(`[Watchdog] Job ${job.id} (heartbeat dead ${inactiveMinutes}min, AI Engine DOWN) → FAILED ✓`);
           }
         }
       }
@@ -251,7 +314,7 @@ export class JobsService implements OnModuleInit {
         select: ['id', 'userId', 'status', 'updatedAt', 'type'],
       });
 
-      if (staleJobs.length === 0 && convertingZombies.length === 0) {
+      if (staleJobs.length === 0 && heartbeatZombies.length === 0 && absoluteTimeoutZombies.length === 0) {
         return; // Nothing to clean
       }
 

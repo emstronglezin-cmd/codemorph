@@ -405,7 +405,27 @@ export class ConversionPipeline {
       irDocument = cachedIR;
       jlog.info('✅ Phase 3: IR — cache HIT (0 tokens)', { jobId: ctx.jobId });
     } else {
-      irDocument = await irGenerator.generate(ctx, astResult, archResult);
+      // FIX PHASE 31 — TIMEOUT GLOBAL PHASE IR
+      // Sans ce guard, irGenerator.generate() peut rester suspendu indéfiniment si:
+      //   - L'appel HTTP Groq est zombie (TCP keep-alive sans données)
+      //   - Le semaphore GroqRateLimiter bloque (tous les slots pris par d'autres jobs)
+      //   - Un retry 429 attend très longtemps
+      // Tier free-groq: 4 appels séquentiels × 90s timeout + 8s interval + retries ≈ 5min max réel
+      // On pose une limite haute à 8min pour le free-groq (marge × 1.5), 4min pour les autres.
+      const IR_PHASE_TIMEOUT_MS = tier === 'free-groq' ? 8 * 60_000 : 4 * 60_000;
+      const irTimeoutError = new Error(
+        `[GATE-IR] TIMEOUT: IR Generation exceeded ${IR_PHASE_TIMEOUT_MS / 60_000} minutes. ` +
+        `Possible causes: Groq API unresponsive, rate limit throttle, TCP zombie connection. ` +
+        `jobId=${ctx.jobId} tier=${tier}`,
+      );
+      const irTimeout = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(irTimeoutError), IR_PHASE_TIMEOUT_MS),
+      );
+      jlog.info(`[IR] Starting IR generation — timeout=${IR_PHASE_TIMEOUT_MS / 60_000}min tier=${tier}`, { jobId: ctx.jobId, step: 'ir_start' });
+      irDocument = await Promise.race([
+        irGenerator.generate(ctx, astResult, archResult),
+        irTimeout,
+      ]);
       pipelineCache.irCache.set(cacheKey, irDocument);
     }
     phaseEnd('ir');

@@ -1334,9 +1334,17 @@ export class AIProvider {
     // Groq free tier = 8000 TPM — cap max_tokens pour rester dans les limites
     // openai/gpt-oss-120b = primary, openai/gpt-oss-20b = fallback si 429
     const GROQ_MAX_TOKENS = Math.min(maxTokens, 2800);
+    // FIX PHASE 31 — CAUSE RACINE BLOCAGE IR:
+    // Le SDK OpenAI a un timeout par défaut de 600s. Sur Groq avec un payload large
+    // ou une connexion TCP zombie, l'appel peut rester pending indéfiniment.
+    // Timeout explicite 90s: assez pour un appel normal Groq (p99 < 30s), assez court
+    // pour ne pas bloquer le pipeline. Le retry sur 429 gère les cas temporaires.
+    const GROQ_HTTP_TIMEOUT_MS = 90_000; // 90s max par appel Groq
     const client = new OpenAI({
-      apiKey:  process.env['GROQ_API_KEY']!,
-      baseURL: 'https://api.groq.com/openai/v1',
+      apiKey:   process.env['GROQ_API_KEY']!,
+      baseURL:  'https://api.groq.com/openai/v1',
+      timeout:  GROQ_HTTP_TIMEOUT_MS,
+      maxRetries: 0, // on gère le retry nous-mêmes pour contrôler le comportement 429
     });
 
     const jlog = jobId ? getJobLogger(jobId) : undefined;
