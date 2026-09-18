@@ -113,13 +113,25 @@ export class AiEngineClient {
   //   - jobId transmis tel quel (attendu par l'AI Engine)
   async submitConversion(req: AiConvertRequest): Promise<AiConvertResponse> {
     const targetUrl = `${this.baseUrl}/api/convert`;
+    const sourceCharCount = req.files.reduce((acc, f) => acc + (f.content?.length ?? 0), 0);
 
+    // FIX PHASE 32 — DISPATCH LOG STRUCTURÉ
+    // Permet de tracer exactement si l'appel HTTP part réellement vers l'AI Engine.
     this.logger.log(
-      `[submitConversion] [Job ${req.jobId}] ${req.sourceLanguage} → ${req.targetLanguage}, ` +
-      `${req.files.length} files, mock=${this.mockMode}, url=${targetUrl}`,
+      `[DISPATCH-START] jobId=${req.jobId} url=${targetUrl} ` +
+      `src=${req.sourceLanguage} tgt=${req.targetLanguage} ` +
+      `files=${req.files.length} chars=${sourceCharCount} ` +
+      `mock=${this.mockMode} circuit=${this.circuitOpen ? 'OPEN' : 'closed'}`,
+    );
+    this.logger.log(
+      `[DISPATCH-START] callbackUrl=${req.callbackUrl} progressUrl=${req.progressUrl ?? '(none)'}`,
     );
 
     if (this.mockMode) {
+      this.logger.warn(
+        `[DISPATCH-MOCK] jobId=${req.jobId} — AI_ENGINE_URL not set or is Docker-internal. ` +
+        `Running mock conversion. Set AI_ENGINE_URL=https://<real-ai-engine>.onrender.com to use real AI.`,
+      );
       return this.mockConversion(req);
     }
 
@@ -157,6 +169,7 @@ export class AiEngineClient {
         extraHeaders['X-AI-Engine-Secret'] = aiEngineSecret;
       }
 
+      const httpStart = Date.now();
       const res = await firstValueFrom(
         this.http
           .post<AiConvertResponse>(targetUrl, payload, {
@@ -170,15 +183,20 @@ export class AiEngineClient {
               count:    2,
               delay:    (err, attempt) => {
                 const wait = Math.pow(2, attempt) * 1_000;
-                this.logger.warn(`[submitConversion] [Job ${req.jobId}] retry ${attempt}/2 after ${wait}ms: ${(err as Error).message}`);
+                this.logger.warn(
+                  `[DISPATCH-RETRY] jobId=${req.jobId} attempt=${attempt}/2 wait=${wait}ms ` +
+                  `reason=${(err as Error).message}`,
+                );
                 return new Promise((r) => setTimeout(r, wait)) as any;
               },
               resetOnSuccess: true,
             }),
             catchError((err: AxiosError) => {
+              const durationMs = Date.now() - httpStart;
               this.logger.error(
-                `[submitConversion] [Job ${req.jobId}] HTTP error: ${err.message} ` +
-                `status=${err.response?.status ?? 'no response'} body=${JSON.stringify(err.response?.data ?? {})}`,
+                `[DISPATCH-FAILED] jobId=${req.jobId} url=${targetUrl} ` +
+                `durationMs=${durationMs} httpStatus=${err.response?.status ?? 'NO_RESPONSE'} ` +
+                `error=${err.message} body=${JSON.stringify(err.response?.data ?? {})}`,
               );
               this.recordFailure();
               return throwError(() => new ServiceUnavailableException(
@@ -188,7 +206,11 @@ export class AiEngineClient {
           ),
       );
 
-      this.logger.log(`[submitConversion] [Job ${req.jobId}] AI Engine accepted: status=${res.status} body=${JSON.stringify(res.data)}`);
+      const durationMs = Date.now() - httpStart;
+      this.logger.log(
+        `[DISPATCH-OK] jobId=${req.jobId} httpStatus=${res.status} durationMs=${durationMs} ` +
+        `body=${JSON.stringify(res.data)}`,
+      );
       this.recordSuccess();
 
       // L'AI Engine répond { jobId, status: 'processing', message }
@@ -533,6 +555,7 @@ export class AiEngineClient {
   }
 
   // ── Health check ─────────────────────────────────────────
+  // FIX PHASE 32: route corrigée /health → /api/health (route réelle de l'AI Engine)
   async health(): Promise<AiHealthResponse | null> {
     if (this.mockMode) {
       return {
@@ -542,9 +565,10 @@ export class AiEngineClient {
       };
     }
     try {
+      // CORRECTION: l'AI Engine expose /api/health (pas /health qui retourne 404)
       const res = await firstValueFrom(
         this.http
-          .get<AiHealthResponse>(`${this.baseUrl}/health`, { timeout: 5_000 })
+          .get<AiHealthResponse>(`${this.baseUrl}/api/health`, { timeout: 5_000 })
           .pipe(timeout(6_000)),
       );
       return res.data;

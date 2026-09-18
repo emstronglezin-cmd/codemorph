@@ -67,22 +67,34 @@
 # GOOGLE_CLIENT_SECRET=<depuis Google Cloud Console>
 # GOOGLE_CALLBACK_URL=https://codemorph-backend.onrender.com/auth/google/callback
 #
-# AI_ENGINE_URL=https://codemorph-ai.onrender.com
+# AI_ENGINE_URL=https://codemorph-1-rdx0.onrender.com   ← URL RÉELLE (auto-générée par Render)
+# NOTE: l'URL auto-générée est visible dans Render Dashboard → Service → Settings → URL
+# render.yaml documente "codemorph-ai" comme nom de service, mais Render génère une URL
+# différente (ex: codemorph-1-rdx0.onrender.com). Toujours utiliser l'URL Dashboard réelle.
 # AI_ENGINE_SECRET=<openssl rand -base64 32>
+#
+# IMPORTANT — API_URL doit être défini sur l'AI Engine pour que callbackUrl soit correct:
+# Sans API_URL sur l'AI Engine → callbackUrl = localhost:4000 → injoignable depuis Render AI Engine
+# Sur Render AI Engine env vars → ajouter:
+# API_URL=https://codemorph-hp00.onrender.com/api/v1   ← URL RÉELLE du backend
 #
 # FEATURE_BILLING=false
 # FEATURE_ANALYTICS=false
 
 # ────────────────────────────────────────────────────────────
-# VARIABLES D'ENVIRONNEMENT — AI Engine (codemorph-ai)
+# VARIABLES D'ENVIRONNEMENT — AI Engine (codemorph-1-rdx0)
+# URL réelle Render: https://codemorph-1-rdx0.onrender.com
 # ────────────────────────────────────────────────────────────
 #
 # NODE_ENV=production
 # AI_PORT=5000
 # LOG_LEVEL=warn
-# AI_ENGINE_SECRET=<même valeur que backend>
+# AI_ENGINE_SECRET=<même valeur que backend — OBLIGATOIRE>
 #
 # GROQ_API_KEY=<depuis console.groq.com — GRATUIT>
 # OPENAI_API_KEY=                        (optionnel — platform tier)
 #
-# API_URL=https://codemorph-backend.onrender.com/api/v1
+# CRITIQUE — API_URL OBLIGATOIRE sur l'AI Engine Render:
+# Sans cette variable, l'AI Engine construit callbackUrl=localhost:4000 (inaccessible)
+# et le job reste CONVERTING indéfiniment.
+# API_URL=https://codemorph-hp00.onrender.com/api/v1   ← URL RÉELLE du backend

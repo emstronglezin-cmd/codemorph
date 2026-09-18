@@ -167,16 +167,10 @@ convertRouter.post('/', async (req: Request, res: Response, next: NextFunction):
         }
         if (callbackUrl) {
           const { default: axios } = await import('axios');
-          // FIX: format de callback attendu par le backend handleCallback()
-          // Backend attend: { success, filesGenerated, linesGenerated, result, irDocument }
           const filesGenerated  = result.files?.length ?? 0;
           const linesGenerated  = result.files?.reduce(
             (acc: number, f: { content: string }) => acc + (f.content?.split('\n').length ?? 0), 0
           ) ?? 0;
-          // FIX PHASE 20 — CRITICAL: ajouter X-AI-Engine-Secret au callback
-          // Le backend (jobs.controller.ts) vérifie ce header avant d'accepter le callback.
-          // Sans ce header → 401 UnauthorizedException → callback silencieusement rejeté
-          // → job reste CONVERTING indéfiniment → watchdog FAILED après 5 min.
           const aiEngineSecret = process.env['AI_ENGINE_SECRET'] ?? '';
           const callbackHeaders: Record<string, string> = {
             'Content-Type': 'application/json',
@@ -184,7 +178,14 @@ convertRouter.post('/', async (req: Request, res: Response, next: NextFunction):
           if (aiEngineSecret) {
             callbackHeaders['X-AI-Engine-Secret'] = aiEngineSecret;
           }
-          await axios.post(callbackUrl, {
+
+          // FIX PHASE 32 — CALLBACK RETRY + LOGS STRUCTURÉS
+          // AVANT: un seul axios.post avec .catch() silencieux.
+          //   Si le backend était en sleep mode Render (cold start ~30s) ou avait un timeout,
+          //   le callback échouait silencieusement → job restait RUNNING indéfiniment.
+          // MAINTENANT: 3 tentatives avec backoff (0s, 10s, 30s).
+          //   Si toutes échouent → log [CALLBACK-FAILED] explicite (visible dans Render logs).
+          const callbackPayload = {
             success:        true,
             jobId:          result.jobId,
             filesGenerated,
@@ -196,14 +197,11 @@ convertRouter.post('/', async (req: Request, res: Response, next: NextFunction):
               targetLanguage:  ctx.targetFramework,
               conversionType:  'ai',
               generatedAt:     new Date().toISOString(),
-              // FIX PHASE 20 — Transmettre le provider IA au backend pour affichage frontend
               aiTier:  result.aiTier,
               aiModel: result.aiModel,
-              // PHASE FINALE — Nouveaux champs
               compilationResult:  result.compilationResult,
               zipResult:          result.zipResult,
               conversionReport:   result.conversionReport?.text,
-              // PHASE 2.5/6/8/12 (NOUVEAU) — Livrables obligatoires
               applicationSpec:    result.applicationSpec,
               contentValidation:  result.contentValidation,
               deliveryCheck:      result.deliveryCheck,
@@ -213,35 +211,98 @@ convertRouter.post('/', async (req: Request, res: Response, next: NextFunction):
               conversionReportMarkdown: result.conversionReport?.markdown,
             },
             irDocument:     result.ir,
-          }, { timeout: 15_000, headers: callbackHeaders }).catch((cbErr: Error) => {
-            console.error(`[PIPELINE] Callback POST FAILED: ${cbErr.message} → ${callbackUrl}`);
-          });
-          console.log(`[PIPELINE] ━━━ Callback sent ━━━`);
-          console.log(`[PIPELINE] Callback → ${callbackUrl}`);
-          console.log(`[PIPELINE] filesGenerated=${filesGenerated} linesGenerated=${linesGenerated} secret=${aiEngineSecret ? 'SET' : 'NOT SET — callback may be rejected!'} aiTier=${result.aiTier ?? 'unknown'}`);
+          };
+
+          const MAX_CALLBACK_ATTEMPTS = 3;
+          const CALLBACK_DELAYS_MS = [0, 10_000, 30_000]; // 0s, 10s, 30s
+          let callbackSent = false;
+          for (let attempt = 1; attempt <= MAX_CALLBACK_ATTEMPTS; attempt++) {
+            const delay = CALLBACK_DELAYS_MS[attempt - 1] ?? 0;
+            if (delay > 0) {
+              console.log(`[CALLBACK-RETRY] job=${ctx.jobId} attempt=${attempt}/${MAX_CALLBACK_ATTEMPTS} waiting ${delay}ms before retry`);
+              await new Promise<void>((r) => setTimeout(r, delay));
+            }
+            try {
+              const cbStart = Date.now();
+              console.log(
+                `[CALLBACK-SEND] job=${ctx.jobId} attempt=${attempt}/${MAX_CALLBACK_ATTEMPTS} ` +
+                `→ ${callbackUrl} filesGenerated=${filesGenerated} ` +
+                `secret=${aiEngineSecret ? 'SET' : 'NOT SET — will likely be rejected!'} ` +
+                `aiTier=${result.aiTier ?? 'unknown'}`,
+              );
+              await axios.post(callbackUrl, callbackPayload, { timeout: 20_000, headers: callbackHeaders });
+              console.log(
+                `[CALLBACK-SEND-OK] job=${ctx.jobId} attempt=${attempt} ` +
+                `durationMs=${Date.now() - cbStart} → ${callbackUrl}`,
+              );
+              callbackSent = true;
+              break;
+            } catch (cbErr: unknown) {
+              const msg = (cbErr as Error).message ?? String(cbErr);
+              const status = (cbErr as { response?: { status?: number } })?.response?.status;
+              console.error(
+                `[CALLBACK-SEND-FAIL] job=${ctx.jobId} attempt=${attempt}/${MAX_CALLBACK_ATTEMPTS} ` +
+                `url=${callbackUrl} httpStatus=${status ?? 'NO_RESPONSE'} error=${msg}`,
+              );
+              if (status === 401 || status === 403) {
+                console.error(
+                  `[CALLBACK-AUTH-REJECTED] job=${ctx.jobId} — Backend rejected callback with ${status}. ` +
+                  `Check AI_ENGINE_SECRET matches on both Backend and AI Engine Render env vars.`,
+                );
+                break; // Pas la peine de réessayer si c'est un 401/403
+              }
+            }
+          }
+          if (!callbackSent) {
+            console.error(
+              `[CALLBACK-FAILED] job=${ctx.jobId} — ALL ${MAX_CALLBACK_ATTEMPTS} callback attempts FAILED. ` +
+              `callbackUrl=${callbackUrl}. ` +
+              `Job will remain RUNNING on backend until watchdog kills it (Phase 31: 120min absolute timeout).`,
+            );
+          }
         }
       })
       .catch(async (err: Error) => {
-        console.error(`[PIPELINE] Pipeline FAILED — job=${ctx.jobId} error=${err.message}`);
+        console.error(`[PIPELINE-FAILED] job=${ctx.jobId} error=${err.message}`);
         if (callbackUrl) {
           const { default: axios } = await import('axios');
-          // FIX: format d'erreur attendu par le backend handleCallback()
-          // Backend attend: { success: false, error }
-          // FIX PHASE 20 — CRITICAL: ajouter X-AI-Engine-Secret au callback d'erreur également
           const aiEngineSecret = process.env['AI_ENGINE_SECRET'] ?? '';
-          const callbackHeaders: Record<string, string> = {
-            'Content-Type': 'application/json',
-          };
-          if (aiEngineSecret) {
-            callbackHeaders['X-AI-Engine-Secret'] = aiEngineSecret;
+          const callbackHeaders: Record<string, string> = { 'Content-Type': 'application/json' };
+          if (aiEngineSecret) callbackHeaders['X-AI-Engine-Secret'] = aiEngineSecret;
+
+          // Retry aussi pour le callback d'erreur
+          const MAX_ERR_ATTEMPTS = 3;
+          const ERR_DELAYS_MS = [0, 5_000, 15_000];
+          for (let attempt = 1; attempt <= MAX_ERR_ATTEMPTS; attempt++) {
+            const delay = ERR_DELAYS_MS[attempt - 1] ?? 0;
+            if (delay > 0) await new Promise<void>((r) => setTimeout(r, delay));
+            try {
+              console.log(
+                `[CALLBACK-SEND] job=${ctx.jobId} FAILURE callback attempt=${attempt}/${MAX_ERR_ATTEMPTS} ` +
+                `→ ${callbackUrl} error="${err.message}"`,
+              );
+              await axios.post(callbackUrl, {
+                success: false,
+                jobId:   ctx.jobId,
+                error:   err.message,
+              }, { timeout: 15_000, headers: callbackHeaders });
+              console.log(`[CALLBACK-SEND-OK] job=${ctx.jobId} FAILURE callback sent attempt=${attempt}`);
+              break;
+            } catch (cbErr: unknown) {
+              const msg = (cbErr as Error).message ?? String(cbErr);
+              const status = (cbErr as { response?: { status?: number } })?.response?.status;
+              console.error(
+                `[CALLBACK-SEND-FAIL] job=${ctx.jobId} FAILURE callback attempt=${attempt}/${MAX_ERR_ATTEMPTS} ` +
+                `httpStatus=${status ?? 'NO_RESPONSE'} error=${msg}`,
+              );
+              if (attempt === MAX_ERR_ATTEMPTS) {
+                console.error(
+                  `[CALLBACK-FAILED] job=${ctx.jobId} — ALL ${MAX_ERR_ATTEMPTS} FAILURE callback attempts failed. ` +
+                  `Job will remain RUNNING until watchdog (Phase 31: 120min absolute timeout).`,
+                );
+              }
+            }
           }
-          await axios.post(callbackUrl, {
-            success: false,
-            jobId:   ctx.jobId,
-            error:   err.message,
-          }, { timeout: 15_000, headers: callbackHeaders }).catch((cbErr: Error) => {
-            console.error(`[PIPELINE] Failure callback POST FAILED: ${cbErr.message}`);
-          });
         }
       });
   } catch (err) {

@@ -617,15 +617,21 @@ export class JobsService implements OnModuleInit {
     );
     if (!apiUrlEnv && !renderUrl) {
       this.logger.warn(
-        `[PIPELINE] WARNING: Neither API_URL nor RENDER_EXTERNAL_URL is set! ` +
-        `callbackUrl will be localhost:4000 which is unreachable from AI Engine on Render. ` +
-        `Set API_URL=https://<your-backend>.onrender.com/api/v1 in Render env vars.`,
+        `[DISPATCH-CONFIG-WARN] jobId=${job.id} — Neither API_URL nor RENDER_EXTERNAL_URL is set! ` +
+        `callbackUrl="${callbackUrl}" will be localhost:4000 which is UNREACHABLE from AI Engine on Render. ` +
+        `FIX: Set API_URL=https://codemorph-hp00.onrender.com/api/v1 on Render AI Engine env vars.`,
       );
     }
 
+    // FIX PHASE 32 — DISPATCH LOG STRUCTURÉ CÔTÉ BACKEND
+    const totalChars = files.reduce((acc, f) => acc + (f.content?.length ?? 0), 0);
     this.logger.log(
-      `[PIPELINE] AI request sent — jobId=${job.id} files=${files.length} ` +
-      `${job.sourceLanguage}→${job.targetLanguage} callbackUrl=${callbackUrl} mockMode=${this.aiEngineClient.isMockMode}`,
+      `[DISPATCH-BACKEND] jobId=${job.id} ` +
+      `aiEngineUrl=${this.config.get<string>('AI_ENGINE_URL', '(not set)')} ` +
+      `mockMode=${this.aiEngineClient.isMockMode} ` +
+      `files=${files.length} chars=${totalChars} ` +
+      `${job.sourceLanguage}→${job.targetLanguage} ` +
+      `callbackUrl=${callbackUrl}`,
     );
 
     let response: Awaited<ReturnType<typeof this.aiEngineClient.submitConversion>>;
@@ -641,14 +647,15 @@ export class JobsService implements OnModuleInit {
       });
     } catch (err) {
       this.logger.error(
-        `[PIPELINE] AI Engine call FAILED — jobId=${job.id}: ${(err as Error)?.message ?? String(err)}`,
+        `[DISPATCH-FAILED] jobId=${job.id} — AI Engine call threw: ${(err as Error)?.message ?? String(err)}`,
       );
       throw err;
     }
 
     const aiJobId = response.jobId ?? job.id;
     this.logger.log(
-      `[PIPELINE] AI response received — jobId=${job.id} aiJobId=${aiJobId} accepted=${response.accepted}`,
+      `[DISPATCH-OK] jobId=${job.id} aiJobId=${aiJobId} accepted=${response.accepted} ` +
+      `message="${response.message ?? ''}" — now waiting for callback`,
     );
 
     return String(aiJobId);
@@ -667,12 +674,21 @@ export class JobsService implements OnModuleInit {
     },
   ): Promise<void> {
     const job = await this.findById(id);
-    this.logger.log(`[PIPELINE] ━━━ Callback received ━━━`);
-    this.logger.log(`[PIPELINE] jobId=${id} success=${payload.success} filesGenerated=${payload.filesGenerated ?? 0} linesGenerated=${payload.linesGenerated ?? 0}`);
 
-    // Log files count from result if present
+    // FIX PHASE 32 — CALLBACK LOG STRUCTURÉ
+    // Permet de prouver que le callback a été reçu et traité par le backend.
     const resultFiles = (payload.result?.['files'] as Array<unknown> | undefined);
-    this.logger.log(`[PIPELINE] result.files.length=${resultFiles?.length ?? 0} (from callback payload)`);
+    this.logger.log(
+      `[CALLBACK-RECEIVED] jobId=${id} success=${payload.success} ` +
+      `filesGenerated=${payload.filesGenerated ?? 0} linesGenerated=${payload.linesGenerated ?? 0} ` +
+      `result.files.length=${resultFiles?.length ?? 0} jobStatus=${job.status}`,
+    );
+
+    if (!payload.success) {
+      this.logger.error(
+        `[CALLBACK-RECEIVED] jobId=${id} FAILED — error=${payload.error ?? '(no error message in payload)'}`,
+      );
+    }
 
     // Get user plan for quota tracking
     const plan = await this.subscriptionSvc.getUserPlan(job.userId);
@@ -692,9 +708,10 @@ export class JobsService implements OnModuleInit {
         filesProcessed: payload.filesGenerated,
         linesProcessed: payload.linesGenerated,
       });
-      this.logger.log(`[PIPELINE] ━━━ Database updated ━━━`);
-      this.logger.log(`[PIPELINE] Saving ${payload.filesGenerated ?? 0} generated files to DB — jobId=${id}`);
-      this.logger.log(`[PIPELINE] Job DONE — jobId=${id} filesGenerated=${payload.filesGenerated ?? 0} linesGenerated=${payload.linesGenerated ?? 0}`);
+      this.logger.log(
+        `[CALLBACK-PROCESSED] jobId=${id} → DONE ` +
+        `filesGenerated=${payload.filesGenerated ?? 0} linesGenerated=${payload.linesGenerated ?? 0}`,
+      );
     } else {
       const errorMsg = payload.error ?? 'Unknown error from AI Engine';
       await this.updateStatus(id, JobStatus.FAILED, {
@@ -702,7 +719,9 @@ export class JobsService implements OnModuleInit {
         progress:     0,
       });
       await this.appendLog(id, 'failed', 'failed', `AI Engine error: ${errorMsg}`);
-      this.logger.error(`[PIPELINE] Job failed by AI Engine — jobId=${id} error=${errorMsg}`);
+      this.logger.error(
+        `[CALLBACK-PROCESSED] jobId=${id} → FAILED error="${errorMsg}"`,
+      );
     }
   }
 
@@ -838,6 +857,89 @@ export class JobsService implements OnModuleInit {
 
     await this.updateStatus(id, JobStatus.FAILED, { errorMessage: 'Cancelled by user' });
     this.logger.log(`[Job ${id}] Cancelled by user ${userId}`);
+  }
+
+  // ── AI Engine probe — test HTTP Backend→AI Engine (Phase 32) ───
+  // Permet de vérifier depuis le backend déployé que l'AI Engine est
+  // joignable, répond, et que la configuration est correcte.
+  // Retourne un rapport détaillé sans effectuer de vraie conversion.
+  async probeAiEngine(): Promise<{
+    aiEngineUrl:    string;
+    mockMode:       boolean;
+    healthOk:       boolean;
+    healthStatus:   number | null;
+    healthBody:     unknown;
+    durationMs:     number;
+    callbackUrlSample: string;
+    apiUrlSource:   string;
+    error:          string | null;
+  }> {
+    const aiEngineUrl = this.config.get<string>('AI_ENGINE_URL', '(not set)');
+    const mockMode    = this.aiEngineClient.isMockMode;
+
+    // Construire la callbackUrl de la même façon que dispatchToAiEngine
+    const apiUrlEnv = this.config.get<string>('API_URL');
+    const renderUrl = process.env['RENDER_EXTERNAL_URL'];
+    const apiUrl    = apiUrlEnv
+      ?? (renderUrl ? `${renderUrl}/api/v1` : 'http://localhost:4000/api/v1');
+    const callbackUrlSample = `${apiUrl}/jobs/<jobId>/callback`;
+    const apiUrlSource = apiUrlEnv
+      ? 'API_URL env var'
+      : (renderUrl ? 'RENDER_EXTERNAL_URL' : 'localhost fallback (MISSING in prod!)');
+
+    this.logger.log(
+      `[PROBE-START] AI Engine probe initiated — ` +
+      `aiEngineUrl=${aiEngineUrl} mockMode=${mockMode} ` +
+      `callbackUrl_sample=${callbackUrlSample} apiUrlSource=${apiUrlSource}`,
+    );
+
+    if (mockMode) {
+      this.logger.warn(
+        `[PROBE-MOCK] mockMode=true — no real HTTP call will be made. ` +
+        `AI_ENGINE_URL is "${aiEngineUrl}" which triggers mock mode.`,
+      );
+      return {
+        aiEngineUrl,
+        mockMode: true,
+        healthOk: false,
+        healthStatus: null,
+        healthBody: null,
+        durationMs: 0,
+        callbackUrlSample,
+        apiUrlSource,
+        error: `mockMode=true: AI_ENGINE_URL="${aiEngineUrl}" is unset or Docker-internal. No real AI Engine call possible.`,
+      };
+    }
+
+    const start = Date.now();
+    let healthStatus: number | null = null;
+    let healthBody: unknown = null;
+    let error: string | null = null;
+    let healthOk = false;
+
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 8_000);
+      const probeUrl = `${aiEngineUrl}/api/health`;
+      this.logger.log(`[PROBE-HTTP] GET ${probeUrl} (timeout=8s)`);
+      const res = await fetch(probeUrl, { signal: controller.signal });
+      clearTimeout(timer);
+      healthStatus = res.status;
+      try { healthBody = await res.json(); } catch { healthBody = `(non-JSON body, status=${res.status})`; }
+      healthOk = res.ok;
+      this.logger.log(
+        `[PROBE-HTTP-OK] status=${healthStatus} durationMs=${Date.now() - start} ` +
+        `body=${JSON.stringify(healthBody).slice(0, 200)}`,
+      );
+    } catch (e) {
+      error = (e as Error).message;
+      this.logger.error(
+        `[PROBE-HTTP-FAILED] aiEngineUrl=${aiEngineUrl} durationMs=${Date.now() - start} error=${error}`,
+      );
+    }
+
+    const durationMs = Date.now() - start;
+    return { aiEngineUrl, mockMode, healthOk, healthStatus, healthBody, durationMs, callbackUrlSample, apiUrlSource, error };
   }
 
   // ── Helpers ───────────────────────────────────────────

@@ -99,6 +99,28 @@ export class JobsController {
     return stats;
   }
 
+  // ── GET /jobs/ai-engine/probe — test Backend→AI Engine (Phase 32) ─
+  // FIX PHASE 32 — DIAGNOSTIC ENDPOINT :
+  // Permet de vérifier depuis le Backend déployé sur Render que :
+  //   1. AI_ENGINE_URL est correctement configuré (pas mockMode)
+  //   2. L'AI Engine répond bien à GET /api/health
+  //   3. La callbackUrl qui sera envoyée à l'AI Engine est correcte
+  // Route @Public() car ne retourne aucune donnée sensible (pas de secrets).
+  // Accessible par les admins pour diagnostic en production.
+  @Public()
+  @SkipThrottle()
+  @Get('ai-engine/probe')
+  @ApiOperation({ summary: '[Phase 32] Probe AI Engine connectivity from Backend — returns health check result and config' })
+  async probeAiEngine() {
+    this.logger.log('[PROBE] GET /jobs/ai-engine/probe requested');
+    const result = await this.jobsService.probeAiEngine();
+    this.logger.log(
+      `[PROBE] Result: mockMode=${result.mockMode} healthOk=${result.healthOk} ` +
+      `status=${result.healthStatus} durationMs=${result.durationMs} error=${result.error ?? 'none'}`,
+    );
+    return result;
+  }
+
   @Get(':id')
   @ApiOperation({ summary: 'Get job by ID' })
   async findOne(
@@ -276,11 +298,9 @@ export class JobsController {
   }
 
   // ── Callback from AI Engine (protégé par secret partagé) ─
-  // FIX PHASE 6 — SEC-callback: le callback était @Public() sans validation
-  // → n'importe qui pouvait forcer un job en DONE avec de faux résultats
-  // Fix: vérification du secret AI_ENGINE_SECRET dans le header X-AI-Engine-Secret
-  // Si AI_ENGINE_SECRET non configuré → avertissement + accepté (compat dev)
-  @SkipThrottle()  // Le callback vient d'un service interne — pas de rate limit
+  // FIX PHASE 6 — SEC-callback
+  // FIX PHASE 32 — CALLBACK LOGS STRUCTURÉS : [CALLBACK-RECEIVED] [CALLBACK-FAILED]
+  @SkipThrottle()
   @Public()
   @Post(':id/callback')
   @HttpCode(HttpStatus.OK)
@@ -298,22 +318,40 @@ export class JobsController {
       linesGenerated?: number;
     },
   ) {
+    const sourceIp = req.headers['x-forwarded-for'] ?? req.socket?.remoteAddress ?? 'unknown';
+    this.logger.log(
+      `[CALLBACK-RECEIVED] jobId=${id} success=${body.success} ` +
+      `filesGenerated=${body.filesGenerated ?? 0} from=${sourceIp}`,
+    );
+
     // Vérifier le secret partagé Backend↔AI Engine
     const expectedSecret = this.config.get<string>('AI_ENGINE_SECRET', '');
     if (expectedSecret) {
       const provided = req.headers['x-ai-engine-secret'] as string | undefined;
       if (!provided || provided !== expectedSecret) {
-        this.logger.warn(`[Callback] Job ${id} — rejected: invalid X-AI-Engine-Secret`);
+        this.logger.warn(
+          `[CALLBACK-FAILED] jobId=${id} — rejected: invalid X-AI-Engine-Secret. ` +
+          `provided=${provided ? '(set but wrong)' : '(missing)'}`,
+        );
         throw new UnauthorizedException('Invalid or missing X-AI-Engine-Secret header');
       }
     } else {
-      // En dev sans secret configuré → warn mais accepter
-      this.logger.warn(`[Callback] AI_ENGINE_SECRET not set — callback accepted without auth (dev mode)`);
+      this.logger.warn(
+        `[CALLBACK-RECEIVED] jobId=${id} — AI_ENGINE_SECRET not set, accepting without auth (dev mode). ` +
+        `Set AI_ENGINE_SECRET in production!`,
+      );
     }
 
-    this.logger.log(`[Callback] Job ${id} → success=${body.success}`);
-    await this.jobsService.handleCallback(id, body);
-    return { ok: true };
+    try {
+      await this.jobsService.handleCallback(id, body);
+      this.logger.log(`[CALLBACK-PROCESSED] jobId=${id} → ${body.success ? 'DONE' : 'FAILED'} ✓`);
+      return { ok: true };
+    } catch (err) {
+      this.logger.error(
+        `[CALLBACK-FAILED] jobId=${id} — handleCallback threw: ${(err as Error).message}`,
+      );
+      throw err;
+    }
   }
 
   // ── Quick-start: from GitHub repo ─────────────────────
