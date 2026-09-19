@@ -207,17 +207,21 @@ export class AiEngineClient {
       );
 
       const durationMs = Date.now() - httpStart;
+      // FIX PHASE 33 — DISPATCH-RESPONSE : renommé depuis [DISPATCH-OK], champs normalisés
+      // Permet de tracer : HTTP status reçu + durée + aiEngineJobId retourné par l'AI Engine
+      const data = res.data as any;
+      const aiEngineJobId: string = data.jobId ?? req.jobId;
       this.logger.log(
-        `[DISPATCH-OK] jobId=${req.jobId} httpStatus=${res.status} durationMs=${durationMs} ` +
-        `body=${JSON.stringify(res.data)}`,
+        `[DISPATCH-RESPONSE] jobId=${req.jobId} httpStatus=${res.status} durationMs=${durationMs} ` +
+        `aiEngineJobId=${aiEngineJobId} accepted=${data.accepted ?? (data.status === 'processing')} ` +
+        `message=${data.message ?? '(none)'}`,
       );
       this.recordSuccess();
 
       // L'AI Engine répond { jobId, status: 'processing', message }
       // On normalise vers AiConvertResponse { jobId, accepted, message }
-      const data = res.data as any;
       return {
-        jobId:    data.jobId ?? req.jobId,
+        jobId:    aiEngineJobId,
         accepted: data.status === 'processing' || data.accepted === true,
         message:  data.message,
       };

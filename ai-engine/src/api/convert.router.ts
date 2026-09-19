@@ -30,6 +30,20 @@ function extractAIKeys(req: Request): { userOpenAIKey?: string; userAnthropicKey
 
 // ── POST /api/convert — async (fire and forget + callback) ─
 convertRouter.post('/', async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+  // FIX PHASE 33 — [AI-ENGINE-REQUEST] : premier log absolu dès réception HTTP,
+  // avant toute validation SSRF, guard ou construction de contexte.
+  // Permet de confirmer côté Runtime que la requête du Backend est bien arrivée.
+  const requestId = (req.headers['x-request-id'] as string | undefined) ?? `req-${Date.now()}`;
+  const rawJobId  = (req.body as Record<string, unknown>)?.jobId as string | undefined;
+  console.log(
+    `[AI-ENGINE-REQUEST] route=POST /api/convert requestId=${requestId} ` +
+    `jobId=${rawJobId ?? '(not yet parsed)'} ` +
+    `sourceFramework=${(req.body as Record<string, unknown>)?.sourceFramework ?? '?'} ` +
+    `targetFramework=${(req.body as Record<string, unknown>)?.targetFramework ?? '?'} ` +
+    `hasCallbackUrl=${!!(req.body as Record<string, unknown>)?.callbackUrl} ` +
+    `ip=${req.ip ?? req.socket?.remoteAddress ?? 'unknown'}`,
+  );
+
   try {
     const {
       jobId,
