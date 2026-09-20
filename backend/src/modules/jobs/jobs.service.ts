@@ -653,9 +653,26 @@ export class JobsService implements OnModuleInit {
     }
 
     const aiJobId = response.jobId ?? job.id;
+
+    // FIX PHASE 34 — BUG #2 :
+    // AVANT: accepted=false n'était jamais vérifié → job restait CONVERTING silencieusement
+    // MAINTENANT: accepted=false → exception → ConversionProcessorService marque FAILED
+    // Note: avec validateStatus strict (Phase 34 Bug#1), accepted sera toujours true ici.
+    // Ce guard défensif reste au cas où submitConversion serait appelé d'un autre chemin.
+    if (!response.accepted) {
+      this.logger.error(
+        `[DISPATCH-FAILED] jobId=${job.id} — AI Engine returned accepted=false ` +
+        `aiJobId=${aiJobId} message="${response.message ?? '(none)'}". ` +
+        `Job will be marked FAILED to prevent zombie CONVERTING state.`,
+      );
+      throw new Error(
+        `AI Engine rejected the conversion job (accepted=false): ${response.message ?? 'no reason given'}`,
+      );
+    }
+
     this.logger.log(
-      `[DISPATCH-OK] jobId=${job.id} aiJobId=${aiJobId} accepted=${response.accepted} ` +
-      `message="${response.message ?? ''}" — now waiting for callback`,
+      `[DISPATCH-RESPONSE] jobId=${job.id} aiJobId=${aiJobId} accepted=true ` +
+      `message="${response.message ?? ''}" — pipeline started, waiting for callback`,
     );
 
     return String(aiJobId);

@@ -119,6 +119,17 @@ convertRouter.post('/', async (req: Request, res: Response, next: NextFunction):
     console.log(`[PIPELINE] job=${ctx.jobId} src=${ctx.sourceFramework} tgt=${ctx.targetFramework}`);
     console.log(`[PIPELINE] Files detected: ${fileMarkerCount} (from file markers in sourceCode)`);
     console.log(`[PIPELINE] sourceCode.length=${sourceCode.length} chars callbackUrl=${callbackUrl ?? '(none)'}`);
+
+    // FIX PHASE 34 — [AI-ENGINE-ACCEPTED] : log émis AVANT le 202 HTTP pour confirmer que
+    // l'AI Engine accepte bien le job et démarre le pipeline.
+    // Correspond au [DISPATCH-RESPONSE] côté Backend — les deux jobId doivent être identiques.
+    console.log(
+      `[AI-ENGINE-ACCEPTED] requestId=${requestId} jobId=${ctx.jobId} ` +
+      `aiEngineJobId=${ctx.jobId} sourceFramework=${ctx.sourceFramework} ` +
+      `targetFramework=${ctx.targetFramework} hasCallbackUrl=${!!callbackUrl} ` +
+      `sourceChars=${sourceCode.length} fileMarkers=${fileMarkerCount}`,
+    );
+
     res.status(202).json({ jobId: ctx.jobId, accepted: true, message: 'Conversion pipeline started' });
 
     // Run pipeline + callback in background

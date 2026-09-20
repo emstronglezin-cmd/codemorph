@@ -175,54 +175,84 @@ export class AiEngineClient {
           .post<AiConvertResponse>(targetUrl, payload, {
             headers:         extraHeaders,
             timeout:         30_000,
-            validateStatus:  (s) => s < 500,
+            // FIX PHASE 34 — BUG #1 :
+            // AVANT: validateStatus: s < 500 → 401/403 passaient dans .data sans exception
+            //   → [DISPATCH-RESPONSE] httpStatus=401 accepted=false mais aucune exception levée
+            //   → le job restait silencieusement CONVERTING, callback jamais reçu
+            // MAINTENANT: seul 202 est un succès. Tout autre status lève une AxiosError.
+            //   → catchError capture 401 → [DISPATCH-FAILED] explicite → exception propagée
+            //   → ConversionProcessorService marque le job FAILED → plus de zombie job
+            validateStatus:  (s) => s === 202,
           })
           .pipe(
             timeout(35_000),
             retry({
               count:    2,
               delay:    (err, attempt) => {
+                const axErr = err as AxiosError;
+                const status = axErr.response?.status;
                 const wait = Math.pow(2, attempt) * 1_000;
                 this.logger.warn(
                   `[DISPATCH-RETRY] jobId=${req.jobId} attempt=${attempt}/2 wait=${wait}ms ` +
-                  `reason=${(err as Error).message}`,
+                  `httpStatus=${status ?? 'NO_RESPONSE'} reason=${(err as Error).message}`,
                 );
+                // FIX PHASE 34 — NE PAS retry sur 401/403 (secret mismatch non récupérable)
+                if (status === 401 || status === 403) {
+                  return throwError(() => new ServiceUnavailableException(
+                    `AI Engine rejected request (${status}) — secret mismatch or unauthorized. ` +
+                    `Check AI_ENGINE_SECRET is identical on both Backend and AI Engine Render env vars.`,
+                  ));
+                }
                 return new Promise((r) => setTimeout(r, wait)) as any;
               },
               resetOnSuccess: true,
             }),
             catchError((err: AxiosError) => {
               const durationMs = Date.now() - httpStart;
-              this.logger.error(
-                `[DISPATCH-FAILED] jobId=${req.jobId} url=${targetUrl} ` +
-                `durationMs=${durationMs} httpStatus=${err.response?.status ?? 'NO_RESPONSE'} ` +
-                `error=${err.message} body=${JSON.stringify(err.response?.data ?? {})}`,
-              );
+              const status = err.response?.status;
+              const body   = err.response?.data;
+              // FIX PHASE 34 — Log différencié selon le type d'erreur
+              if (status === 401 || status === 403) {
+                this.logger.error(
+                  `[DISPATCH-FAILED] jobId=${req.jobId} url=${targetUrl} ` +
+                  `durationMs=${durationMs} httpStatus=${status} ` +
+                  `error=AUTH_REJECTED body=${JSON.stringify(body ?? {})} ` +
+                  `CAUSE: AI_ENGINE_SECRET mismatch — verify both services have same value on Render`,
+                );
+              } else {
+                this.logger.error(
+                  `[DISPATCH-FAILED] jobId=${req.jobId} url=${targetUrl} ` +
+                  `durationMs=${durationMs} httpStatus=${status ?? 'NO_RESPONSE'} ` +
+                  `error=${err.message} body=${JSON.stringify(body ?? {})}`,
+                );
+              }
               this.recordFailure();
               return throwError(() => new ServiceUnavailableException(
-                `AI Engine unavailable: ${err.message}`,
+                status === 401 || status === 403
+                  ? `AI Engine rejected dispatch (${status}): AI_ENGINE_SECRET mismatch`
+                  : `AI Engine unavailable: ${err.message}`,
               ));
             }),
           ),
       );
 
       const durationMs = Date.now() - httpStart;
-      // FIX PHASE 33 — DISPATCH-RESPONSE : renommé depuis [DISPATCH-OK], champs normalisés
-      // Permet de tracer : HTTP status reçu + durée + aiEngineJobId retourné par l'AI Engine
+      // FIX PHASE 33 — DISPATCH-RESPONSE : normalisé avec champs status, durationMs, aiEngineJobId
+      // FIX PHASE 34 — seul 202 atteint ce point (validateStatus strict)
       const data = res.data as any;
       const aiEngineJobId: string = data.jobId ?? req.jobId;
       this.logger.log(
         `[DISPATCH-RESPONSE] jobId=${req.jobId} httpStatus=${res.status} durationMs=${durationMs} ` +
-        `aiEngineJobId=${aiEngineJobId} accepted=${data.accepted ?? (data.status === 'processing')} ` +
+        `aiEngineJobId=${aiEngineJobId} accepted=${data.accepted ?? true} ` +
         `message=${data.message ?? '(none)'}`,
       );
       this.recordSuccess();
 
-      // L'AI Engine répond { jobId, status: 'processing', message }
-      // On normalise vers AiConvertResponse { jobId, accepted, message }
+      // L'AI Engine répond { jobId, accepted: true, message }
+      // validateStatus strict garantit que seul 202 atteint ce point
       return {
         jobId:    aiEngineJobId,
-        accepted: data.status === 'processing' || data.accepted === true,
+        accepted: true,   // garanti par validateStatus: s === 202
         message:  data.message,
       };
     } catch (err) {
