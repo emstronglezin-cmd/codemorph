@@ -26,6 +26,8 @@
 import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
 
 import { IQueueProvider, JobOptions } from './queue.provider.interface';
+// FIX PHASE 35 — NonRetryableError : stopper le retry sur jobs terminaux
+import { NonRetryableError } from './non-retryable.error';
 
 /** Interface minimale du processeur (évite import circulaire) */
 export interface IConversionProcessor {
@@ -255,7 +257,24 @@ export class MemoryQueueProvider implements IQueueProvider, OnModuleDestroy {
 
       const maxAttempts = job.opts.attempts ?? MAX_ATTEMPTS;
 
-      if (!timedOut && job.attemptsMade < maxAttempts) {
+      // FIX PHASE 35 — NonRetryableError : certaines erreurs sont terminales et ne
+      // doivent JAMAIS déclencher de retry, quelle que soit la tentative courante.
+      // Exemples : job déjà FAILED/DONE en base, secret mismatch non récupérable.
+      // AVANT : toute Error ordinaire → retry jusqu'à maxAttempts (3 inutiles)
+      // MAINTENANT : NonRetryableError → abandon immédiat, statut failed, 0 retry
+      const isNonRetryable = err instanceof NonRetryableError ||
+        (err as { nonRetryable?: boolean })?.nonRetryable === true;
+
+      if (isNonRetryable) {
+        // Abandon immédiat — pas de retry, quelle que soit la tentative
+        job.status      = 'failed';
+        job.completedAt = Date.now();
+        this.completedJobs.set(job.id, job);
+        this.logger.warn(
+          `[MemoryQueue] 🚫 Job ${job.id} — NonRetryableError après ` +
+          `${job.attemptsMade} tentative(s): ${message} (aucun retry planifié)`,
+        );
+      } else if (!timedOut && job.attemptsMade < maxAttempts) {
         // Retry avec backoff exponentiel
         const delay = this.computeBackoff(job);
         this.logger.warn(

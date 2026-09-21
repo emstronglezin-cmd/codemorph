@@ -1357,8 +1357,10 @@ export class AIProvider {
       jlog?.aiRateLimit(waitedMs, `semaphore/TPM wait (inflight=${groqRateLimiter.inflight}/${3}, sent=${groqRateLimiter.totalRequestsSent})`);
     }
 
-    // Modèles à essayer en cascade si 429
-    const GROQ_MODELS = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b'];
+    // FIX PHASE 35 — Cascade de modèles Groq :
+    // 120b → 20b → llama-3.1-8b-instant (emergency fallback si les deux 120b/20b sont rate-limited)
+    // Chaque modèle a 2 tentatives avec backoff sur 429 avant de passer au suivant.
+    const GROQ_MODELS = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b', 'llama-3.1-8b-instant'];
     let lastError: Error | null = null;
     let tokensUsed = 0;
     const callStart = Date.now();
@@ -1404,12 +1406,26 @@ export class AIProvider {
                 ? Math.max(parseFloat(retryMatch[1]) + 3, 20)
                 : 30;
               const retryWaitMs = waitSec * 1000;
+
+              // FIX PHASE 35 — [AI-ENGINE-429] : log structuré non-sensible pour tracer le 429 Groq.
+              // NE JAMAIS logger : API key, Authorization, tokens complets.
+              // Logger uniquement : modèle, durationMs, Retry-After, jobId (via jlog).
+              console.warn(
+                `[AI-ENGINE-429] provider=groq model=${modelId} ` +
+                `attempt=${attempt + 1}/2 retryAfterSec=${waitSec} ` +
+                `durationMs=${Date.now() - callStart} ` +
+                `inflight=${groqRateLimiter.inflight}/${3} ` +
+                `totalRequestsSent=${groqRateLimiter.totalRequestsSent} ` +
+                `source=GROQ_API_RATE_LIMIT ` +
+                `action=ABSORBING_INTERNALLY_retry_backoff`,
+              );
+
               jlog?.aiRetry(attempt + 1, 2, `Groq 429 on ${modelId}`, retryWaitMs);
               console.warn(`[AIProvider] Groq 429 on ${modelId} attempt ${attempt+1}/2 — waiting ${waitSec}s (Retry-After respected)...`);
               await new Promise((r) => setTimeout(r, retryWaitMs));
               lastError = err instanceof Error ? err : new Error(msg);
-              // Après 1 tentative sur 120b → passer immédiatement au modèle 20b
-              if (modelId === GROQ_MODELS[0]) break;
+              // Après 1 tentative sur ce modèle → passer au modèle suivant dans la cascade
+              break;
             } else {
               jlog?.aiCallEnd({ provider: 'groq', model: modelId, phase: 'ai_call', durationMs: Date.now() - callStart, tokensUsed: 0, success: false, error: msg });
               throw err;
@@ -1422,7 +1438,15 @@ export class AIProvider {
       release(tokensUsed);
     }
 
-    // Tous les modèles ont échoué
+    // Tous les modèles ont échoué après cascade complète
+    // FIX PHASE 35 — Log final quand toute la cascade échoue
+    console.error(
+      `[AI-ENGINE-429] provider=groq source=GROQ_ALL_MODELS_EXHAUSTED ` +
+      `models=${GROQ_MODELS.join(',')} ` +
+      `totalDurationMs=${Date.now() - callStart} ` +
+      `lastError=${lastError?.message ?? 'unknown'} ` +
+      `action=PIPELINE_WILL_FAIL_callback_sent_to_backend`,
+    );
     jlog?.aiCallEnd({ provider: 'groq', model: this.model, phase: 'ai_call', durationMs: Date.now() - callStart, tokensUsed: 0, success: false, error: lastError?.message ?? 'all models exhausted' });
     throw lastError ?? new Error('Groq: all models exhausted');
   }

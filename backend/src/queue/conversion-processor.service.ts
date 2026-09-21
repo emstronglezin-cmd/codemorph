@@ -19,6 +19,8 @@ import { UploadsService }      from '../modules/uploads/uploads.service';
 import { QuotaService }        from '../modules/quota/quota.service';
 import { SubscriptionService } from '../modules/subscription/subscription.service';
 import { getPlanLimits }       from '../modules/subscription/plan-limits.config';
+// FIX PHASE 35 — NonRetryableError : signale à MemoryQueue qu'un job terminal ne doit pas être retenté
+import { NonRetryableError }   from './non-retryable.error';
 
 export interface ConversionJobPayload {
   jobId: string;
@@ -85,11 +87,16 @@ export class ConversionProcessorService {
           currentJob.status === JobStatus.FAILED ||
           currentJob.status === JobStatus.DONE
         ) {
+          // FIX PHASE 35 — NonRetryableError : le job est déjà terminal en base.
+          // Lancer NonRetryableError (pas Error) pour que MemoryQueue STOPPE
+          // immédiatement sans planifier de retry supplémentaire.
+          // AVANT : Error ordinaire → MemoryQueue planifiait retry 2, retry 3 (wasted)
+          // MAINTENANT : NonRetryableError → MemoryQueue abandonne immédiatement
           this.logger.warn(
-            `${tag} Retry ${attemptInfo.attemptsMade + 1}: job déjà terminal ` +
-            `(${currentJob.status}). Abandon.`,
+            `${tag} [NON-RETRYABLE] Attempt ${attemptInfo.attemptsMade + 1}: job déjà terminal ` +
+            `(status=${currentJob.status}) — abandon immédiat, pas de retry.`,
           );
-          throw new Error(
+          throw new NonRetryableError(
             `Job ${jobId} est déjà en statut terminal (${currentJob.status}). Retry abandonné.`,
           );
         }

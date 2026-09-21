@@ -203,6 +203,25 @@ export class AiEngineClient {
                     `Check AI_ENGINE_SECRET is identical on both Backend and AI Engine Render env vars.`,
                   ));
                 }
+                // FIX PHASE 35 — NE PAS retry sur 429 (Render rate limit externe, non récupérable
+                // immédiatement — retenter dans les secondes qui suivent ne ferait qu'aggraver).
+                // Le 429 vient soit de Render soit de Groq propagé hors pipeline (cas anormal).
+                // L'AI Engine absorbe les 429 Groq en interne — si 429 remonte jusqu'au Backend,
+                // c'est que le rate limit est dépassé à un niveau externe (Render, proxy).
+                // Action correcte : marquer le job FAILED immédiatement, pas de retry.
+                if (status === 429) {
+                  this.logger.error(
+                    `[DISPATCH-429] jobId=${req.jobId} url=${targetUrl} ` +
+                    `httpStatus=429 — AI Engine rate limited (Render/proxy level). ` +
+                    `No retry — job will be marked FAILED. ` +
+                    `CAUSE: Render free plan request rate limit OR Groq rate limit not absorbed internally.`,
+                  );
+                  return throwError(() => new ServiceUnavailableException(
+                    `AI Engine rate limited (429): too many requests. ` +
+                    `This is likely a Render free plan limit. ` +
+                    `The job has been marked FAILED. Retry your job in a few minutes.`,
+                  ));
+                }
                 return new Promise((r) => setTimeout(r, wait)) as any;
               },
               resetOnSuccess: true,
@@ -211,13 +230,22 @@ export class AiEngineClient {
               const durationMs = Date.now() - httpStart;
               const status = err.response?.status;
               const body   = err.response?.data;
-              // FIX PHASE 34 — Log différencié selon le type d'erreur
+              // FIX PHASE 34+35 — Log différencié selon le type d'erreur
               if (status === 401 || status === 403) {
                 this.logger.error(
                   `[DISPATCH-FAILED] jobId=${req.jobId} url=${targetUrl} ` +
                   `durationMs=${durationMs} httpStatus=${status} ` +
                   `error=AUTH_REJECTED body=${JSON.stringify(body ?? {})} ` +
                   `CAUSE: AI_ENGINE_SECRET mismatch — verify both services have same value on Render`,
+                );
+              } else if (status === 429) {
+                // FIX PHASE 35 — [DISPATCH-429] : log structuré pour le 429 Render/proxy
+                this.logger.error(
+                  `[DISPATCH-429] jobId=${req.jobId} url=${targetUrl} ` +
+                  `durationMs=${durationMs} httpStatus=429 ` +
+                  `source=RENDER_OR_PROXY_RATE_LIMIT ` +
+                  `body=${JSON.stringify(body ?? {})} ` +
+                  `CAUSE: Render free plan rate limit OR AI Engine internal 429 propagated externally`,
                 );
               } else {
                 this.logger.error(
@@ -230,7 +258,9 @@ export class AiEngineClient {
               return throwError(() => new ServiceUnavailableException(
                 status === 401 || status === 403
                   ? `AI Engine rejected dispatch (${status}): AI_ENGINE_SECRET mismatch`
-                  : `AI Engine unavailable: ${err.message}`,
+                  : status === 429
+                    ? `AI Engine rate limited (429): too many concurrent requests to Render`
+                    : `AI Engine unavailable: ${err.message}`,
               ));
             }),
           ),
