@@ -62,6 +62,12 @@ import {
   computeFidelityReport, analyzeSource,
   fidelityReportToMarkdown, fidelityReportToHTML,
 } from './fidelity-engine';
+// PHASE 36: Free-tier large project pipeline — Global Context + Semantic Chunks
+import {
+  runSemanticPipeline, shouldUseSemanticPipeline,
+  type SemanticPipelineResult,
+} from './phase36/semantic-pipeline';
+import { getPhase36Config, estimateTokens } from './phase36/config';
 import type {
   ApplicationSpec, ContentValidationReport,
   DeliveryCheckResult, TestResultsReport,
@@ -399,11 +405,75 @@ export class ConversionPipeline {
     phaseStart('ir');
     reporter.report('phase_3_ir', 'IR Generation', 0, sourceFileCount, 'Building Intermediate Representation (3-5 AI calls)…');
     jlog.info('⚙️  Phase 3: IR Generation + Knowledge Graph', { jobId: ctx.jobId, tier });
+
+    // ── PHASE 36: Décision pipeline sémantique (Global Context + Semantic Chunks) ──
+    // Gros projet → analyse sémantique par modules (requêtes petites, reprise, cache).
+    // Petit/moyen projet → chemin legacy préservé à l'identique (0 régression).
+    const semanticDecision = shouldUseSemanticPipeline(
+      ctx.sourceCode.length,
+      astResult.files.length,
+      tier,
+    );
+    jlog.info(`[PHASE36] semantic pipeline decision: use=${semanticDecision.use} (${semanticDecision.reason})`, {
+      jobId: ctx.jobId, step: 'phase36_decision', use: semanticDecision.use, reason: semanticDecision.reason,
+      sourceChars: ctx.sourceCode.length, sourceFiles: astResult.files.length,
+    });
+
     let irDocument: Awaited<ReturnType<IRGenerator['generate']>>;
-    const cachedIR = pipelineCache.irCache.get(cacheKey) as typeof irDocument | undefined;
+    // Caches séparés: legacy = cacheKey, sémantique = cacheKey+'p36' (jamais mélangés)
+    const irCacheKey = semanticDecision.use ? buildCacheKey(cacheKey, 'p36', tier) : cacheKey;
+    let phase36Result: SemanticPipelineResult | undefined;
+    const cachedIR = pipelineCache.irCache.get(irCacheKey) as typeof irDocument | undefined;
     if (cachedIR) {
       irDocument = cachedIR;
       jlog.info('✅ Phase 3: IR — cache HIT (0 tokens)', { jobId: ctx.jobId });
+    } else if (semanticDecision.use) {
+      // ── PHASE 36: pipeline sémantique avec timeout adapté au nombre de chunks ──
+      const cfg36        = getPhase36Config();
+      const estChunks    = Math.max(1, Math.ceil(estimateTokens(ctx.sourceCode) / cfg36.chunkSizeTokens));
+      const SEM_TIMEOUT  = Math.max(8 * 60_000, estChunks * 90_000 * 2 + 5 * 60_000);
+      jlog.info(`[PHASE36] semantic IR starting — estChunks≈${estChunks} timeout=${Math.round(SEM_TIMEOUT / 60_000)}min budget/request=${cfg36.maxInputTokens}tok concurrency=${cfg36.maxConcurrentRequests}`, {
+        jobId: ctx.jobId, step: 'phase36_start', estChunks,
+      });
+      try {
+        const semanticResult = await Promise.race([
+          runSemanticPipeline(ctx, astResult, archResult, new AIProvider(opts), {
+            onProgress: (done, total, message) => {
+              reporter.report('phase_3_ir', 'Semantic Module Analysis', done, total, message);
+            },
+          }),
+          new Promise<never>((_, reject) =>
+            setTimeout(
+              () => reject(new Error(`[GATE-IR][PHASE36] TIMEOUT: semantic IR exceeded ${Math.round(SEM_TIMEOUT / 60_000)}min (jobId=${ctx.jobId})`)),
+              SEM_TIMEOUT,
+            ),
+          ),
+        ]);
+        irDocument = { ir: semanticResult.ir, tokensUsed: semanticResult.tokensUsed };
+        phase36Result = semanticResult;
+        pipelineCache.irCache.set(irCacheKey, irDocument);
+        jlog.info(`[PHASE36] semantic IR complete — chunks=${semanticResult.chunkCount} tokensUsed=${semanticResult.tokensUsed} cacheHits=${semanticResult.cacheHits} resumed=${semanticResult.resumedChunks} coherenceIssues=${semanticResult.coherenceReport.issues.length} durationMs=${semanticResult.durationMs}`, {
+          jobId: ctx.jobId, step: 'phase36_done',
+        });
+      } catch (semErr) {
+        // FALLBACK ROBUSTESSE : si le pipeline sémantique échoue définitivement
+        // (après retries+backoff+resume), on retombe sur le chemin legacy —
+        // le résultat n'est JAMAIS moins bon que l'ancien pipeline.
+        const semMsg = (semErr as Error).message;
+        jlog.warn(`[PHASE36] semantic pipeline failed — falling back to legacy IR generator: ${semMsg.slice(0, 200)}`, {
+          jobId: ctx.jobId, step: 'phase36_fallback',
+        });
+        console.warn(`[PIPELINE] ⚠️  PHASE36 fallback → legacy IR generator (${semMsg.slice(0, 150)})`);
+        const LEGACY_TIMEOUT_MS = tier === 'free-groq' ? 8 * 60_000 : 4 * 60_000;
+        const legacyTimeout = new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error(`[GATE-IR] TIMEOUT: legacy IR exceeded ${LEGACY_TIMEOUT_MS / 60_000}min after semantic fallback`)), LEGACY_TIMEOUT_MS),
+        );
+        irDocument = await Promise.race([
+          irGenerator.generate(ctx, astResult, archResult),
+          legacyTimeout,
+        ]);
+        pipelineCache.irCache.set(cacheKey, irDocument);
+      }
     } else {
       // FIX PHASE 31 — TIMEOUT GLOBAL PHASE IR
       // Sans ce guard, irGenerator.generate() peut rester suspendu indéfiniment si:
@@ -1132,6 +1202,23 @@ export class ConversionPipeline {
         },
       } : {}),
       ...(conversionReportData ? { conversionReport: conversionReportData } : {}),
+      // ── PHASE 36: Rapport du pipeline sémantique (observabilité backend) ─────
+      ...(phase36Result ? {
+        phase36Report: {
+          used:              true,
+          chunkCount:        phase36Result.chunkCount,
+          resumedChunks:     phase36Result.resumedChunks,
+          cacheHits:         phase36Result.cacheHits,
+          cacheMisses:       phase36Result.cacheMisses,
+          tokensUsed:        phase36Result.tokensUsed,
+          mergeStatus:       phase36Result.mergeReport.status,
+          duplicatesRemoved: phase36Result.mergeReport.duplicatesRemoved,
+          coherenceIssues:   phase36Result.coherenceReport.issues.length,
+          coherenceCritical: phase36Result.coherenceReport.criticalCount,
+          coherenceFixed:    phase36Result.coherenceReport.fixedCount,
+          durationMs:        phase36Result.durationMs,
+        },
+      } : {}),
     };
   }
 
