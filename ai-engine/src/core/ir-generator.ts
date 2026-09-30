@@ -1042,7 +1042,8 @@ Return ONLY valid JSON.`;
     });
   }
 }
-const FRAMEWORK_DEP_MAPS: Record<string, IRDocument['dependencyMap']> = {
+// PHASE 36: exporté pour le pipeline sémantique (dependencyMap identique)
+export const FRAMEWORK_DEP_MAPS: Record<string, IRDocument['dependencyMap']> = {
   'Flutter->React': {
     keep:    [],
     replace: [

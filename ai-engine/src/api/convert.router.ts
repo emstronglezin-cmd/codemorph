@@ -234,6 +234,8 @@ convertRouter.post('/', async (req: Request, res: Response, next: NextFunction):
               fidelityScore:      result.fidelityScore,
               conversionReportJson:    result.conversionReport?.json,
               conversionReportMarkdown: result.conversionReport?.markdown,
+              // ── PHASE 36: rapport du pipeline sémantique (gros projets) ──────
+              phase36Report:      result.phase36Report,
             },
             irDocument:     result.ir,
           };

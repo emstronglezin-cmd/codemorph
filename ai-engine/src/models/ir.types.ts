@@ -354,6 +354,24 @@ export interface ConversionResult {
     markdown: string;
     html:     string;
   };
+  // ── PHASE 36: Pipeline sémantique (gros projets, free tier) — rapport ─────
+  phase36Report?: Phase36ReportSummary;
+}
+
+/** Résumé observable du pipeline sémantique Phase 36 (joint au callback backend). */
+export interface Phase36ReportSummary {
+  used:           boolean;
+  chunkCount:     number;
+  resumedChunks:  number;
+  cacheHits:      number;
+  cacheMisses:    number;
+  tokensUsed:     number;
+  mergeStatus:    string;
+  duplicatesRemoved: number;
+  coherenceIssues: number;
+  coherenceCritical: number;
+  coherenceFixed: number;
+  durationMs:     number;
 }
 
 export interface GeneratedFile {

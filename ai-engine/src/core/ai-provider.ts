@@ -31,33 +31,34 @@ import { getJobLogger } from './structured-logger';
 //
 // NOUVELLE APPROCHE : token-bucket basé sur la consommation réelle de tokens
 //   • Groq free = 8 000 TPM (tokens/minute) — réinitialise chaque 60s glissante
-//   • Chaque requête consomme ~3 000 tokens (input+output, estimé conservatif)
-//   • Budget 8 000 TPM → 2 requêtes/minute avec marge de sécurité
-//   • Délai minimal entre requêtes : 8s (vs 35s avant) — 4× plus rapide
-//   • Parallélisme contrôlé : max 3 requêtes en vol simultanées (semaphore)
-//   • Backoff adaptatif sur 429 : délai Retry-After exact + marge 5s
+//   • PHASE 36 : l'estimation par requête utilise la TAILLE RÉELLE du prompt
+//     (input estimé + output demandé) au lieu d'un forfait fixe → une requête
+//     trop grosse ATTEND le reset de fenêtre au lieu de partir et prendre un 429.
+//   • Backoff adaptatif sur 429 : délai Retry-After exact + marge
 //
-// RÉSULTAT ATTENDU : 100 appels × 8s = 13min (vs 58min avant) — 4-5× plus rapide
-// SÉCURITÉ : tracking TPM réel + fallback conservatif si 429 reçu
+// LIMITES CONFIGURABLES (PHASE 36 — rien n'est hardcodé) :
+//   AI_RATE_LIMIT_TPM          (défaut 7000 — sous la limite Groq free 8000)
+//   AI_MIN_INTERVAL_MS         (défaut 8000 — délai minimal entre requêtes)
+//   AI_PROVIDER_MAX_CONCURRENT (défaut 3 — requêtes simultanées max)
 //
 class GroqRateLimiter {
   // ── Token-bucket state ─────────────────────────────────────────────────────
   private windowStart      = 0;
   private tokensUsedInWindow = 0;
 
-  // Groq free tier: 8000 TPM. On en utilise 7000 max (marge 12.5%)
-  private readonly TPM_LIMIT    = 7_000;
-  // Estimation conservatrice par requête (input 2500 + output 1800 = ~4300, on met 3500 pour marge)
+  // Groq free tier: 8000 TPM. Budget configurable (marge par défaut ~12%)
+  private readonly TPM_LIMIT    = GroqRateLimiter.envInt('AI_RATE_LIMIT_TPM', 7_000, 500, 1_000_000);
+  // Estimation conservatrice par requête si l'estimation réelle n'est pas fournie
   private readonly TOKENS_PER_REQ = 3_500;
-  // Délai minimal absolu entre deux requêtes (ms) — réduit de 35s à 8s
-  private readonly MIN_INTERVAL_MS = 8_000;
+  // Délai minimal absolu entre deux requêtes (ms)
+  private readonly MIN_INTERVAL_MS = GroqRateLimiter.envInt('AI_MIN_INTERVAL_MS', 8_000, 0, 120_000);
   // Fenêtre TPM en millisecondes (1 minute)
   private readonly WINDOW_MS       = 60_000;
 
   private lastRequestEndTime = 0;
 
   // ── Semaphore : max N requêtes en vol simultané ────────────────────────────
-  private readonly MAX_CONCURRENT = 3;
+  private readonly MAX_CONCURRENT = GroqRateLimiter.envInt('AI_PROVIDER_MAX_CONCURRENT', 3, 1, 16);
   inflight = 0; // public pour logging dans groqChat
   private waitQueue: Array<() => void> = [];
 
@@ -65,6 +66,14 @@ class GroqRateLimiter {
   totalRequestsSent  = 0;
   totalWaitMs        = 0;
   totalThrottledCount = 0;
+
+  static envInt(key: string, defaultValue: number, min: number, max: number): number {
+    const raw = process.env[key];
+    if (raw === undefined || raw.trim() === '') return defaultValue;
+    const parsed = Number.parseInt(raw, 10);
+    if (Number.isNaN(parsed)) return defaultValue;
+    return Math.min(max, Math.max(min, parsed));
+  }
 
   // ── Enregistrer la consommation réelle de tokens ──────────────────────────
   recordTokens(tokens: number): void {
@@ -77,8 +86,16 @@ class GroqRateLimiter {
     this.tokensUsedInWindow += tokens;
   }
 
-  async acquire(): Promise<(tokensUsed?: number) => void> {
+  // ── PHASE 36: estimation tokens d'un prompt (input) ────────────────────────
+  static estimatePromptTokens(messages: Array<{ content: string }>): number {
+    const chars = messages.reduce((acc, m) => acc + (m.content?.length ?? 0), 0);
+    return Math.ceil((chars / 4) * 1.08); // conservateur (sur-estime légèrement)
+  }
+
+  async acquire(estimatedTokens?: number): Promise<(tokensUsed?: number) => void> {
     const waitStart = Date.now();
+    // PHASE 36: projection TPM basée sur la taille réelle (input estimé + output)
+    const projectedPerReq = Math.max(estimatedTokens ?? 0, this.TOKENS_PER_REQ);
 
     // ── 1. Semaphore : attendre un slot concurrent libre ─────────────────────
     if (this.inflight >= this.MAX_CONCURRENT) {
@@ -95,25 +112,31 @@ class GroqRateLimiter {
       await new Promise((r) => setTimeout(r, intervalWait));
     }
 
-    // ── 3. Token-bucket : attendre si on approche la limite TPM ──────────────
-    const now = Date.now();
-    if (now - this.windowStart < this.WINDOW_MS) {
-      const projectedTokens = this.tokensUsedInWindow + this.TOKENS_PER_REQ;
-      if (projectedTokens > this.TPM_LIMIT) {
-        const windowElapsed  = now - this.windowStart;
-        const windowRemaining = Math.max(0, this.WINDOW_MS - windowElapsed);
-        const tpmWaitMs      = windowRemaining + 2_000; // +2s marge
-        console.log(`[GroqRateLimiter] 🚦 TPM limit approaching (${this.tokensUsedInWindow}/${this.TPM_LIMIT} tokens) — waiting ${(tpmWaitMs / 1000).toFixed(1)}s for window reset`);
-        this.totalThrottledCount++;
-        await new Promise((r) => setTimeout(r, tpmWaitMs));
-        // Réinitialiser la fenêtre après attente
-        this.windowStart        = Date.now();
+    // ── 3. Token-bucket : attendre si la requête dépasserait la limite TPM ────
+    // PHASE 36: avec la projection réelle, une requête trop grosse pour le
+    // quota minute ATTEND le reset (au lieu de partir en 429 systématique).
+    for (;;) {
+      const now = Date.now();
+      if (now - this.windowStart >= this.WINDOW_MS) {
+        // Fenêtre expirée — réinitialiser
+        this.windowStart        = now;
         this.tokensUsedInWindow = 0;
+        break;
       }
-    } else {
-      // Fenêtre expirée — réinitialiser
+      const projectedTokens = this.tokensUsedInWindow + projectedPerReq;
+      if (projectedTokens <= this.TPM_LIMIT) break;
+
+      // Si la requête seule dépasse le budget minute entier, attendre ne sert
+      // à rien de la boucler — partir après UNE attente de reset de fenêtre
+      // (le backoff 429 de groqChat absorbe l'éventuel refus résiduel).
+      const windowRemaining = Math.max(0, this.WINDOW_MS - (now - this.windowStart));
+      const tpmWaitMs = windowRemaining + 2_000; // +2s marge
+      console.log(`[GroqRateLimiter] 🚦 TPM limit approaching (${this.tokensUsedInWindow}/${this.TPM_LIMIT} tokens, projected=${projectedTokens}) — waiting ${(tpmWaitMs / 1000).toFixed(1)}s for window reset`);
+      this.totalThrottledCount++;
+      await new Promise((r) => setTimeout(r, tpmWaitMs));
       this.windowStart        = Date.now();
       this.tokensUsedInWindow = 0;
+      break;
     }
 
     const totalWait = Date.now() - waitStart;
@@ -132,7 +155,7 @@ class GroqRateLimiter {
         this.recordTokens(tokensUsed);
       } else {
         // Estimation si tokens réels non fournis
-        this.recordTokens(this.TOKENS_PER_REQ);
+        this.recordTokens(projectedPerReq);
       }
       // Débloquer le prochain waiter du semaphore
       const next = this.waitQueue.shift();
@@ -1350,8 +1373,13 @@ export class AIProvider {
     const jlog = jobId ? getJobLogger(jobId) : undefined;
 
     // ── Rate limiting global (token-bucket + semaphore) ───────────────────────
+    // PHASE 36: projection TPM = tokens input estimés du prompt + output demandé
+    // → les requêtes volumineuses attendent le reset de fenêtre au lieu de partir en 429.
+    const estimatedInputTokens = GroqRateLimiter.estimatePromptTokens(messages);
+    const projectedTokens = estimatedInputTokens + GROQ_MAX_TOKENS;
+    console.log(`[AI-BUDGET] provider=groq estimatedInputTokens=${estimatedInputTokens} maxOutputTokens=${GROQ_MAX_TOKENS} projectedTotal=${projectedTokens}`);
     const waitStart = Date.now();
-    const release = await groqRateLimiter.acquire();
+    const release = await groqRateLimiter.acquire(projectedTokens);
     const waitedMs = Date.now() - waitStart;
     if (waitedMs > 500) {
       jlog?.aiRateLimit(waitedMs, `semaphore/TPM wait (inflight=${groqRateLimiter.inflight}/${3}, sent=${groqRateLimiter.totalRequestsSent})`);
