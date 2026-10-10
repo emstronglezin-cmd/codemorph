@@ -28,6 +28,9 @@ import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
 import { IQueueProvider, JobOptions } from './queue.provider.interface';
 // FIX PHASE 35 — NonRetryableError : stopper le retry sur jobs terminaux
 import { NonRetryableError } from './non-retryable.error';
+// FIX PHASE 37 — RetryableError : respecter Retry-After / backoff partagé
+import { retryAfterMsOf }   from './retryable.error';
+import { computeRetryDelayMs } from './retry-delay';
 
 /** Interface minimale du processeur (évite import circulaire) */
 export interface IConversionProcessor {
@@ -71,6 +74,8 @@ interface MemoryJob {
   enqueuedAt:   number;
   completedAt?: number;
   error?:       string;
+  // FIX PHASE 37 — dernière erreur (pour Retry-After / backoff partagé)
+  lastError?:   unknown;
 }
 
 @Injectable()
@@ -253,6 +258,7 @@ export class MemoryQueueProvider implements IQueueProvider, OnModuleDestroy {
 
       const message = (err as Error).message ?? 'Erreur inconnue';
       job.error       = message;
+      job.lastError   = err;
       job.attemptsMade++;
 
       const maxAttempts = job.opts.attempts ?? MAX_ATTEMPTS;
@@ -322,8 +328,15 @@ export class MemoryQueueProvider implements IQueueProvider, OnModuleDestroy {
     );
   }
 
-  // ── Calcul du backoff exponentiel ─────────────────────────
+  // ── Calcul du backoff ─────────────────────────────────────
+  // FIX PHASE 37 — même politique que Bull (retry-delay.ts, source unique) :
+  //   • RetryableError avec Retry-After → délai respecté (plafonné) ;
+  //   • sinon → exponentiel borné (comportement historique préservé).
   private computeBackoff(job: MemoryJob): number {
+    if (retryAfterMsOf(job.lastError) !== undefined) {
+      return computeRetryDelayMs(job.lastError, job.attemptsMade);
+    }
+
     const type  = job.opts.backoff?.type  ?? 'exponential';
     const delay = job.opts.backoff?.delay ?? INITIAL_BACKOFF_MS;
 

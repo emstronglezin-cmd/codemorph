@@ -29,6 +29,8 @@ import { ConfigService }     from '@nestjs/config';
 import { Cron, CronExpression } from '@nestjs/schedule';
 
 import { QueueAdapterService } from '../../queue/queue-adapter.service';
+// FIX PHASE 37 — stratégie de retry unique (Retry-After + exponentiel + jitter)
+import { getMaxAttempts, CONVERSION_BACKOFF_TYPE } from '../../queue/retry-delay';
 
 import { JobEntity, JobStatus, JobType } from './jobs.entity';
 import { AiEngineClient }                from './ai-engine.client';
@@ -468,9 +470,12 @@ export class JobsService implements OnModuleInit {
             'run-conversion',
             { jobId, dto },
             {
-              priority:         limits.queuePriority,
-              attempts:         3,
-              backoff:          { type: 'exponential', delay: 2_000 },
+              priority: limits.queuePriority,
+              // FIX PHASE 37 — tentative max + backoff 'conversion-retry'
+              // (Retry-After respecté si fourni, sinon exponentiel + jitter).
+              // Le job n'est marqué FAILED qu'à épuisement réel de ces tentatives.
+              attempts:         getMaxAttempts(),
+              backoff:          { type: CONVERSION_BACKOFF_TYPE, delay: 2_000 },
               removeOnComplete: 100,
               removeOnFail:     200,
               plan,
@@ -705,6 +710,17 @@ export class JobsService implements OnModuleInit {
       this.logger.error(
         `[CALLBACK-RECEIVED] jobId=${id} FAILED — error=${payload.error ?? '(no error message in payload)'}`,
       );
+    }
+
+    // FIX PHASE 37 — TRANSITIONS COHÉRENTES : un job déjà DONE est terminal.
+    // Un callback dupliqué ou tardif (pipeline relancé, retry réseau) ne doit
+    // JAMAIS ré-écrire un résultat déjà livré. On l'ignore proprement.
+    if (job.status === JobStatus.DONE) {
+      this.logger.warn(
+        `[CALLBACK-IGNORED] jobId=${id} — job déjà DONE, callback dupliqué/tardif ignoré ` +
+        `(success=${payload.success}). Résultat existant préservé.`,
+      );
+      return;
     }
 
     // Get user plan for quota tracking

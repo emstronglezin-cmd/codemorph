@@ -16,8 +16,13 @@ export interface JobOptions {
   priority?:         number;
   /** Nombre de tentatives max. Défaut: 3 */
   attempts?:         number;
-  /** Stratégie de backoff */
-  backoff?:          { type: 'exponential' | 'fixed'; delay: number };
+  /**
+   * Stratégie de backoff.
+   * FIX PHASE 37 — 'conversion-retry' : stratégie custom enregistrée par
+   * JobsProcessor (Bull) et reproduite par MemoryQueueProvider — Retry-After
+   * respecté si fourni, sinon backoff exponentiel + jitter (retry-delay.ts).
+   */
+  backoff?:          { type: 'exponential' | 'fixed' | 'conversion-retry'; delay: number };
   /** Supprimer de la queue après succès (Bull uniquement) */
   removeOnComplete?: number | boolean;
   /** Supprimer de la queue après échec (Bull uniquement) */

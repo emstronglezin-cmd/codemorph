@@ -18,6 +18,45 @@ import type { ConversionContext } from '../models/ir.types';
 
 export const convertRouter = Router();
 
+// ── FIX PHASE 37 — Idempotence par jobId ───────────────────
+// Le backend peut retenter un dispatch (429 edge, timeout réseau…) alors que
+// le pipeline du même jobId tourne déjà côté AI Engine. Sans garde-fou, deux
+// pipelines complets tourneraient en parallèle sur le même projet → double
+// consommation de quota Groq et callbacks concurrents.
+// Cette table borne (max 500 entrées, TTL 2h) rend POST /api/convert idempotent :
+//   • jobId déjà EN COURS ('running')   → 202 "already in progress", pas de 2e pipeline
+//   • jobId déjà RÉUSSI  ('succeeded')  → 202 (résultat préservé, jamais relancé)
+//   • jobId en ÉCHEC    ('failed')      → le dispatch suivant relance le pipeline
+//     (c'est le comportement attendu d'un retry après échec réel).
+const RUNNING_PIPELINES = new Map<string, { startedAt: number; state: 'running' | 'succeeded' | 'failed' }>();
+const RUNNING_PIPELINES_MAX = 500;
+const RUNNING_PIPELINES_TTL_MS = 2 * 60 * 60 * 1000;
+
+function pruneRunningPipelines(): void {
+  const now = Date.now();
+  for (const [jobId, entry] of RUNNING_PIPELINES.entries()) {
+    if (now - entry.startedAt > RUNNING_PIPELINES_TTL_MS) RUNNING_PIPELINES.delete(jobId);
+  }
+  // Borne mémoire : supprimer d'abord les entrées terminées les plus anciennes
+  if (RUNNING_PIPELINES.size > RUNNING_PIPELINES_MAX) {
+    const entries = [...RUNNING_PIPELINES.entries()].sort((a, b) => a[1].startedAt - b[1].startedAt);
+    for (const [jobId, entry] of entries) {
+      if (RUNNING_PIPELINES.size <= RUNNING_PIPELINES_MAX) break;
+      if (entry.state !== 'running') RUNNING_PIPELINES.delete(jobId);
+    }
+  }
+}
+
+/** Test-only : vide la table d'idempotence. */
+export function resetRunningPipelines(): void {
+  RUNNING_PIPELINES.clear();
+}
+
+/** Test-only : lecture de l'état d'un jobId dans la table. */
+export function getRunningPipelineState(jobId: string): 'running' | 'succeeded' | 'failed' | undefined {
+  return RUNNING_PIPELINES.get(jobId)?.state;
+}
+
 // ── Helper: extract user AI keys from headers ──────────────
 function extractAIKeys(req: Request): { userOpenAIKey?: string; userAnthropicKey?: string } {
   const openaiKey    = req.headers['x-openai-key'] as string | undefined;
@@ -113,6 +152,40 @@ convertRouter.post('/', async (req: Request, res: Response, next: NextFunction):
 
     const aiOpts = extractAIKeys(req);
 
+    // FIX PHASE 37 — Idempotence : si un pipeline tourne déjà pour ce jobId
+    // (dispatch retenté par le backend pendant la conversion), on répond 202
+    // sans relancer de pipeline. Évite la double consommation de quota et les
+    // callbacks concurrents. Le premier pipeline en cours reste la seule source.
+    pruneRunningPipelines();
+    const existingRun = RUNNING_PIPELINES.get(ctx.jobId);
+    if (existingRun && existingRun.state === 'running') {
+      console.warn(
+        `[AI-ENGINE-DUPLICATE] requestId=${requestId} jobId=${ctx.jobId} — pipeline déjà en cours ` +
+        `(démarré il y a ${Math.round((Date.now() - existingRun.startedAt) / 1000)}s). ` +
+        `Réponse 202 sans relancer de second pipeline.`,
+      );
+      res.status(202).json({
+        jobId: ctx.jobId,
+        accepted: true,
+        message: 'Conversion already in progress — duplicate dispatch ignored',
+      });
+      return;
+    }
+    if (existingRun && existingRun.state === 'succeeded') {
+      console.warn(
+        `[AI-ENGINE-DUPLICATE] requestId=${requestId} jobId=${ctx.jobId} — conversion déjà RÉUSSIE. ` +
+        `Résultat préservé, aucune ré-exécution.`,
+      );
+      res.status(202).json({
+        jobId: ctx.jobId,
+        accepted: true,
+        message: 'Conversion already completed — result preserved',
+      });
+      return;
+    }
+    // state 'failed' ou absent → (re)démarrage légitime du pipeline
+    RUNNING_PIPELINES.set(ctx.jobId, { startedAt: Date.now(), state: 'running' });
+
     // Count files in sourceCode
     const fileMarkerCount = (sourceCode.match(/\/\/\s*(?:=+\s*)?FILE:\s*/g) ?? []).length;
     console.log(`[PIPELINE] ━━━ AI Engine received conversion job ━━━`);
@@ -135,6 +208,9 @@ convertRouter.post('/', async (req: Request, res: Response, next: NextFunction):
     // Run pipeline + callback in background
     pipeline.run(ctx, aiOpts)
       .then(async (result) => {
+        // FIX PHASE 37 — conversion réussie : plus jamais ré-exécutée pendant le TTL
+        const run = RUNNING_PIPELINES.get(ctx.jobId);
+        if (run) run.state = 'succeeded';
         const filesCount = result.files?.length ?? 0;
         const linesTotal = result.files?.reduce((acc: number, f: { content: string }) => acc + (f.content?.split('\n').length ?? 0), 0) ?? 0;
         console.log(`[PIPELINE] ━━━ Pipeline completed ━━━`);
@@ -290,6 +366,9 @@ convertRouter.post('/', async (req: Request, res: Response, next: NextFunction):
         }
       })
       .catch(async (err: Error) => {
+        // FIX PHASE 37 — échec réel : un dispatch ultérieur du même jobId pourra relancer
+        const run = RUNNING_PIPELINES.get(ctx.jobId);
+        if (run) run.state = 'failed';
         console.error(`[PIPELINE-FAILED] job=${ctx.jobId} error=${err.message}`);
         if (callbackUrl) {
           const { default: axios } = await import('axios');
