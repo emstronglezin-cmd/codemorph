@@ -82,6 +82,16 @@ export class AiEngineClient {
   private consecutiveFailures = 0;
   private readonly CIRCUIT_THRESHOLD = 5;
 
+  // ── FIX PHASE 38 — Dispatch concurrency limiter ──────────────────────
+  // Empêche de saturer le endpoint AI Engine sur Render (free tier rate-limit).
+  // Maximum MAX_DISPATCH_CONCURRENT requêtes HTTP simultanées vers l'AI Engine.
+  // Les requêtes supplémentaires attendent qu'un slot se libère.
+  // Ceci ne remplace PAS le rate-limiter Groq côté AI Engine — il protège
+  // uniquement la couche edge/proxy Render devant l'AI Engine.
+  private dispatchInFlight = 0;
+  private dispatchWaitQueue: Array<() => void> = [];
+  private readonly MAX_DISPATCH_CONCURRENT = 2; // conservatif pour Render free tier
+
   constructor(
     private readonly http: HttpService,
     private readonly config: ConfigService,
@@ -103,6 +113,26 @@ export class AiEngineClient {
     } else {
       this.logger.log(`[PIPELINE] AI Engine real mode — baseUrl=${this.baseUrl}`);
     }
+  }
+
+  // ── Dispatch concurrency semaphore ──────────────────────────────────
+  // FIX PHASE 38 : Limite le nombre de dispatch HTTP simultanés vers l'AI Engine
+  // pour éviter les 429 de l'edge Render. Les dispatch supplémentaires attendent.
+  private async acquireDispatchSlot(): Promise<() => void> {
+    if (this.dispatchInFlight < this.MAX_DISPATCH_CONCURRENT) {
+      this.dispatchInFlight++;
+      return () => this.releaseDispatchSlot();
+    }
+    // Attendre qu'un slot se libère
+    await new Promise<void>((resolve) => this.dispatchWaitQueue.push(resolve));
+    this.dispatchInFlight++;
+    return () => this.releaseDispatchSlot();
+  }
+
+  private releaseDispatchSlot(): void {
+    this.dispatchInFlight = Math.max(0, this.dispatchInFlight - 1);
+    const next = this.dispatchWaitQueue.shift();
+    if (next) next();
   }
 
   // ── Submit async conversion job ──────────────────────────
@@ -141,6 +171,13 @@ export class AiEngineClient {
     }
 
     this.assertCircuitClosed();
+
+    // FIX PHASE 38 — Concurrency limiter : attendre un slot avant d'envoyer
+    // Évite de saturer le endpoint Render (free tier rate-limit)
+    const releaseSlot = await this.acquireDispatchSlot();
+    this.logger.log(
+      `[DISPATCH-SLOT] jobId=${req.jobId} acquired — inFlight=${this.dispatchInFlight}/${this.MAX_DISPATCH_CONCURRENT}`,
+    );
 
     // ── Convertir files[] → sourceCode string (format attendu par l'AI Engine) ──
     // L'AI Engine attend un seul champ `sourceCode` (string), pas un tableau de fichiers.
@@ -241,6 +278,9 @@ export class AiEngineClient {
         { kind: 'unknown', requestId, provider: 'ai-engine' },
         err as Error,
       );
+    } finally {
+      // FIX PHASE 38 — Toujours libérer le slot de concurrence, même en cas d'erreur
+      releaseSlot();
     }
   }
 

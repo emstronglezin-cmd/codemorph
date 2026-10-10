@@ -31,7 +31,12 @@ export function envInt(key: string, defaultValue: number, min: number, max: numb
 
 /** Nombre max de tentatives d'un job de conversion (env: CONVERSION_MAX_ATTEMPTS). */
 export function getMaxAttempts(): number {
-  return envInt('CONVERSION_MAX_ATTEMPTS', 3, 1, 10);
+  // FIX PHASE 38 — Défaut augmenté de 3 à 5 :
+  // Avec Render free tier, la fenêtre de rate-limit peut durer >1 minute.
+  // 3 tentatives (backoff 5s+10s = 15s total) ne suffisent pas.
+  // 5 tentatives (backoff 5s+10s+20s+40s = 75s total) couvrent la fenêtre
+  // de rate-limit Render sans délai excessif.
+  return envInt('CONVERSION_MAX_ATTEMPTS', 5, 1, 10);
 }
 
 /**
