@@ -37,6 +37,10 @@ import { ConversionProcessorService } from '../../queue/conversion-processor.ser
 import { MemoryQueueProvider }        from '../../queue/memory-queue.provider';
 import { QueueAdapterService }        from '../../queue/queue-adapter.service';
 import { QueueModule }                from '../../queue/queue.module';
+// FIX PHASE 37 — stratégie de backoff unique (Retry-After + exponentiel + jitter)
+import {
+  CONVERSION_BACKOFF_TYPE, conversionBackoffStrategy, getMaxAttempts,
+} from '../../queue/retry-delay';
 
 /**
  * Initialisation post-construction — résout la circularité.
@@ -59,13 +63,26 @@ class JobsModuleInit implements OnModuleInit {
     TypeOrmModule.forFeature([JobEntity]),
 
     // Bull queue — lazyConnect=true dans app.module.ts évite crash si Redis KO
+    // FIX PHASE 37 — RETRY COHÉRENT :
+    //   • attempts       = getMaxAttempts() (défaut 3, env CONVERSION_MAX_ATTEMPTS)
+    //   • backoff custom = 'conversion-retry' : respect du Retry-After si fourni,
+    //     sinon backoff exponentiel + jitter (retry-delay.ts, source unique
+    //     partagée avec MemoryQueueProvider).
+    //   La stratégie est enregistrée via settings.backoffStrategies (mécanisme
+    //   Bull officiel — aucune boucle de retry concurrente côté processeur).
     BullModule.registerQueue({
       name: 'conversion',
       defaultJobOptions: {
         removeOnComplete: 100,
         removeOnFail:     200,
-        attempts:         3,
-        backoff: { type: 'exponential', delay: 2_000 },
+        attempts:         getMaxAttempts(),
+        backoff: { type: CONVERSION_BACKOFF_TYPE, delay: 2_000 },
+      },
+      settings: {
+        backoffStrategies: {
+          [CONVERSION_BACKOFF_TYPE]: (attemptsMade: number, err: Error) =>
+            conversionBackoffStrategy(attemptsMade, err),
+        },
       },
     }),
 

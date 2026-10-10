@@ -14,9 +14,14 @@
 import { Injectable, Logger, ServiceUnavailableException } from '@nestjs/common';
 import { HttpService } from '@nestjs/axios';
 import { ConfigService } from '@nestjs/config';
-import { firstValueFrom, timeout, retry, catchError } from 'rxjs';
+import { firstValueFrom, timeout, catchError } from 'rxjs';
 import { AxiosError } from 'axios';
 import { throwError } from 'rxjs';
+import { randomUUID } from 'crypto';
+
+import { RetryableError }        from '../../queue/retryable.error';
+import { NonRetryableError }     from '../../queue/non-retryable.error';
+import { parseRetryAfterHeader } from '../../queue/retry-delay';
 
 export interface AiConvertRequest {
   jobId:          string;
@@ -158,122 +163,53 @@ export class AiEngineClient {
       options:         req.options,
     };
 
-    try {
-      // FIX PHASE 5 — SEC-01 : transmettre le secret partagé AI_ENGINE_SECRET
-      const aiEngineSecret = this.config.get<string>('AI_ENGINE_SECRET', '');
-      const extraHeaders: Record<string, string> = {
-        'Content-Type': 'application/json',
-        'X-Source': 'codemorph-backend',
-      };
-      if (aiEngineSecret) {
-        extraHeaders['X-AI-Engine-Secret'] = aiEngineSecret;
-      }
+    // FIX PHASE 5 — SEC-01 : transmettre le secret partagé AI_ENGINE_SECRET
+    const aiEngineSecret = this.config.get<string>('AI_ENGINE_SECRET', '');
+    const extraHeaders: Record<string, string> = {
+      'Content-Type': 'application/json',
+      'X-Source': 'codemorph-backend',
+      // ID de corrélation end-to-end : loggé côté Backend ET côté AI Engine
+      // ([AI-ENGINE-REQUEST] lit x-request-id). Jamais de secret dans ce header.
+      'X-Request-Id': randomUUID(),
+    };
+    if (aiEngineSecret) {
+      extraHeaders['X-AI-Engine-Secret'] = aiEngineSecret;
+    }
+    const requestId = extraHeaders['X-Request-Id'];
 
-      const httpStart = Date.now();
+    const httpStart = Date.now();
+    try {
       const res = await firstValueFrom(
         this.http
           .post<AiConvertResponse>(targetUrl, payload, {
             headers:         extraHeaders,
             timeout:         30_000,
-            // FIX PHASE 34 — BUG #1 :
-            // AVANT: validateStatus: s < 500 → 401/403 passaient dans .data sans exception
-            //   → [DISPATCH-RESPONSE] httpStatus=401 accepted=false mais aucune exception levée
-            //   → le job restait silencieusement CONVERTING, callback jamais reçu
-            // MAINTENANT: seul 202 est un succès. Tout autre status lève une AxiosError.
-            //   → catchError capture 401 → [DISPATCH-FAILED] explicite → exception propagée
-            //   → ConversionProcessorService marque le job FAILED → plus de zombie job
+            // FIX PHASE 34 — BUG #1 : seul 202 est un succès. Tout autre status
+            // lève une AxiosError, classifiée ci-dessous en erreur retryable ou non.
             validateStatus:  (s) => s === 202,
           })
           .pipe(
             timeout(35_000),
-            retry({
-              count:    2,
-              delay:    (err, attempt) => {
-                const axErr = err as AxiosError;
-                const status = axErr.response?.status;
-                const wait = Math.pow(2, attempt) * 1_000;
-                this.logger.warn(
-                  `[DISPATCH-RETRY] jobId=${req.jobId} attempt=${attempt}/2 wait=${wait}ms ` +
-                  `httpStatus=${status ?? 'NO_RESPONSE'} reason=${(err as Error).message}`,
-                );
-                // FIX PHASE 34 — NE PAS retry sur 401/403 (secret mismatch non récupérable)
-                if (status === 401 || status === 403) {
-                  return throwError(() => new ServiceUnavailableException(
-                    `AI Engine rejected request (${status}) — secret mismatch or unauthorized. ` +
-                    `Check AI_ENGINE_SECRET is identical on both Backend and AI Engine Render env vars.`,
-                  ));
-                }
-                // FIX PHASE 35 — NE PAS retry sur 429 (Render rate limit externe, non récupérable
-                // immédiatement — retenter dans les secondes qui suivent ne ferait qu'aggraver).
-                // Le 429 vient soit de Render soit de Groq propagé hors pipeline (cas anormal).
-                // L'AI Engine absorbe les 429 Groq en interne — si 429 remonte jusqu'au Backend,
-                // c'est que le rate limit est dépassé à un niveau externe (Render, proxy).
-                // Action correcte : marquer le job FAILED immédiatement, pas de retry.
-                if (status === 429) {
-                  this.logger.error(
-                    `[DISPATCH-429] jobId=${req.jobId} url=${targetUrl} ` +
-                    `httpStatus=429 — AI Engine rate limited (Render/proxy level). ` +
-                    `No retry — job will be marked FAILED. ` +
-                    `CAUSE: Render free plan request rate limit OR Groq rate limit not absorbed internally.`,
-                  );
-                  return throwError(() => new ServiceUnavailableException(
-                    `AI Engine rate limited (429): too many requests. ` +
-                    `This is likely a Render free plan limit. ` +
-                    `The job has been marked FAILED. Retry your job in a few minutes.`,
-                  ));
-                }
-                return new Promise((r) => setTimeout(r, wait)) as any;
-              },
-              resetOnSuccess: true,
-            }),
+            // FIX PHASE 37 — RETRY UNIQUE :
+            // AVANT: retry rxjs interne (2 tentatives immédiates) + retry Bull/Memory
+            //   + exception 429 transformée en échec définitif → deux mécanismes
+            //   concurrents, et le job passait FAILED dès le premier 429.
+            // MAINTENANT: aucun retry interne. catchError classe l'erreur
+            //   (RetryableError / NonRetryableError) et c'est la FILE (Bull ou
+            //   MemoryQueue) qui planifie les tentatives avec backoff + Retry-After.
+            //   Un seul mécanisme de retry, aucune boucle concurrente.
             catchError((err: AxiosError) => {
-              const durationMs = Date.now() - httpStart;
-              const status = err.response?.status;
-              const body   = err.response?.data;
-              // FIX PHASE 34+35 — Log différencié selon le type d'erreur
-              if (status === 401 || status === 403) {
-                this.logger.error(
-                  `[DISPATCH-FAILED] jobId=${req.jobId} url=${targetUrl} ` +
-                  `durationMs=${durationMs} httpStatus=${status} ` +
-                  `error=AUTH_REJECTED body=${JSON.stringify(body ?? {})} ` +
-                  `CAUSE: AI_ENGINE_SECRET mismatch — verify both services have same value on Render`,
-                );
-              } else if (status === 429) {
-                // FIX PHASE 35 — [DISPATCH-429] : log structuré pour le 429 Render/proxy
-                this.logger.error(
-                  `[DISPATCH-429] jobId=${req.jobId} url=${targetUrl} ` +
-                  `durationMs=${durationMs} httpStatus=429 ` +
-                  `source=RENDER_OR_PROXY_RATE_LIMIT ` +
-                  `body=${JSON.stringify(body ?? {})} ` +
-                  `CAUSE: Render free plan rate limit OR AI Engine internal 429 propagated externally`,
-                );
-              } else {
-                this.logger.error(
-                  `[DISPATCH-FAILED] jobId=${req.jobId} url=${targetUrl} ` +
-                  `durationMs=${durationMs} httpStatus=${status ?? 'NO_RESPONSE'} ` +
-                  `error=${err.message} body=${JSON.stringify(body ?? {})}`,
-                );
-              }
-              this.recordFailure();
-              return throwError(() => new ServiceUnavailableException(
-                status === 401 || status === 403
-                  ? `AI Engine rejected dispatch (${status}): AI_ENGINE_SECRET mismatch`
-                  : status === 429
-                    ? `AI Engine rate limited (429): too many concurrent requests to Render`
-                    : `AI Engine unavailable: ${err.message}`,
-              ));
+              throw this.classifyDispatchError(err, req.jobId, targetUrl, requestId, httpStart);
             }),
           ),
       );
 
       const durationMs = Date.now() - httpStart;
-      // FIX PHASE 33 — DISPATCH-RESPONSE : normalisé avec champs status, durationMs, aiEngineJobId
-      // FIX PHASE 34 — seul 202 atteint ce point (validateStatus strict)
       const data = res.data as any;
       const aiEngineJobId: string = data.jobId ?? req.jobId;
       this.logger.log(
-        `[DISPATCH-RESPONSE] jobId=${req.jobId} httpStatus=${res.status} durationMs=${durationMs} ` +
-        `aiEngineJobId=${aiEngineJobId} accepted=${data.accepted ?? true} ` +
+        `[DISPATCH-RESPONSE] jobId=${req.jobId} requestId=${requestId} httpStatus=${res.status} ` +
+        `durationMs=${durationMs} aiEngineJobId=${aiEngineJobId} accepted=${data.accepted ?? true} ` +
         `message=${data.message ?? '(none)'}`,
       );
       this.recordSuccess();
@@ -286,10 +222,150 @@ export class AiEngineClient {
         message:  data.message,
       };
     } catch (err) {
-      this.logger.error(`[submitConversion] [Job ${req.jobId}] exception: ${(err as Error)?.message}`);
+      // Erreurs déjà typées par classifyDispatchError (ou circuit breaker) :
+      // on les propage telles quelles — c'est la file qui décide du retry.
+      if (
+        err instanceof RetryableError ||
+        err instanceof NonRetryableError ||
+        (err as { nonRetryable?: boolean })?.nonRetryable === true ||
+        (err as { retryable?: boolean })?.retryable === true
+      ) {
+        throw err;
+      }
+      // Toute autre exception (inattendue) → classifiée transitoire et bornée
+      // par le nombre max de tentatives de la file (jamais de boucle infinie).
+      this.logger.error(`[submitConversion] [Job ${req.jobId}] unexpected exception: ${(err as Error)?.message}`);
       this.recordFailure();
-      throw err;
+      throw new RetryableError(
+        `AI Engine dispatch failed unexpectedly: ${(err as Error)?.message ?? 'unknown error'}`,
+        { kind: 'unknown', requestId, provider: 'ai-engine' },
+        err as Error,
+      );
     }
+  }
+
+  // ── Classification des erreurs de dispatch ───────────────
+  // FIX PHASE 37 — OBJECTIF 1+2 :
+  //   • Préserver les infos utiles du fournisseur (message d'erreur, statut,
+  //     Retry-After) au lieu d'une erreur générique.
+  //   • Distinguer erreurs TRANSITOIRES (429, 5xx, timeout, réseau) →
+  //     RetryableError (la file retente avec backoff + Retry-After)
+  //     des erreurs PERMANENTES (401/403 secret, 400 payload) →
+  //     NonRetryableError (aucun retry).
+  //   • Journalisation SÉCURISÉE : jamais de clé/token/secret, jamais le
+  //     contenu complet du dépôt — uniquement statut, type, Retry-After,
+  //     requestId et indices d'origine (headers non-sensibles).
+  private classifyDispatchError(
+    err:       unknown,
+    jobId:     string,
+    targetUrl: string,
+    requestId: string,
+    httpStart: number,
+  ): Error {
+    const durationMs = Date.now() - httpStart;
+    const axErr  = err as AxiosError;
+    const status = axErr.response?.status;
+    const body   = axErr.response?.data as Record<string, unknown> | undefined;
+    // Extrait NON-SENSIBLE du body : uniquement les champs error/message,
+    // tronqués. Jamais le body complet (peut contenir du code utilisateur).
+    const bodyInfo = body && typeof body === 'object'
+      ? JSON.stringify({
+          error:   typeof body['error'] === 'string'   ? (body['error'] as string).slice(0, 200)   : undefined,
+          message: typeof body['message'] === 'string' ? (body['message'] as string).slice(0, 200) : undefined,
+        })
+      : `(non-object body)`;
+
+    // ── HTTP 429 : rate limit — erreur TRANSITOIRE, retry différé ──────────
+    if (status === 429) {
+      const headers = (axErr.response?.headers ?? {}) as Record<string, string | undefined>;
+      const retryAfterMs = parseRetryAfterHeader(headers['retry-after']);
+      // Indices d'origine du 429 (headers non-sensibles) : aucun code de ce
+      // dépôt ne retourne 429 → le 429 provient d'une couche infra devant
+      // l'AI Engine (edge/proxy Render). Ces champs le prouvent dans les logs.
+      const originHints = [
+        headers['server']      ? `server=${String(headers['server']).slice(0, 40)}`       : null,
+        headers['via']         ? `via=${String(headers['via']).slice(0, 40)}`             : null,
+        headers['cf-ray']      ? `cf-ray=${String(headers['cf-ray']).slice(0, 24)}`       : null,
+        headers['x-request-id'] ? `upstreamRequestId=${String(headers['x-request-id']).slice(0, 64)}` : null,
+      ].filter(Boolean).join(' ');
+
+      this.logger.error(
+        `[DISPATCH-429] jobId=${jobId} requestId=${requestId} url=${targetUrl} ` +
+        `durationMs=${durationMs} httpStatus=429 errorType=rate-limit ` +
+        `provider=ai-engine-edge retryAfterMs=${retryAfterMs ?? 'none'} ` +
+        `body=${bodyInfo} originHints=[${originHints || 'none'}] ` +
+        `action=RETRYABLE_VIA_QUEUE_BACKOFF ` +
+        `NOTE: no code path in backend/ai-engine returns 429 — source is the ` +
+        `infra layer in front of the AI Engine (Render edge/proxy rate limit ` +
+        `on the free plan, or upstream proxy). Groq 429s are absorbed inside ` +
+        `the AI Engine pipeline and never surface as an HTTP 429 here.`,
+      );
+      return new RetryableError(
+        `AI Engine rate limited (429): too many requests. ` +
+        `${retryAfterMs !== undefined ? `Server asked to wait ${Math.round(retryAfterMs / 1000)}s. ` : ''}` +
+        `The job will be retried automatically by the queue.`,
+        { kind: 'rate-limit', httpStatus: 429, retryAfterMs, requestId, provider: 'ai-engine-edge' },
+        axErr instanceof Error ? axErr : undefined,
+      );
+    }
+
+    // ── HTTP 401/403 : secret mismatch / unauthorized — PERMANENT ──────────
+    if (status === 401 || status === 403) {
+      this.logger.error(
+        `[DISPATCH-FAILED] jobId=${jobId} requestId=${requestId} url=${targetUrl} ` +
+        `durationMs=${durationMs} httpStatus=${status} errorType=auth-rejected ` +
+        `provider=ai-engine body=${bodyInfo} action=NO_RETRY ` +
+        `CAUSE: AI_ENGINE_SECRET mismatch — verify both services have the same value on Render`,
+      );
+      return new NonRetryableError(
+        `AI Engine rejected dispatch (${status}): authentication refused. ` +
+        `Check AI_ENGINE_SECRET is identical on Backend and AI Engine.`,
+        axErr instanceof Error ? axErr : undefined,
+      );
+    }
+
+    // ── Autres 4xx : payload refusé — PERMANENT à cette taille ─────────────
+    if (status !== undefined && status >= 400 && status < 500) {
+      this.logger.error(
+        `[DISPATCH-FAILED] jobId=${jobId} requestId=${requestId} url=${targetUrl} ` +
+        `durationMs=${durationMs} httpStatus=${status} errorType=bad-request ` +
+        `provider=ai-engine body=${bodyInfo} action=NO_RETRY`,
+      );
+      return new NonRetryableError(
+        `AI Engine rejected the request payload (${status}). Provider response preserved: ${bodyInfo}`,
+        axErr instanceof Error ? axErr : undefined,
+      );
+    }
+
+    // ── 5xx : serveur AI Engine en difficulté — TRANSITOIRE ────────────────
+    if (status !== undefined && status >= 500) {
+      this.logger.error(
+        `[DISPATCH-FAILED] jobId=${jobId} requestId=${requestId} url=${targetUrl} ` +
+        `durationMs=${durationMs} httpStatus=${status} errorType=server-error ` +
+        `provider=ai-engine body=${bodyInfo} action=RETRYABLE_VIA_QUEUE_BACKOFF`,
+      );
+      this.recordFailure();
+      return new RetryableError(
+        `AI Engine server error (${status}). Provider response preserved: ${bodyInfo}`,
+        { kind: 'server', httpStatus: status, requestId, provider: 'ai-engine' },
+        axErr instanceof Error ? axErr : undefined,
+      );
+    }
+
+    // ── Pas de réponse : timeout / réseau — TRANSITOIRE ────────────────────
+    const code = axErr.code ?? '';
+    const isTimeout = code === 'ECONNABORTED' || code === 'ETIMEDOUT' || /timeout/i.test(axErr.message ?? '');
+    this.logger.error(
+      `[DISPATCH-FAILED] jobId=${jobId} requestId=${requestId} url=${targetUrl} ` +
+      `durationMs=${durationMs} httpStatus=NO_RESPONSE errorType=${isTimeout ? 'timeout' : 'network'} ` +
+      `code=${code || '-'} error=${(axErr.message ?? '').slice(0, 160)} action=RETRYABLE_VIA_QUEUE_BACKOFF`,
+    );
+    this.recordFailure();
+    return new RetryableError(
+      `AI Engine unreachable (${isTimeout ? 'timeout' : 'network'}): ${(axErr.message ?? 'no response').slice(0, 160)}`,
+      { kind: isTimeout ? 'timeout' : 'network', requestId, provider: 'ai-engine' },
+      axErr instanceof Error ? axErr : undefined,
+    );
   }
 
   // ── Mock conversion — fires callback after a delay ───────
@@ -651,11 +727,14 @@ export class AiEngineClient {
       this.circuitOpen = false;
       this.consecutiveFailures = 0;
     } else {
-      throw new ServiceUnavailableException({
-        code:    'AI_ENGINE_CIRCUIT_OPEN',
-        message: 'AI Engine is temporarily unavailable. Please try again in 30 seconds.',
-        retryAfterMs: this.CIRCUIT_TIMEOUT_MS - elapsed,
-      });
+      // FIX PHASE 37 — erreur TRANSITOIRE : le circuit se referme après
+      // CIRCUIT_TIMEOUT_MS. La file retentera après le délai indiqué au lieu
+      // de marquer le job FAILED immédiatement.
+      const remainingMs = this.CIRCUIT_TIMEOUT_MS - elapsed;
+      throw new RetryableError(
+        'AI Engine is temporarily unavailable (circuit breaker open). Please try again in 30 seconds.',
+        { kind: 'unavailable', retryAfterMs: remainingMs, provider: 'ai-engine' },
+      );
     }
   }
 

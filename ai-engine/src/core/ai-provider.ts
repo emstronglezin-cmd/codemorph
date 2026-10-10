@@ -1435,14 +1435,25 @@ export class AIProvider {
                 : 30;
               const retryWaitMs = waitSec * 1000;
 
-              // FIX PHASE 35 — [AI-ENGINE-429] : log structuré non-sensible pour tracer le 429 Groq.
-              // NE JAMAIS logger : API key, Authorization, tokens complets.
-              // Logger uniquement : modèle, durationMs, Retry-After, jobId (via jlog).
+              // FIX PHASE 37 — requestId upstream (si l'erreur Groq le porte).
+              // Utile pour corréler avec le support Groq. Jamais de secret ici.
+              const upstreamRequestId = (() => {
+                const hdrs = (err as { headers?: Record<string, unknown> })?.headers;
+                const v = hdrs?.['x-request-id'] ?? hdrs?.['request-id'];
+                return typeof v === 'string' ? v.slice(0, 64) : 'n/a';
+              })();
+
+              // FIX PHASE 35/37 — [AI-ENGINE-429] : log structuré non-sensible du 429 Groq.
+              // NE JAMAIS logger : API key, Authorization, tokens complets, prompts.
+              // Logger uniquement : provider, modèle, statut, type d'erreur, délai de
+              // réessai, requestId upstream et compteurs internes.
               console.warn(
                 `[AI-ENGINE-429] provider=groq model=${modelId} ` +
+                `httpStatus=429 errorType=rate-limit ` +
                 `attempt=${attempt + 1}/2 retryAfterSec=${waitSec} ` +
+                `upstreamRequestId=${upstreamRequestId} ` +
                 `durationMs=${Date.now() - callStart} ` +
-                `inflight=${groqRateLimiter.inflight}/${3} ` +
+                `inflight=${groqRateLimiter.inflight}/${groqRateLimiter['MAX_CONCURRENT']} ` +
                 `totalRequestsSent=${groqRateLimiter.totalRequestsSent} ` +
                 `source=GROQ_API_RATE_LIMIT ` +
                 `action=ABSORBING_INTERNALLY_retry_backoff`,

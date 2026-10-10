@@ -161,7 +161,72 @@ curl https://codemorph-backend.onrender.com/api/v1/health
 
 ---
 
+## HTTP 429 & Conversion Retries (Phase 37)
+
+Large conversions (e.g. ~195 000 chars / 50 files) can be rejected with an
+**HTTP 429** during `ir-generation`. Since **no code path in this repository
+returns 429**, the 429 originates from the **infra layer in front of the AI
+Engine** (Render free-plan edge/proxy rate limit, or an upstream proxy) — not
+from Groq directly (Groq 429s are absorbed *inside* the AI Engine pipeline).
+
+### What changed
+
+- A **transient error** (429, 5xx, timeout, network) **no longer fails the job
+  on the first occurrence**. The queue (Bull or Memory) schedules a retry with:
+  - the server's **`Retry-After`** when provided (capped), otherwise
+  - an **exponential backoff + jitter**.
+- The job is marked **`FAILED` only after attempts are truly exhausted**, or
+  immediately for a **permanent error** (e.g. `401` secret mismatch).
+- A **completed (`DONE`) job is never re-run or overwritten** (idempotent AI
+  Engine dispatch + callback guard).
+- Backend↔AI Engine dispatch is **idempotent by `jobId`**: a duplicate dispatch
+  while a pipeline already runs returns `202 already in progress` instead of
+  starting a second pipeline (avoids double Groq spend and racing callbacks).
+- If a dispatch fails **before any AI request actually ran**, the per-user
+  AI-request quota counter is rolled back, so retries don't burn the free-plan
+  hourly quota.
+
+### Retry tuning (backend env vars)
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `CONVERSION_MAX_ATTEMPTS` | `3` | Max attempts per conversion job |
+| `CONVERSION_BACKOFF_BASE_MS` | `5000` | Base delay for exponential backoff (no `Retry-After`) |
+| `CONVERSION_RETRY_MAX_DELAY_MS` | `120000` | Cap on backoff delay |
+| `CONVERSION_RETRY_AFTER_CAP_MS` | `120000` | Cap applied to a server `Retry-After` |
+
+### Verifying after deploy
+
+```bash
+# 1. Backend health
+curl https://codemorph-backend.onrender.com/api/v1/health
+
+# 2. AI Engine probe (confirms backend→AI Engine reachability + config)
+curl https://codemorph-backend.onrender.com/api/v1/jobs/ai-engine/probe
+```
+
+Then start a conversion and watch the logs:
+
+- `[DISPATCH-429] ... errorType=rate-limit retryAfterMs=... action=RETRYABLE_VIA_QUEUE_BACKOFF`
+  → a 429 was hit and **will be retried** (job stays active).
+- `[PIPELINE-RETRY] jobId=... attempt=1/3 erreur récupérable ...`
+  → the job remains active and the queue scheduled the next attempt.
+- `[PIPELINE] FAILED jobId=... après 3/3 tentative(s)`
+  → genuine exhaustion, job correctly marked `FAILED` with the provider's
+  error message preserved.
+- `[AI-ENGINE-DUPLICATE] ... pipeline déjà en cours`
+  → a duplicate dispatch was correctly ignored.
+
+---
+
 ## Troubleshooting
+
+**Conversion fails with `AI Engine rate limited (429)`**  
+→ This is now retried automatically (see above). If it still exhausts attempts,
+the logs show the exact `retryAfterMs` and origin hints (`server`/`via` headers)
+to identify which layer rate-limited you. Consider raising
+`CONVERSION_MAX_ATTEMPTS` or spreading load. Do **not** re-add a blanket
+"fail immediately on 429".
 
 **Build fails with "Cannot find module '@codemorph/shared'"**  
 → The Dockerfile builds `shared/` before `backend/`. Verify `backend/package.json` has `"@codemorph/shared": "file:../shared"`.

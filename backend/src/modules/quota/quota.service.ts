@@ -224,6 +224,25 @@ export class QuotaService {
     return { allowed, resetInSeconds };
   }
 
+  // ── Rollback AI rate limit (FIX PHASE 37) ────────────────
+  // Décrémente le compteur de requêtes AI de la fenêtre courante.
+  // Utilisé quand une tentative de dispatch échoue AVANT d'avoir réellement
+  // consommé une requête AI (ex: 429 edge/proxy, circuit ouvert, réseau).
+  // Sans cela, chaque tentative ratée d'un job free (5 req AI/h) brûlerait
+  // le quota de l'utilisateur alors qu'aucune requête IA n'a eu lieu.
+  async rollbackAiRateLimit(userId: string): Promise<void> {
+    const key = `ratelimit:ai:${userId}:${Math.floor(Date.now() / 3_600_000)}`;
+    try {
+      if (this.redis) {
+        const val = await this.redis.decr(key);
+        if (val < 0) await this.redis.set(key, '0');
+        return;
+      }
+    } catch (e) { this.logger.warn(`Redis DECR failed: ${String(e)}`); }
+    const cur = parseInt(memGet(key) ?? '0', 10);
+    memSet(key, String(Math.max(0, cur - 1)), 3600);
+  }
+
   // ────────────────────────────────────────────────────────
   // PHASE 7 FIX: Concurrent jobs — basé sur la DB, pas Redis
   // ────────────────────────────────────────────────────────
