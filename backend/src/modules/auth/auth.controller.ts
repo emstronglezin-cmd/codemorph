@@ -199,28 +199,104 @@ export class AuthController {
   }
 
   // ── Google OAuth ──────────────────────────────────────
+  // FIX PHASE 38 : state CSRF géré manuellement via cookie signé httpOnly
+  // (même fix que GitHub PHASE 19 — state: true nécessitait express-session,
+  // incompatible avec JWT stateless)
   @Public()
   @Get('google')
-  @UseGuards(AuthGuard('google'))
-  @ApiOperation({ summary: 'Initiate Google OAuth2 login' })
-  googleAuth(): void {
-    // Passport redirects
+  @ApiOperation({ summary: 'Initiate Google OAuth2 login (stateless state via signed cookie)' })
+  async googleAuth(
+    @Res() res: Response,
+  ): Promise<void> {
+    const frontendUrl = process.env['FRONTEND_URL'] ?? 'https://codemorph-coral.vercel.app';
+
+    // Validate Google OAuth configuration
+    const clientId = process.env['GOOGLE_CLIENT_ID'] ?? '';
+    const clientSecret = process.env['GOOGLE_CLIENT_SECRET'] ?? '';
+    if (!clientId || !clientSecret) {
+      this.logger.error(
+        '[Google OAuth] GOOGLE_CLIENT_ID or GOOGLE_CLIENT_SECRET not configured — ' +
+        'redirecting to frontend with error',
+      );
+      res.redirect(`${frontendUrl}/auth/sign-in?error=oauth_not_configured&provider=google`);
+      return;
+    }
+
+    // 1. Générer un state aléatoire sécurisé
+    const state  = randomBytes(32).toString('hex');
+    const sig    = this.signState(state);
+    const isProd = process.env['NODE_ENV'] === 'production';
+
+    // 2. Stocker le state dans un cookie httpOnly signé (TTL 10min)
+    res.cookie('cm_oauth_state', `${state}.${sig}`, {
+      httpOnly: true,
+      secure:   isProd,
+      sameSite: isProd ? 'none' : 'lax',
+      maxAge:   AuthController.OAUTH_STATE_TTL_MS,
+      path:     '/',
+    });
+
+    // 3. Construire l'URL Google OAuth avec le state
+    const callbackUrl = process.env['GOOGLE_CALLBACK_URL']
+      ?? 'http://localhost:4000/api/v1/auth/google/callback';
+
+    const googleUrl = new URL('https://accounts.google.com/o/oauth2/v2/auth');
+    googleUrl.searchParams.set('client_id',     clientId);
+    googleUrl.searchParams.set('redirect_uri',  callbackUrl);
+    googleUrl.searchParams.set('response_type', 'code');
+    googleUrl.searchParams.set('scope',         'email profile');
+    googleUrl.searchParams.set('state',         state);
+    googleUrl.searchParams.set('access_type',   'offline');
+    googleUrl.searchParams.set('prompt',        'consent');
+
+    this.logger.log(`[Google OAuth] Redirecting → Google state=${state.slice(0, 8)}…`);
+    res.redirect(googleUrl.toString());
   }
 
   @Public()
   @Get('google/callback')
   @UseGuards(AuthGuard('google'))
-  @ApiOperation({ summary: 'Google OAuth2 callback' })
+  @ApiOperation({ summary: 'Google OAuth callback — validates state cookie' })
   async googleCallback(
-    @Req()  req: OAuthRequest,
-    @Res()  res: Response,
+    @Req()   req: OAuthRequest,
+    @Res()   res: Response,
+    @Query('state') queryState: string,
   ): Promise<void> {
+    const frontendUrl = process.env['FRONTEND_URL'] ?? 'https://codemorph-coral.vercel.app';
+
+    // 4. Valider le state depuis le cookie
+    const cookies   = req.cookies as Record<string, string> | undefined;
+    const cookieVal = cookies?.['cm_oauth_state'] ?? '';
+    const dotIdx    = cookieVal.lastIndexOf('.');
+    const cookieState = dotIdx > 0 ? cookieVal.slice(0, dotIdx) : '';
+    const cookieSig   = dotIdx > 0 ? cookieVal.slice(dotIdx + 1) : '';
+
+    const stateOk =
+      cookieState.length > 0 &&
+      cookieSig.length  > 0 &&
+      cookieState === queryState &&
+      this.verifyState(cookieState, cookieSig);
+
+    if (!stateOk) {
+      this.logger.warn(
+        `[Google OAuth] State mismatch — cookie="${cookieVal.slice(0, 16)}…" ` +
+        `query="${queryState?.slice(0, 8)}…"`,
+      );
+      res.redirect(`${frontendUrl}/auth/sign-in?error=oauth_state_invalid`);
+      return;
+    }
+
+    // 5. Supprimer le cookie state (usage unique)
+    res.clearCookie('cm_oauth_state', { path: '/' });
+
+    // 6. Émettre les JWT et rediriger
     const tokens = await this.authService.loginOAuthUser(req.user);
     this.setRefreshTokenCookie(res, tokens.refreshToken);
-    const frontendUrl = process.env['FRONTEND_URL'] ?? 'https://codemorph-coral.vercel.app';
+
     // FIX PHASE 20 — OAUTH CROSS-DOMAIN (même fix que GitHub) :
     // Fragment #rt= pour contourner le blocage des cookies cross-domain SameSite
     const rtEncoded = Buffer.from(tokens.refreshToken).toString('base64url');
+    this.logger.log(`[Google OAuth] Success → ${frontendUrl}/auth/oauth-success`);
     res.redirect(`${frontendUrl}/auth/oauth-success#rt=${rtEncoded}`);
   }
 
