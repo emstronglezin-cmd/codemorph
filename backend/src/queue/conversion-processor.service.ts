@@ -26,6 +26,9 @@ import { NonRetryableError }   from './non-retryable.error';
 // PLUS le job FAILED — la file (Bull ou Memory) planifie la tentative suivante.
 import { RetryableError, isNonRetryableError, retryAfterMsOf } from './retryable.error';
 import { computeRetryDelayMs, getMaxAttempts }                  from './retry-delay';
+// FIX PHASE 39 — snapshot des fichiers sources réutilisé entre deux tentatives
+// (évite de re-télécharger / re-analyser le dépôt GitHub à chaque reprise).
+import { sourceSnapshotCache }                                  from './source-snapshot-cache';
 
 export interface ConversionJobPayload {
   jobId: string;
@@ -106,6 +109,8 @@ export class ConversionProcessorService {
           `${tag} [NON-RETRYABLE] Attempt ${attemptInfo.attemptsMade + 1}: job déjà DONE — ` +
           `résultat préservé, aucune ré-exécution.`,
         );
+        // FIX PHASE 39 — job terminal : le snapshot ne servira plus, on le purge.
+        sourceSnapshotCache.delete(jobId);
         throw new NonRetryableError(
           `Job ${jobId} est déjà terminé (DONE). Ré-exécution refusée, résultat préservé.`,
         );
@@ -135,7 +140,35 @@ export class ConversionProcessorService {
       // ── Phase 2: Récupération des fichiers sources ─────────
       let files: Array<{ path: string; content: string }> = [];
 
-      if (dto.type === JobType.GITHUB_IMPORT) {
+      // ── FIX PHASE 39 — Snapshot réutilisé entre deux tentatives ───────────
+      // AVANT : chaque tentative re-téléchargeait le dépôt GitHub / re-dézippait
+      //   l'archive. Un 429 au dispatch ⇒ 5 téléchargements complets du même
+      //   projet (50 fichiers / ~195 000 caractères) et 5 × N appels à l'API
+      //   GitHub, qui applique sa propre limite de débit.
+      // APRÈS : la tentative 0 télécharge et met en cache ; les tentatives
+      //   suivantes réutilisent le snapshot tant qu'il est frais (TTL 10 min).
+      //   Cohérence préservée : le dto d'un job est figé à l'enqueue, et un
+      //   snapshot figé évite justement de convertir un dépôt modifié en cours
+      //   de retry sous le même jobId. L'entrée est purgée à l'état terminal.
+      //   Aucun contenu de fichier n'est journalisé.
+      const cachedFiles = attemptInfo.attemptsMade > 0
+        ? sourceSnapshotCache.get(jobId)
+        : undefined;
+
+      if (cachedFiles) {
+        const cachedChars = cachedFiles.reduce((acc, f) => acc + (f.content?.length ?? 0), 0);
+        files = cachedFiles;
+        this.logger.log(
+          `[PIPELINE] Snapshot sources réutilisé (pas de re-téléchargement) — ` +
+          `jobId=${jobId} attempt=${attemptInfo.attemptsMade + 1} ` +
+          `files=${cachedFiles.length} chars=${cachedChars}`,
+        );
+        await this.jobsService.appendLog(
+          jobId, 'ast-analysis', 'running',
+          `Réutilisation du snapshot sources (${cachedFiles.length} fichiers) — ` +
+          `téléchargement déjà effectué à la tentative précédente.`,
+        );
+      } else if (dto.type === JobType.GITHUB_IMPORT) {
         if (!dto.sourceRepo) throw new Error('GITHUB_IMPORT: sourceRepo requis.');
         this.logger.log(
           `[PIPELINE] Fetching GitHub repo: ${dto.sourceRepo}@${dto.sourceBranch ?? 'main'}`,
@@ -171,6 +204,13 @@ export class ConversionProcessorService {
       if (limits.maxFilesPerProject > 0 && files.length > limits.maxFilesPerProject) {
         this.logger.warn(`${tag} Troncature à ${limits.maxFilesPerProject} fichiers (limite plan)`);
         files = files.slice(0, limits.maxFilesPerProject);
+      }
+
+      // FIX PHASE 39 — Mise en cache APRÈS troncature : le snapshot conservé est
+      // exactement celui qui sera envoyé à l'AI Engine, donc une reprise renvoie
+      // un payload identique (mêmes fichiers, même volume).
+      if (!cachedFiles) {
+        sourceSnapshotCache.put(jobId, files);
       }
 
       await this.jobsService.appendLog(
@@ -323,6 +363,9 @@ export class ConversionProcessorService {
         `[PIPELINE] FAILED jobId=${jobId} après ${attemptsUsed}/${maxAttempts} tentative(s): ${message}`,
         error.stack,
       );
+
+      // FIX PHASE 39 — job terminal : purger le snapshot (plus aucun retry).
+      sourceSnapshotCache.delete(jobId);
 
       if (aiRateLimitIncremented) {
         try { await this.quotaService.rollbackAiRateLimit(dto.userId); } catch { /* non-bloquant */ }

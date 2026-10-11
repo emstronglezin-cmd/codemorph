@@ -71,6 +71,118 @@ const SUPPORTED_PAIRS: Array<{ source: string; target: string }> = [
   { source: 'typescript',  target: 'typescript' },
 ];
 
+// ============================================================
+// FIX PHASE 39 — PROVENANCE RÉELLE DU 429 (au lieu d'une supposition)
+// ------------------------------------------------------------
+// Les phases 37 et 38 ont étiqueté le 429 `provider=ai-engine-edge` en DUR,
+// puis conclu « c'est l'edge Render/Cloudflare ». Or cette étiquette n'était
+// pas une observation : elle était écrite dans le code avant même d'avoir lu
+// la réponse. Vérifications faites le 2026-10-11 sur l'instance réelle
+// https://codemorph-1-rdx0.onrender.com :
+//   • `server: cloudflare` est présent sur TOUTES les réponses (200, 400, 401)
+//     car Render place tous les *.onrender.com derrière Cloudflare
+//     (`x-render-origin-server: Render` + `rndr-id` le confirment).
+//     → `server: cloudflare` ne discrimine RIEN.
+//   • 25 requêtes séquentielles puis 80 requêtes parallèles sur
+//     POST /api/convert → 0 × 429. L'edge ne limite pas à ce volume.
+//   • Un POST de 200 Ko / 50 fichiers traverse l'edge sans 429.
+//   • Aucun chemin de code de ce dépôt n'émet de 429 (grep exhaustif).
+// Donc : pour savoir QUI a répondu 429, il faut regarder les en-têtes qui
+// prouvent le passage par l'ORIGINE applicative, et non `server`.
+//
+// Marqueurs d'origine (ajoutés par Render/Express, jamais par un CDN seul) :
+//   rndr-id                  → posé par le routeur Render
+//   x-render-origin-server   → posé par Render quand l'origine a répondu
+//   x-render-routing         → posé par Render (ex: "no-server")
+//   x-powered-by: Express    → posé par l'application Express elle-même
+//   x-request-id             → écho par notre requestLogger (middleware app)
+// Si AU MOINS UN est présent → la réponse vient de l'origine applicative.
+// Si AUCUN n'est présent     → la réponse a été produite AVANT l'application.
+// ============================================================
+
+export interface RateLimitProvenance {
+  /** Nom de fournisseur déduit (jamais une supposition codée en dur). */
+  provider: string;
+  /** 'origin' = réponse produite/traversée par l'app ; 'edge' = avant l'app. */
+  provenance: 'origin' | 'edge' | 'unknown';
+  /** En-têtes non sensibles utiles, formatés pour les logs. */
+  hints: string;
+  /** Conclusion lisible par un opérateur. */
+  verdict: string;
+}
+
+/** Marqueurs prouvant que la réponse a atteint l'origine applicative. */
+const ORIGIN_MARKERS = [
+  'rndr-id',
+  'x-render-origin-server',
+  'x-render-routing',
+  'x-powered-by',
+  'x-request-id',
+] as const;
+
+export function classifyRateLimitProvenance(
+  rawHeaders: Record<string, string | undefined> | undefined,
+): RateLimitProvenance {
+  // Les en-têtes axios/AxiosHeaders peuvent être en casse mixte → on normalise.
+  const headers: Record<string, string> = {};
+  for (const [k, v] of Object.entries(rawHeaders ?? {})) {
+    if (v !== undefined && v !== null) headers[k.toLowerCase()] = String(v);
+  }
+
+  const markersFound = ORIGIN_MARKERS.filter((m) => headers[m]);
+  const originReached = markersFound.length > 0;
+
+  const hints = [
+    headers['server']               ? `server=${headers['server'].slice(0, 40)}`                        : null,
+    headers['via']                  ? `via=${headers['via'].slice(0, 60)}`                              : null,
+    headers['cf-ray']               ? `cfRay=${headers['cf-ray'].slice(0, 24)}`                         : null,
+    headers['rndr-id']              ? `rndrId=${headers['rndr-id'].slice(0, 32)}`                       : null,
+    headers['x-render-origin-server'] ? `renderOrigin=${headers['x-render-origin-server'].slice(0, 32)}` : null,
+    headers['x-render-routing']     ? `renderRouting=${headers['x-render-routing'].slice(0, 32)}`       : null,
+    headers['x-powered-by']         ? `poweredBy=${headers['x-powered-by'].slice(0, 32)}`               : null,
+    headers['x-request-id']         ? `upstreamRequestId=${headers['x-request-id'].slice(0, 64)}`       : null,
+    headers['content-type']         ? `contentType=${headers['content-type'].slice(0, 48)}`             : null,
+    headers['content-length']       ? `contentLength=${headers['content-length'].slice(0, 16)}`         : null,
+    markersFound.length             ? `originMarkers=${markersFound.join(',')}`                         : `originMarkers=none`,
+  ].filter(Boolean).join(' ');
+
+  if (originReached) {
+    return {
+      provider:   'ai-engine-origin',
+      provenance: 'origin',
+      hints,
+      verdict:
+        'La réponse 429 porte au moins un marqueur d\'origine applicative ' +
+        `(${markersFound.join(', ')}). Elle a donc atteint le process Node de l'AI Engine ` +
+        '(ou son routeur Render), et NON un simple CDN. Chercher la limite de débit côté ' +
+        'application / plan Render, pas côté Cloudflare.',
+    };
+  }
+
+  if (headers['server'] || headers['cf-ray'] || headers['via']) {
+    return {
+      provider:   'edge-or-proxy',
+      provenance: 'edge',
+      hints,
+      verdict:
+        'La réponse 429 ne porte AUCUN marqueur d\'origine applicative ' +
+        "(ni rndr-id, ni x-render-origin-server, ni x-powered-by, ni x-request-id) " +
+        'alors qu\'un en-tête d\'intermédiaire est présent. La requête a été rejetée ' +
+        "AVANT d'atteindre le process Node — d'où l'absence de log Runtime. " +
+        'C\'est la seule configuration qui prouve un rejet par la couche intermédiaire.',
+    };
+  }
+
+  return {
+    provider:   'unknown',
+    provenance: 'unknown',
+    hints,
+    verdict:
+      'Aucun marqueur d\'origine et aucun marqueur d\'intermédiaire : provenance indéterminée. ' +
+      'Ne pas conclure. Capturer la réponse brute avant de modifier quoi que ce soit.',
+  };
+}
+
 @Injectable()
 export class AiEngineClient {
   private readonly logger = new Logger(AiEngineClient.name);
@@ -118,21 +230,38 @@ export class AiEngineClient {
   // ── Dispatch concurrency semaphore ──────────────────────────────────
   // FIX PHASE 38 : Limite le nombre de dispatch HTTP simultanés vers l'AI Engine
   // pour éviter les 429 de l'edge Render. Les dispatch supplémentaires attendent.
+  // FIX PHASE 39 — RACE DE SUR-ADMISSION CORRIGÉE.
+  // AVANT :
+  //   acquire : si plein → await (file d'attente) ; à la reprise → inFlight++
+  //   release : inFlight-- PUIS résolution du suivant (microtâche)
+  //   Séquence fautive avec MAX=2 et 2 en vol + C en attente :
+  //     release()  → inFlight=1, C résolu (microtâche en suspens)
+  //     nouvel appel D arrive SYNCHRONE : 1 < 2 → inFlight=2, D admis
+  //     microtâche de C : inFlight=3  ← 3 requêtes simultanées pour MAX=2
+  //   La limite de concurrence était donc violable précisément quand on en a
+  //   besoin, c'est-à-dire sous charge — le cas que ce sémaphore doit protéger.
+  // APRÈS : le slot est TRANSFÉRÉ au suivant sans jamais être décrémenté, donc
+  //   aucune fenêtre où un nouvel appel pourrait passer devant. Le compteur ne
+  //   baisse que lorsqu'il n'y a plus personne en attente.
   private async acquireDispatchSlot(): Promise<() => void> {
     if (this.dispatchInFlight < this.MAX_DISPATCH_CONCURRENT) {
       this.dispatchInFlight++;
       return () => this.releaseDispatchSlot();
     }
-    // Attendre qu'un slot se libère
+    // Pas de slot libre : on attend un TRANSFERT de slot. Le compteur n'est pas
+    // touché ici — il l'a déjà été par l'appelant initial.
     await new Promise<void>((resolve) => this.dispatchWaitQueue.push(resolve));
-    this.dispatchInFlight++;
     return () => this.releaseDispatchSlot();
   }
 
   private releaseDispatchSlot(): void {
-    this.dispatchInFlight = Math.max(0, this.dispatchInFlight - 1);
     const next = this.dispatchWaitQueue.shift();
-    if (next) next();
+    if (next) {
+      // Transfert direct : le slot passe au suivant, inFlight reste inchangé.
+      next();
+      return;
+    }
+    this.dispatchInFlight = Math.max(0, this.dispatchInFlight - 1);
   }
 
   // ── Submit async conversion job ──────────────────────────
@@ -172,13 +301,6 @@ export class AiEngineClient {
 
     this.assertCircuitClosed();
 
-    // FIX PHASE 38 — Concurrency limiter : attendre un slot avant d'envoyer
-    // Évite de saturer le endpoint Render (free tier rate-limit)
-    const releaseSlot = await this.acquireDispatchSlot();
-    this.logger.log(
-      `[DISPATCH-SLOT] jobId=${req.jobId} acquired — inFlight=${this.dispatchInFlight}/${this.MAX_DISPATCH_CONCURRENT}`,
-    );
-
     // ── Convertir files[] → sourceCode string (format attendu par l'AI Engine) ──
     // L'AI Engine attend un seul champ `sourceCode` (string), pas un tableau de fichiers.
     // On concatène tous les fichiers avec un header indiquant le chemin.
@@ -214,6 +336,17 @@ export class AiEngineClient {
     }
     const requestId = extraHeaders['X-Request-Id'];
 
+    // FIX PHASE 38/39 — Concurrency limiter : attendre un slot avant d'envoyer.
+    // FIX PHASE 39 : l'acquisition est placée IMMÉDIATEMENT avant le try/finally
+    // qui libère le slot. Auparavant, ~20 lignes (construction du payload, des
+    // en-têtes) s'exécutaient entre l'acquisition et le try : toute exception y
+    // levant aurait fait fuir le slot définitivement (capacité réduite à vie).
+    // Le slot est aussi tenu moins longtemps, ce qui améliore le débit utile.
+    const releaseSlot = await this.acquireDispatchSlot();
+    this.logger.log(
+      `[DISPATCH-SLOT] jobId=${req.jobId} acquired — inFlight=${this.dispatchInFlight}/${this.MAX_DISPATCH_CONCURRENT}`,
+    );
+
     const httpStart = Date.now();
     try {
       const res = await firstValueFrom(
@@ -221,9 +354,18 @@ export class AiEngineClient {
           .post<AiConvertResponse>(targetUrl, payload, {
             headers:         extraHeaders,
             timeout:         30_000,
-            // FIX PHASE 34 — BUG #1 : seul 202 est un succès. Tout autre status
-            // lève une AxiosError, classifiée ci-dessous en erreur retryable ou non.
-            validateStatus:  (s) => s === 202,
+            // FIX PHASE 39 — BUG DE CLASSIFICATION (avait survécu à la phase 34) :
+            // AVANT : `validateStatus: (s) => s === 202`. Si l'AI Engine répondait
+            //   200 (ou tout autre 2xx), axios levait une AxiosError que
+            //   classifyDispatchError ne rangeait dans AUCUNE branche 4xx/5xx →
+            //   elle retombait sur la branche « pas de réponse » et produisait
+            //   RetryableError kind=network, httpStatus=undefined, + recordFailure()
+            //   qui ouvrait le circuit breaker. Un SUCCÈS était donc traité comme
+            //   une panne réseau : retries inutiles + circuit ouvert à tort.
+            // APRÈS : tout 2xx est un succès ; `accepted` est déduit du corps,
+            //   avec repli sur le statut. Le comportement nominal (202 + accepted)
+            //   est strictement préservé.
+            validateStatus:  (s) => s >= 200 && s < 300,
           })
           .pipe(
             timeout(35_000),
@@ -244,18 +386,21 @@ export class AiEngineClient {
       const durationMs = Date.now() - httpStart;
       const data = res.data as any;
       const aiEngineJobId: string = data.jobId ?? req.jobId;
+      // FIX PHASE 39 — `accepted` déduit du corps, repli sur le statut 2xx.
+      const accepted: boolean =
+        typeof data.accepted === 'boolean' ? data.accepted : res.status >= 200 && res.status < 300;
       this.logger.log(
         `[DISPATCH-RESPONSE] jobId=${req.jobId} requestId=${requestId} httpStatus=${res.status} ` +
-        `durationMs=${durationMs} aiEngineJobId=${aiEngineJobId} accepted=${data.accepted ?? true} ` +
+        `durationMs=${durationMs} aiEngineJobId=${aiEngineJobId} accepted=${accepted} ` +
         `message=${data.message ?? '(none)'}`,
       );
       this.recordSuccess();
 
-      // L'AI Engine répond { jobId, accepted: true, message }
-      // validateStatus strict garantit que seul 202 atteint ce point
+      // L'AI Engine répond { jobId, accepted: true, message } avec 202.
+      // Tout autre 2xx est accepté : `accepted` vient alors du corps ou du statut.
       return {
         jobId:    aiEngineJobId,
-        accepted: true,   // garanti par validateStatus: s === 202
+        accepted,
         message:  data.message,
       };
     } catch (err) {
@@ -319,32 +464,22 @@ export class AiEngineClient {
     if (status === 429) {
       const headers = (axErr.response?.headers ?? {}) as Record<string, string | undefined>;
       const retryAfterMs = parseRetryAfterHeader(headers['retry-after']);
-      // Indices d'origine du 429 (headers non-sensibles) : aucun code de ce
-      // dépôt ne retourne 429 → le 429 provient d'une couche infra devant
-      // l'AI Engine (edge/proxy Render). Ces champs le prouvent dans les logs.
-      const originHints = [
-        headers['server']      ? `server=${String(headers['server']).slice(0, 40)}`       : null,
-        headers['via']         ? `via=${String(headers['via']).slice(0, 40)}`             : null,
-        headers['cf-ray']      ? `cf-ray=${String(headers['cf-ray']).slice(0, 24)}`       : null,
-        headers['x-request-id'] ? `upstreamRequestId=${String(headers['x-request-id']).slice(0, 64)}` : null,
-      ].filter(Boolean).join(' ');
+      const prov = classifyRateLimitProvenance(headers);
 
       this.logger.error(
         `[DISPATCH-429] jobId=${jobId} requestId=${requestId} url=${targetUrl} ` +
         `durationMs=${durationMs} httpStatus=429 errorType=rate-limit ` +
-        `provider=ai-engine-edge retryAfterMs=${retryAfterMs ?? 'none'} ` +
-        `body=${bodyInfo} originHints=[${originHints || 'none'}] ` +
-        `action=RETRYABLE_VIA_QUEUE_BACKOFF ` +
-        `NOTE: no code path in backend/ai-engine returns 429 — source is the ` +
-        `infra layer in front of the AI Engine (Render edge/proxy rate limit ` +
-        `on the free plan, or upstream proxy). Groq 429s are absorbed inside ` +
-        `the AI Engine pipeline and never surface as an HTTP 429 here.`,
+        `provider=${prov.provider} provenance=${prov.provenance} ` +
+        `retryAfterMs=${retryAfterMs ?? 'none'} ` +
+        `retryAfterHeader=${headers['retry-after'] ?? '(absent)'} ` +
+        `body=${bodyInfo} originHints=[${prov.hints || 'none'}] ` +
+        `verdict="${prov.verdict}" action=RETRYABLE_VIA_QUEUE_BACKOFF`,
       );
       return new RetryableError(
         `AI Engine rate limited (429): too many requests. ` +
         `${retryAfterMs !== undefined ? `Server asked to wait ${Math.round(retryAfterMs / 1000)}s. ` : ''}` +
         `The job will be retried automatically by the queue.`,
-        { kind: 'rate-limit', httpStatus: 429, retryAfterMs, requestId, provider: 'ai-engine-edge' },
+        { kind: 'rate-limit', httpStatus: 429, retryAfterMs, requestId, provider: prov.provider },
         axErr instanceof Error ? axErr : undefined,
       );
     }
@@ -388,6 +523,24 @@ export class AiEngineClient {
       return new RetryableError(
         `AI Engine server error (${status}). Provider response preserved: ${bodyInfo}`,
         { kind: 'server', httpStatus: status, requestId, provider: 'ai-engine' },
+        axErr instanceof Error ? axErr : undefined,
+      );
+    }
+
+    // ── FIX PHASE 39 — Garde-fou : 2xx/3xx inattendu ────────────────────────
+    // Ne peut normalement plus arriver (validateStatus accepte tout 2xx), mais
+    // si un 3xx dépasse maxRedirects, axios lève avec une réponse. Sans cette
+    // branche, on retomberait sur « pas de réponse » et on étiquetterait à tort
+    // errorType=network + recordFailure() (circuit breaker).
+    if (status !== undefined && status >= 200 && status < 400) {
+      this.logger.error(
+        `[DISPATCH-FAILED] jobId=${jobId} requestId=${requestId} url=${targetUrl} ` +
+        `durationMs=${durationMs} httpStatus=${status} errorType=unexpected-status ` +
+        `provider=ai-engine body=${bodyInfo} action=RETRYABLE_VIA_QUEUE_BACKOFF`,
+      );
+      return new RetryableError(
+        `AI Engine returned an unexpected status (${status}) for a dispatch. Provider response preserved: ${bodyInfo}`,
+        { kind: 'unknown', httpStatus: status, requestId, provider: 'ai-engine' },
         axErr instanceof Error ? axErr : undefined,
       );
     }

@@ -52,8 +52,19 @@ async function bootstrap(): Promise<void> {
   const app = express();
   const { port } = appConfig;
 
-  app.use(json({ limit: '50mb' }));
+  // ── FIX PHASE 39 — ORDRE DES MIDDLEWARES (cause de « aucun log correspondant ») ──
+  // AVANT : app.use(json()) était monté AVANT requestLogger.
+  //   Conséquence vérifiée en production : quand le corps JSON est illisible ou
+  //   dépasse la limite, body-parser lève AVANT que requestLogger n'ait tourné.
+  //   → aucun `x-request-id` n'est écho dans la réponse,
+  //   → aucune ligne « → POST /api/convert » n'est journalisée,
+  //   → le Backend envoie pourtant un X-Request-Id : la requête devient
+  //     INCORRÉLABLE entre les deux services. C'est exactement le symptôme
+  //     « HTTP 4xx/429 sans aucun log correspondant dans les Runtime Logs ».
+  // APRÈS : requestLogger tourne en TOUT premier. Chaque requête entrante est
+  //   journalisée et son identifiant est écho, même si le parsing du corps échoue.
   app.use((req, res, next) => requestLogger(req, res, next));
+  app.use(json({ limit: '50mb' }));
 
   // Route racine — pour le health check rapide et le monitoring
   app.get('/', (_req, res) => {

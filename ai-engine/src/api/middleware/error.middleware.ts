@@ -65,6 +65,35 @@ export function errorHandler(
   const statusCode = err.statusCode ?? 500;
   const isOperational = err.isOperational ?? false;
 
+  // ── FIX PHASE 39 — identifier les rejets issus du parsing du corps ──────────
+  // body-parser (express.json) lève avec un `type` précis. Sans cette branche,
+  // un corps illisible / tronqué / trop lourd remontait comme un INTERNAL_ERROR
+  // générique, impossible à distinguer d'un vrai 500 dans les Runtime Logs.
+  // Aucun contenu du corps n'est journalisé (sécurité) : seulement le type,
+  // la taille déclarée et l'identifiant de requête corrélé.
+  const parserType = (err as unknown as { type?: string }).type;
+  const isBodyParserError =
+    parserType === 'entity.parse.failed' ||
+    parserType === 'entity.too.large' ||
+    parserType === 'entity.verify.failed' ||
+    parserType === 'request.aborted' ||
+    parserType === 'request.size.did.not.match.content.length';
+
+  if (isBodyParserError) {
+    logger.warn(
+      {
+        requestId:    (req as Request & { id?: string }).id,
+        method:       req.method,
+        url:          req.url,
+        statusCode,
+        parserType,
+        declaredSize: req.headers['content-length'],
+        // Volontairement AUCUN extrait du corps : peut contenir du code utilisateur.
+      },
+      `Corps de requête rejeté avant tout traitement (${parserType})`,
+    );
+  }
+
   // Log all errors
   if (statusCode >= 500) {
     logger.error(
