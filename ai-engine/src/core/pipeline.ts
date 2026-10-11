@@ -29,6 +29,13 @@ import type {
   IRSourceMetrics,
 } from '../models/ir.types';
 import { AIProvider, type AITier }  from './ai-provider';
+// FIX PHASE 40 — PROBLÈME A : vérification anticipée de la clé Groq
+import {
+  assertGroqKeyConfigured,
+  getGroqAuthFailure,
+  GroqAuthError,
+  buildGroqAuthMessage,
+} from './ai-provider';
 import { ASTAnalyzer }              from './ast-analyzer';
 import { ArchitectureDetector }     from './architecture-detector';
 import { IRGenerator }              from './ir-generator';
@@ -269,6 +276,27 @@ export class ConversionPipeline {
     const reporter = new ProgressReporter(ctx.progressUrl, ctx.jobId);
     // Compter les fichiers sources pour le total
     const sourceFileCount = (ctx.sourceCode.match(/\/\/\s*=+\s*FILE:/g) ?? []).length || 1;
+
+    // ── FIX PHASE 40 — PROBLÈME A : échec anticipé sur authentification Groq ──
+    // AVANT : une clé Groq invalide n'était découverte qu'au premier appel IA,
+    //   puis REJOUÉE sur chaque chunk (33 chunks = 33 échecs identiques), chacun
+    //   précédé d'une attente de rate-limit. Le job partait en échec après des
+    //   dizaines de minutes sans message exploitable.
+    // APRÈS : on vérifie la configuration AVANT toute phase, et on refuse de
+    //   démarrer si un 401 a déjà été observé pendant la vie du process.
+    //   La clé n'est ni lue ni journalisée — seulement sa présence.
+    if (tier === 'free-groq') {
+      const prior = getGroqAuthFailure();
+      if (prior) {
+        const message = buildGroqAuthMessage(prior.httpStatus);
+        console.error(
+          `[GROQ-AUTH-ABORT] jobId=${ctx.jobId} httpStatus=${prior.httpStatus} ` +
+          `reason=key_rejected_earlier_in_this_process action=PIPELINE_NOT_STARTED`,
+        );
+        throw new GroqAuthError(message, prior.httpStatus);
+      }
+      assertGroqKeyConfigured();
+    }
 
     // ── PHASE 25 Partie F : Métriques timing par phase ───────
     const phaseTimings: Record<string, number> = {};

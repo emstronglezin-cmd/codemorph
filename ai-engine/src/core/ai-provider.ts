@@ -25,6 +25,130 @@ import { appConfig } from '../config/app.config';
 import { generateTypeScriptFromDart } from './dart-transpiler';
 import { getJobLogger } from './structured-logger';
 
+// ============================================================
+// FIX PHASE 40 — PROBLÈME A : authentification Groq (401)
+// ------------------------------------------------------------
+// CONSTAT (lecture du code, ai-provider.ts avant correction) :
+//   Dans groqChat(), la seule erreur spéciale était le 429, détecté par
+//   correspondance de sous-chaîne sur le message. Toute autre erreur — dont le
+//   401 « Invalid API Key » — tombait dans la branche `else` et faisait
+//   simplement `throw err`. Résultat :
+//     • le 401 n'était JAMAIS distingué d'une erreur transitoire ;
+//     • chaque chunk refaisait un appel complet avec la même clé invalide ;
+//     • chaque appel passait D'ABORD par le rate-limiter (attente min 8 s,
+//       puis attente de reset de fenêtre TPM) avant d'échouer ;
+//     • l'échec facturait des tokens fantômes au budget TPM (voir PHASE 40 B),
+//       ce qui ralentissait encore les chunks suivants.
+//   Avec 33 chunks, une clé invalide coûtait donc des dizaines de minutes
+//   d'attentes pour 33 échecs identiques.
+//
+// CORRECTION :
+//   • détection STRUCTURELLE du 401/403 via `err.status` (le SDK OpenAI le
+//     pose), avec repli sur le message ;
+//   • verrou global : dès le premier 401, plus aucun appel Groq n'est émis.
+//     Les chunks suivants échouent immédiatement, sans appel HTTP ni attente
+//     de rate-limit ;
+//   • message d'erreur explicite nommant la variable d'environnement attendue
+//     (GROQ_API_KEY) et l'action à faire ;
+//   • la clé n'est JAMAIS journalisée, ni en clair ni tronquée.
+//
+// IMPORTANT : un 401 est une erreur PERMANENTE pour ce process. Un 429 reste
+// transitoire et continue d'être absorbé par le backoff existant. Les deux ne
+// doivent pas être confondus — c'était le cœur du bug.
+// ============================================================
+
+/** Erreur d'authentification Groq : permanente, non réessayable. */
+export class GroqAuthError extends Error {
+  readonly isGroqAuthError = true as const;
+  readonly httpStatus: number;
+
+  constructor(message: string, httpStatus = 401) {
+    super(message);
+    this.name = 'GroqAuthError';
+    this.httpStatus = httpStatus;
+  }
+}
+
+/** Vrai si l'erreur est une erreur d'authentification (401/403). */
+export function isGroqAuthError(err: unknown): boolean {
+  if (err instanceof GroqAuthError) return true;
+  // Le SDK OpenAI expose `status` sur ses APIError — source fiable, préférée
+  // à toute correspondance de chaîne.
+  const status = (err as { status?: unknown } | null)?.status;
+  if (status === 401 || status === 403) return true;
+  const msg = (err instanceof Error ? err.message : String(err ?? '')).toLowerCase();
+  // Repli texte : utile quand l'erreur a été re-wrappée et a perdu `status`.
+  return (
+    /\b401\b/.test(msg) ||
+    /\b403\b/.test(msg) ||
+    msg.includes('invalid api key') ||
+    msg.includes('incorrect api key') ||
+    msg.includes('invalid_api_key') ||
+    msg.includes('authentication_error') ||
+    msg.includes('unauthorized')
+  );
+}
+
+/**
+ * Verrou global d'authentification Groq.
+ * Dès qu'un 401 est observé, tous les appels suivants échouent immédiatement.
+ * Volontairement jamais réinitialisé pendant la vie du process : la clé ne
+ * change pas à chaud, et un reset automatique relancerait exactement le
+ * comportement qu'on corrige.
+ */
+let groqAuthFailure: { at: number; httpStatus: number } | null = null;
+
+/** État du verrou d'authentification (pour tests et logs). */
+export function getGroqAuthFailure(): { at: number; httpStatus: number } | null {
+  return groqAuthFailure;
+}
+
+/** Réinitialise le verrou — usage TEST uniquement. */
+export function resetGroqAuthFailureForTests(): void {
+  groqAuthFailure = null;
+}
+
+/** Nom exact de la variable d'environnement attendue (source unique). */
+export const GROQ_API_KEY_ENV = 'GROQ_API_KEY';
+
+/**
+ * Vérifie la présence de la clé AVANT de démarrer un pipeline.
+ * Ne lit ni ne journalise la valeur : uniquement sa présence et sa forme.
+ * Une clé absente/vide est une erreur permanente explicite, pas un 401 à
+ * découvrir après 8 s d'attente de rate-limit.
+ */
+export function assertGroqKeyConfigured(): void {
+  const raw = process.env[GROQ_API_KEY_ENV];
+  if (raw === undefined || raw.trim() === '') {
+    throw new GroqAuthError(
+      `Configuration Groq manquante : la variable d'environnement ${GROQ_API_KEY_ENV} est absente ou vide. ` +
+      `Définissez-la dans Render → Service codemorph-ai → Environment (valeur depuis console.groq.com), ` +
+      `puis redémarrez le service. Aucun appel Groq n'a été émis.`,
+      401,
+    );
+  }
+  // Avertissement de forme uniquement — jamais la valeur.
+  // Les clés Groq commencent par "gsk_" (voir .env.example et docs/GROQ_SETUP.md).
+  if (!raw.trim().startsWith('gsk_')) {
+    console.warn(
+      `[GROQ-AUTH-WARN] ${GROQ_API_KEY_ENV} est définie mais ne commence pas par "gsk_" ` +
+      `(préfixe attendu d'après docs/GROQ_SETUP.md). Vérifiez qu'il s'agit bien d'une clé Groq ` +
+      `et non d'une clé d'un autre fournisseur. La valeur n'est pas journalisée.`,
+    );
+  }
+}
+
+/** Message d'erreur standard pour un 401 Groq — sans jamais inclure la clé. */
+export function buildGroqAuthMessage(httpStatus: number): string {
+  return (
+    `Groq a refusé l'authentification (HTTP ${httpStatus}) : la clé ${GROQ_API_KEY_ENV} est ` +
+    `invalide, révoquée ou expirée. Ce n'est PAS une limite de débit — réessayer ne changera rien. ` +
+    `Action : régénérer une clé sur console.groq.com, mettre à jour ${GROQ_API_KEY_ENV} dans ` +
+    `Render → Service codemorph-ai → Environment, puis redéployer. ` +
+    `Les appels Groq suivants sont court-circuités pour ne pas gaspiller de temps.`
+  );
+}
+
 // ── Rate Limiter global Groq — Token-Bucket TPM-aware (PHASE 28 PERF FIX) ────
 //
 // PROBLÈME PRÉCÉDENT : mutex séquentiel 35s fixe → 100 appels × 35s = 58min d'attente pure
@@ -41,7 +165,9 @@ import { getJobLogger } from './structured-logger';
 //   AI_MIN_INTERVAL_MS         (défaut 8000 — délai minimal entre requêtes)
 //   AI_PROVIDER_MAX_CONCURRENT (défaut 3 — requêtes simultanées max)
 //
-class GroqRateLimiter {
+// Exportée pour les tests : la comptabilité des tokens est le cœur du
+// problème B, elle doit être vérifiable unitairement.
+export class GroqRateLimiter {
   // ── Token-bucket state ─────────────────────────────────────────────────────
   private windowStart      = 0;
   private tokensUsedInWindow = 0;
@@ -55,7 +181,14 @@ class GroqRateLimiter {
   // Fenêtre TPM en millisecondes (1 minute)
   private readonly WINDOW_MS       = 60_000;
 
-  private lastRequestEndTime = 0;
+  // FIX PHASE 40 — PROBLÈME B : paceur réel.
+  // AVANT : `lastRequestEndTime` n'était mis à jour qu'à la LIBÉRATION du slot,
+  //   et le test `sinceLastMs < MIN_INTERVAL_MS` était fait APRÈS l'acquisition
+  //   du sémaphore. Plusieurs requêtes arrivant ensemble lisaient donc la même
+  //   valeur, dormaient la même durée, puis partaient ENSEMBLE : le délai
+  //   minimal ne cadence rien, il retarde seulement un paquet.
+  // APRÈS : le prochain créneau est réservé de façon atomique à l'acquisition.
+  private nextSlotAt = 0;
 
   // ── Semaphore : max N requêtes en vol simultané ────────────────────────────
   private readonly MAX_CONCURRENT = GroqRateLimiter.envInt('AI_PROVIDER_MAX_CONCURRENT', 3, 1, 16);
@@ -66,6 +199,12 @@ class GroqRateLimiter {
   totalRequestsSent  = 0;
   totalWaitMs        = 0;
   totalThrottledCount = 0;
+  // FIX PHASE 40 — appels échoués (aucun token réellement consommé).
+  // Séparé des requêtes envoyées : un échec ne doit pas être confondu avec une
+  // consommation de quota.
+  totalFailedRequests = 0;
+  // Tokens facturés à tort par l'ancien code (compteur de diagnostic).
+  phantomTokensAvoided = 0;
 
   static envInt(key: string, defaultValue: number, min: number, max: number): number {
     const raw = process.env[key];
@@ -92,24 +231,46 @@ class GroqRateLimiter {
     return Math.ceil((chars / 4) * 1.08); // conservateur (sur-estime légèrement)
   }
 
-  async acquire(estimatedTokens?: number): Promise<(tokensUsed?: number) => void> {
+  /**
+   * Réserve un créneau d'envoi.
+   * @returns release(tokensUsed?, outcome?) — DOIT être appelé dans un finally.
+   *   outcome='failed' signifie qu'aucun token n'a été consommé chez le
+   *   fournisseur (401, 429 refusé, erreur réseau) : rien n'est alors facturé
+   *   au budget TPM.
+   */
+  async acquire(
+    estimatedTokens?: number,
+  ): Promise<(tokensUsed?: number, outcome?: 'success' | 'failed') => void> {
     const waitStart = Date.now();
     // PHASE 36: projection TPM basée sur la taille réelle (input estimé + output)
     const projectedPerReq = Math.max(estimatedTokens ?? 0, this.TOKENS_PER_REQ);
 
     // ── 1. Semaphore : attendre un slot concurrent libre ─────────────────────
+    // FIX PHASE 40 — même race de sur-admission que celle corrigée côté Backend
+    // (phase 39) : l'ancienne version décrémentait `inflight` puis réveillait un
+    // waiter en microtâche. Un appel arrivant dans cette fenêtre était admis,
+    // puis le waiter incrémentait à son tour → MAX_CONCURRENT dépassé.
+    // Le slot est maintenant TRANSFÉRÉ sans jamais être décrémenté.
     if (this.inflight >= this.MAX_CONCURRENT) {
       await new Promise<void>((resolve) => this.waitQueue.push(resolve));
+    } else {
+      this.inflight++;
     }
-    this.inflight++;
 
-    // ── 2. Délai minimal entre requêtes (éviter burst immédiat) ──────────────
-    const sinceLastMs = Date.now() - this.lastRequestEndTime;
-    if (this.lastRequestEndTime > 0 && sinceLastMs < this.MIN_INTERVAL_MS) {
-      const intervalWait = this.MIN_INTERVAL_MS - sinceLastMs;
-      console.log(`[GroqRateLimiter] ⏳ Interval wait ${(intervalWait / 1000).toFixed(1)}s (min ${this.MIN_INTERVAL_MS / 1000}s between requests)`);
-      this.totalThrottledCount++;
-      await new Promise((r) => setTimeout(r, intervalWait));
+    // ── 2. Délai minimal entre requêtes — VRAI paceur ────────────────────────
+    // FIX PHASE 40 — PROBLÈME B : réservation atomique du prochain créneau.
+    // Une seule requête à la fois peut lire/écrire `nextSlotAt`, donc les départs
+    // sont réellement espacés de MIN_INTERVAL_MS au lieu de partir en paquet.
+    {
+      const nowMs       = Date.now();
+      const scheduledAt = Math.max(nowMs, this.nextSlotAt);
+      this.nextSlotAt   = scheduledAt + this.MIN_INTERVAL_MS;
+      const intervalWait = scheduledAt - nowMs;
+      if (intervalWait > 0) {
+        console.log(`[GroqRateLimiter] ⏳ Interval wait ${(intervalWait / 1000).toFixed(1)}s (min ${this.MIN_INTERVAL_MS / 1000}s between requests)`);
+        this.totalThrottledCount++;
+        await new Promise((r) => setTimeout(r, intervalWait));
+      }
     }
 
     // ── 3. Token-bucket : attendre si la requête dépasserait la limite TPM ────
@@ -148,18 +309,40 @@ class GroqRateLimiter {
     }
 
     // ── Retourner release() que l'appelant DOIT appeler dans finally ──────────
-    return (tokensUsed?: number) => {
-      this.lastRequestEndTime = Date.now();
-      this.inflight           = Math.max(0, this.inflight - 1);
+    return (tokensUsed?: number, outcome: 'success' | 'failed' = 'success') => {
+      // FIX PHASE 40 — PROBLÈME B : les appels ÉCHOUÉS n'étaient pas
+      // comptabilisés correctement. `tokensUsed` valait 0 sur un échec, donc le
+      // code tombait dans la branche `else` et facturait `projectedPerReq` au
+      // budget TPM — alors que le fournisseur n'avait consommé AUCUN token.
+      //
+      // Conséquence mesurée sur le cas rapporté : chaque 401 remplissait la
+      // fenêtre TPM de tokens fantômes. Avec une limite à 7 000 TPM et une
+      // projection d'environ 4 400 tokens par requête, un seul échec suffisait
+      // pour que la requête suivante attende le reset complet de la fenêtre
+      // (~54 s) EN PLUS du délai minimal de 8 s. C'est exactement la latence
+      // décrite dans les logs.
+      //
+      // APRÈS : un échec ne facture rien. La protection TPM reste intégralement
+      // appliquée aux appels qui ont réellement consommé des tokens.
+      const next = this.waitQueue.shift();
+      if (outcome === 'failed') {
+        this.totalFailedRequests++;
+        this.phantomTokensAvoided += projectedPerReq;
+        if (next) { next(); return; }        // transfert de slot, pas de décrément
+        this.inflight = Math.max(0, this.inflight - 1);
+        return;
+      }
+
       if (tokensUsed && tokensUsed > 0) {
         this.recordTokens(tokensUsed);
       } else {
-        // Estimation si tokens réels non fournis
+        // Succès sans usage rapporté → on reste conservateur.
         this.recordTokens(projectedPerReq);
       }
-      // Débloquer le prochain waiter du semaphore
-      const next = this.waitQueue.shift();
-      if (next) next();
+
+      // Débloquer le prochain waiter du semaphore (transfert, pas de décrément)
+      if (next) { next(); return; }
+      this.inflight = Math.max(0, this.inflight - 1);
     };
   }
 }
@@ -1354,6 +1537,24 @@ export class AIProvider {
   }
 
   private async groqChat(messages: ChatMessage[], maxTokens: number, jobId?: string): Promise<AIResponse> {
+    const jlog = jobId ? getJobLogger(jobId) : undefined;
+
+    // ── FIX PHASE 40 — PROBLÈME A : court-circuit d'authentification ─────────
+    // Vérifié AVANT toute attente de rate-limit et avant tout appel HTTP :
+    // si la clé a déjà été refusée, réessayer est inutile et coûteux.
+    if (groqAuthFailure) {
+      const ageSec = Math.round((Date.now() - groqAuthFailure.at) / 1000);
+      console.warn(
+        `[GROQ-AUTH-SKIPPED] provider=groq httpStatus=${groqAuthFailure.httpStatus} ` +
+        `reason=key_already_rejected firstFailureAgeSec=${ageSec} ` +
+        `action=SHORT_CIRCUIT_no_http_call_no_ratelimit_wait`,
+      );
+      throw new GroqAuthError(buildGroqAuthMessage(groqAuthFailure.httpStatus), groqAuthFailure.httpStatus);
+    }
+    // Clé absente/vide → échec immédiat et explicite (pas de 401 à découvrir
+    // après 8 s d'attente de rate-limit). Ne lit ni ne journalise la valeur.
+    assertGroqKeyConfigured();
+
     // Groq free tier = 8000 TPM — cap max_tokens pour rester dans les limites
     // openai/gpt-oss-120b = primary, openai/gpt-oss-20b = fallback si 429
     const GROQ_MAX_TOKENS = Math.min(maxTokens, 2800);
@@ -1364,13 +1565,11 @@ export class AIProvider {
     // pour ne pas bloquer le pipeline. Le retry sur 429 gère les cas temporaires.
     const GROQ_HTTP_TIMEOUT_MS = 90_000; // 90s max par appel Groq
     const client = new OpenAI({
-      apiKey:   process.env['GROQ_API_KEY']!,
+      apiKey:   process.env[GROQ_API_KEY_ENV]!,
       baseURL:  'https://api.groq.com/openai/v1',
       timeout:  GROQ_HTTP_TIMEOUT_MS,
       maxRetries: 0, // on gère le retry nous-mêmes pour contrôler le comportement 429
     });
-
-    const jlog = jobId ? getJobLogger(jobId) : undefined;
 
     // ── Rate limiting global (token-bucket + semaphore) ───────────────────────
     // PHASE 36: projection TPM = tokens input estimés du prompt + output demandé
@@ -1382,7 +1581,7 @@ export class AIProvider {
     const release = await groqRateLimiter.acquire(projectedTokens);
     const waitedMs = Date.now() - waitStart;
     if (waitedMs > 500) {
-      jlog?.aiRateLimit(waitedMs, `semaphore/TPM wait (inflight=${groqRateLimiter.inflight}/${3}, sent=${groqRateLimiter.totalRequestsSent})`);
+      jlog?.aiRateLimit(waitedMs, `semaphore/TPM wait (inflight=${groqRateLimiter.inflight}/${groqRateLimiter['MAX_CONCURRENT']}, sent=${groqRateLimiter.totalRequestsSent})`);
     }
 
     // FIX PHASE 35 — Cascade de modèles Groq :
@@ -1391,6 +1590,10 @@ export class AIProvider {
     const GROQ_MODELS = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b', 'llama-3.1-8b-instant'];
     let lastError: Error | null = null;
     let tokensUsed = 0;
+    // FIX PHASE 40 — PROBLÈME B : distingue un appel qui a réellement produit
+    // une complétion d'un appel rejeté (401 / 429 / réseau). Seul le premier a
+    // consommé des tokens chez le fournisseur.
+    let callSucceeded = false;
     const callStart = Date.now();
 
     try {
@@ -1418,6 +1621,7 @@ export class AIProvider {
             }
             jlog?.aiCallEnd({ provider: 'groq', model: modelId, phase: 'ai_call', durationMs, tokensUsed, success: true });
             console.log(`[AIProvider] Groq ✅ ${modelId} — ${tokensUsed} tokens | ${durationMs}ms | inflight=${groqRateLimiter.inflight} sent=${groqRateLimiter.totalRequestsSent} | waited=${waitedMs}ms`);
+            callSucceeded = true;
             return {
               content:    rawContent,
               tokensUsed,
@@ -1426,7 +1630,36 @@ export class AIProvider {
             };
           } catch (err: unknown) {
             const msg = err instanceof Error ? err.message : String(err);
-            const is429 = msg.includes('429') || msg.includes('rate limit') || msg.includes('Rate limit');
+
+            // ── FIX PHASE 40 — PROBLÈME A : 401/403 = PERMANENT, on arrête ──
+            // Testé AVANT le 429 : une erreur d'authentification ne doit jamais
+            // être confondue avec une limite de débit. On pose le verrou global,
+            // donc aucun chunk suivant ne refera d'appel avec cette clé.
+            // La clé n'est jamais journalisée.
+            if (isGroqAuthError(err)) {
+              const httpStatus = (err as { status?: number })?.status === 403 ? 403 : 401;
+              groqAuthFailure = { at: Date.now(), httpStatus };
+              jlog?.aiCallEnd({
+                provider: 'groq', model: modelId, phase: 'ai_call',
+                durationMs: Date.now() - callStart, tokensUsed: 0, success: false,
+                error: `authentication failed (HTTP ${httpStatus})`,
+              });
+              console.error(
+                `[GROQ-AUTH-FAILED] provider=groq model=${modelId} ` +
+                `httpStatus=${httpStatus} errorType=auth-invalid-key ` +
+                `retryable=false envVar=${GROQ_API_KEY_ENV} ` +
+                `durationMs=${Date.now() - callStart} ` +
+                `totalRequestsSent=${groqRateLimiter.totalRequestsSent} ` +
+                `action=LATCH_SET_short_circuit_all_further_groq_calls`,
+              );
+              throw new GroqAuthError(buildGroqAuthMessage(httpStatus), httpStatus);
+            }
+
+            // FIX PHASE 40 — détection STRUCTURELLE du 429 (err.status posé par
+            // le SDK), avec repli texte pour les erreurs re-wrappées.
+            const status = (err as { status?: unknown } | null)?.status;
+            const is429 = status === 429
+              || msg.includes('429') || msg.includes('rate limit') || msg.includes('Rate limit');
             if (is429) {
               // Extraire le délai Retry-After suggéré par l'API Groq — respecter exactement
               const retryMatch = msg.match(/(\d+(?:\.\d+)?)s/);
@@ -1473,8 +1706,13 @@ export class AIProvider {
         }
       }
     } finally {
-      // Libérer le slot avec tokens réels pour ajuster le token-bucket précisément
-      release(tokensUsed);
+      // FIX PHASE 40 — libérer le slot en précisant l'issue.
+      // Un appel rejeté (401 / 429 / réseau) n'a consommé AUCUN token chez le
+      // fournisseur : il ne doit donc rien coûter au budget TPM. L'ancien code
+      // facturait ici `projectedPerReq` (~4 400 tokens) à chaque échec, ce qui
+      // saturait la fenêtre et imposait un reset complet (~54 s) à l'appel
+      // suivant, en plus du délai minimal de 8 s.
+      release(tokensUsed, callSucceeded ? 'success' : 'failed');
     }
 
     // Tous les modèles ont échoué après cascade complète

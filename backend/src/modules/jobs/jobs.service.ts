@@ -580,10 +580,21 @@ export class JobsService implements OnModuleInit {
     const job  = await this.findById(id);
     const logs = job.phaseLogs ?? [];
     logs.push({ phase, status: logStatus, message, timestamp: new Date().toISOString() });
+    // FIX PHASE 40 — PROBLÈME C : progression MONOTONE.
+    // AVANT : `progress` était écrasé par la valeur statique de la phase. Si
+    //   l'AI Engine avait déjà fait remonter 60 % puis qu'un appendLog pour
+    //   'ir-generation' passait, la barre REDESCENDAIT à 50 %. La progression
+    //   n'était donc pas cohérente dans les deux sens.
+    // APRÈS : on ne fait jamais reculer la barre, sauf pour les phases
+    //   terminales (done=100 / failed=0) dont la valeur a un sens propre.
+    const phaseProgress = this.calculateProgress(phase);
+    const progress = phase === 'done' || phase === 'failed'
+      ? phaseProgress
+      : Math.max(job.progress ?? 0, phaseProgress);
     await this.jobRepo.update(id, {
       phaseLogs:    logs,
       currentPhase: phase,
-      progress:     this.calculateProgress(phase),
+      progress,
     });
   }
 
@@ -726,11 +737,54 @@ export class JobsService implements OnModuleInit {
     // Get user plan for quota tracking
     const plan = await this.subscriptionSvc.getUserPlan(job.userId);
 
+    // ── FIX PHASE 40 — un « succès » sans fichier valide est un ÉCHEC ───────
+    // AVANT : `if (payload.success)` marquait DONE avec progress=100 même si
+    //   filesGenerated valait 0 ou undefined. L'utilisateur voyait « conversion
+    //   réussie » avec un ZIP vide et filesGenerated=0.
+    // APRÈS : on compte les fichiers RÉELLEMENT utilisables (chemin non vide ET
+    //   contenu non vide). S'il n'y en a aucun, le job passe en FAILED avec un
+    //   message explicite — jamais en DONE.
+    const validFiles = Array.isArray(resultFiles)
+      ? resultFiles.filter((f) => {
+        const file = f as { path?: unknown; content?: unknown };
+        return (
+          typeof file?.path === 'string' && file.path.trim().length > 0 &&
+          typeof file?.content === 'string' && file.content.trim().length > 0
+        );
+      })
+      : [];
+    const declaredFiles = payload.filesGenerated ?? validFiles.length;
+
+    if (payload.success && validFiles.length === 0) {
+      const reason =
+        `L'AI Engine a signalé un succès mais aucun fichier valide n'a été généré ` +
+        `(filesGenerated=${declaredFiles}, result.files=${resultFiles?.length ?? 0}, ` +
+        `fichiers avec chemin ET contenu non vides=0). ` +
+        `Conversion considérée comme échouée — rien à livrer.`;
+      this.logger.error(`[CALLBACK-PROCESSED] jobId=${id} → FAILED (succès sans fichier valide)`);
+      await this.updateStatus(id, JobStatus.FAILED, {
+        errorMessage: reason,
+        errorDetails: {
+          reason:          'success-without-valid-files',
+          declaredFiles,
+          resultFilesLen:  resultFiles?.length ?? 0,
+          validFilesLen:   0,
+          timestamp:       new Date().toISOString(),
+        },
+        filesGenerated: 0,
+        linesGenerated: 0,
+        progress:       0,
+      });
+      await this.appendLog(id, 'failed', 'failed', reason);
+      // Pas de incrément de quota : aucune conversion n'a été livrée.
+      return;
+    }
+
     if (payload.success) {
       await this.updateStatus(id, JobStatus.DONE, {
         result:         payload.result,
         irDocument:     payload.irDocument,
-        filesGenerated: payload.filesGenerated,
+        filesGenerated: declaredFiles,
         linesGenerated: payload.linesGenerated,
         progress:       100,
       });
@@ -756,6 +810,96 @@ export class JobsService implements OnModuleInit {
         `[CALLBACK-PROCESSED] jobId=${id} → FAILED error="${errorMsg}"`,
       );
     }
+  }
+
+  // ── FIX PHASE 40 — PROBLÈME C : progression réelle remontée par l'AI Engine ──
+  //
+  // CONSTAT : `dispatchToAiEngine()` construisait
+  //   progressUrl = `${apiUrl}/jobs/${job.id}/progress`
+  // mais AUCUNE route ne correspondait dans jobs.controller.ts. Chaque POST de
+  // l'AI Engine tombait en 404 — invisiblement, car ProgressReporter ne testait
+  // pas `res.ok`. La colonne `progress` restait donc à la valeur STATIQUE posée
+  // par appendLog(), soit calculateProgress('ir-generation') = 50, pendant toute
+  // la phase d'analyse. Symptôme exact : job `converting` figé à 50 % avec
+  // filesGenerated=0 alors que l'AI Engine annonçait 15/33 chunks.
+  //
+  // Cette méthode convertit la progression réelle de l'AI Engine en un
+  // pourcentage MONOTONE, borné à 99 % : seul le callback peut atteindre 100.
+  async handleProgress(
+    id:      string,
+    payload: {
+      phase?:      string;
+      phaseName?:  string;
+      filesDone?:  number;
+      filesTotal?: number;
+      aiCalls?:    number;
+      aiRetries?:  number;
+      elapsedMs?:  number;
+      message?:    string;
+    },
+  ): Promise<{ progress: number; phase: string }> {
+    const job = await this.findById(id);
+
+    // Un job terminal ne reçoit plus de progression (callback dupliqué/tardif).
+    if (job.status === JobStatus.DONE || job.status === JobStatus.FAILED) {
+      this.logger.warn(
+        `[PROGRESS-IGNORED] jobId=${id} — job terminal (status=${job.status}), ` +
+        `mise à jour de progression ignorée`,
+      );
+      return { progress: job.progress ?? 0, phase: job.currentPhase ?? payload.phase ?? '' };
+    }
+
+    const phase = payload.phase ?? job.currentPhase ?? '';
+    const band  = this.progressBandFor(phase);
+
+    // Interpolation dans la bande de la phase courante.
+    const done  = Math.max(0, Math.floor(payload.filesDone  ?? 0));
+    const total = Math.max(0, Math.floor(payload.filesTotal ?? 0));
+    const ratio = total > 0 ? Math.min(1, done / total) : 0;
+    const computed = Math.round(band.from + (band.to - band.from) * ratio);
+
+    // MONOTONE : la progression ne recule jamais. Un rapport tardif ou une
+    // phase qui se chevauche ne peut pas faire redescendre la barre.
+    // PLAFOND 99 : réserver 100 au callback de succès — annoncer 100 % avant
+    // d'avoir les fichiers générés serait mentir à l'utilisateur.
+    const progress = Math.min(99, Math.max(job.progress ?? 0, computed, band.from));
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await this.jobRepo.update(id, {
+      progress,
+      ...(phase ? { currentPhase: phase } : {}),
+    } as any);
+
+    this.logger.log(
+      `[PROGRESS-RECEIVED] jobId=${id} phase=${phase} ` +
+      `files=${done}/${total} progress=${progress}% ` +
+      `aiCalls=${payload.aiCalls ?? 0} aiRetries=${payload.aiRetries ?? 0} ` +
+      `elapsedMs=${payload.elapsedMs ?? 0}`,
+    );
+
+    return { progress, phase };
+  }
+
+  /**
+   * Bandes de progression par phase, cohérentes avec calculateProgress().
+   * Les noms de phase proviennent de l'AI Engine (ProgressReporter.report) :
+   * phase_1_ast, phase_2_arch, phase_3_ir, phase_5_planning — plus les noms
+   * historiques utilisés par appendLog().
+   */
+  private progressBandFor(phase: string): { from: number; to: number } {
+    const bands: Record<string, { from: number; to: number }> = {
+      'phase_1_ast':          { from: 15, to: 30 },
+      'ast-analysis':         { from: 15, to: 30 },
+      'phase_2_arch':         { from: 30, to: 50 },
+      'architecture-detection': { from: 30, to: 50 },
+      'phase_3_ir':           { from: 50, to: 65 },
+      'ir-generation':        { from: 50, to: 65 },
+      'mapping':              { from: 65, to: 80 },
+      'phase_5_planning':     { from: 80, to: 90 },
+      'code-planning':        { from: 80, to: 90 },
+      'validation':           { from: 90, to: 99 },
+    };
+    return bands[phase] ?? { from: 15, to: 99 };
   }
 
   // ── Reset ALL active jobs for user (sans restriction de temps) ───

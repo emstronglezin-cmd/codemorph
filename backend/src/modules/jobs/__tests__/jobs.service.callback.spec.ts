@@ -63,15 +63,68 @@ describe('JobsService.handleCallback — transitions cohérentes', () => {
       errorMessage: 'AI Engine unreachable (timeout)',
     });
 
+    // FIX PHASE 40 — payload corrigé : ce test porte sur la TRANSITION
+    // FAILED → DONE d'une livraison tardive. L'ancien payload déclarait
+    // `filesGenerated: 12` tout en livrant `result.files: []`, c'est-à-dire
+    // exactement l'état contradictoire que le garde-fou « succès sans fichier
+    // valide » doit désormais refuser. On lui donne de vrais fichiers pour
+    // tester ce qu'il est censé tester.
     await service.handleCallback('job-late', {
       success: true, filesGenerated: 12, linesGenerated: 900,
-      result: { files: [] }, irDocument: { version: '1.0' },
+      result: { files: [{ path: 'src/App.tsx', content: 'export default function App(){}' }] },
+      irDocument: { version: '1.0' },
     });
 
     expect(updateSpy).toHaveBeenCalled();
     const firstUpdate = updateSpy.mock.calls[0];
     expect(firstUpdate[0]).toBe('job-late');
     expect((firstUpdate[1] as { status: JobStatus }).status).toBe(JobStatus.DONE);
+  });
+
+  // ── FIX PHASE 40 — « N'annonce pas une conversion réussie si aucun fichier
+  //    valide n'a été généré » ──────────────────────────────────────────────
+  it('callback SUCCÈS avec result.files vide → FAILED, jamais DONE', async () => {
+    const { service, updateSpy } = makeService({
+      id: 'job-empty', userId: 'u1', status: JobStatus.CONVERTING,
+    });
+
+    await service.handleCallback('job-empty', {
+      success: true, filesGenerated: 0, linesGenerated: 0,
+      result: { files: [] },
+    });
+
+    expect(updateSpy).toHaveBeenCalled();
+    const firstUpdate = updateSpy.mock.calls[0];
+    expect((firstUpdate[1] as { status: JobStatus }).status).toBe(JobStatus.FAILED);
+    expect((firstUpdate[1] as { errorMessage?: string }).errorMessage)
+      .toContain('aucun fichier valide');
+  });
+
+  it('callback SUCCÈS qui déclare 12 fichiers mais livre des fichiers VIDES → FAILED', async () => {
+    const { service, updateSpy } = makeService({
+      id: 'job-hollow', userId: 'u1', status: JobStatus.CONVERTING,
+    });
+
+    await service.handleCallback('job-hollow', {
+      success: true, filesGenerated: 12, linesGenerated: 900,
+      // Chemins présents mais contenus vides : rien d'utilisable à livrer.
+      result: { files: [{ path: 'src/A.tsx', content: '' }, { path: '', content: 'x' }] },
+    });
+
+    const firstUpdate = updateSpy.mock.calls[0];
+    expect((firstUpdate[1] as { status: JobStatus }).status).toBe(JobStatus.FAILED);
+    expect((firstUpdate[1] as { filesGenerated?: number }).filesGenerated).toBe(0);
+  });
+
+  it('callback SUCCÈS sans champ result du tout → FAILED (pas de DONE fantôme)', async () => {
+    const { service, updateSpy } = makeService({
+      id: 'job-noresult', userId: 'u1', status: JobStatus.CONVERTING,
+    });
+
+    await service.handleCallback('job-noresult', { success: true, filesGenerated: 3 });
+
+    const firstUpdate = updateSpy.mock.calls[0];
+    expect((firstUpdate[1] as { status: JobStatus }).status).toBe(JobStatus.FAILED);
   });
 
   it('callback ÉCHEC sur un job CONVERTING → FAILED avec message du fournisseur préservé', async () => {

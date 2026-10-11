@@ -354,6 +354,60 @@ export class JobsController {
     }
   }
 
+  // ── FIX PHASE 40 — PROBLÈME C : route de progression (elle manquait) ──────
+  // `dispatchToAiEngine()` envoie `progressUrl = /jobs/:id/progress` à l'AI
+  // Engine depuis la phase 28, mais aucune route ne l'implémentait : chaque mise
+  // à jour tombait en 404, silencieusement. Le job restait figé à la valeur
+  // statique de calculateProgress(), soit 50 % pendant toute l'analyse.
+  //
+  // Même protection que le callback : @Public (l'AI Engine n'a pas de JWT) +
+  // secret partagé X-AI-Engine-Secret + @SkipThrottle (haute fréquence).
+  @SkipThrottle()
+  @Public()
+  @Post(':id/progress')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'AI Engine progress update (protected by X-AI-Engine-Secret)' })
+  async progress(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Req() req: Request,
+    @Body()
+    body: {
+      phase?:      string;
+      phaseName?:  string;
+      filesDone?:  number;
+      filesTotal?: number;
+      aiCalls?:    number;
+      aiRetries?:  number;
+      elapsedMs?:  number;
+      message?:    string;
+    },
+  ) {
+    // Même contrôle de secret que /:id/callback — cohérence de sécurité.
+    const expectedSecret = this.config.get<string>('AI_ENGINE_SECRET', '');
+    if (expectedSecret) {
+      const provided = req.headers['x-ai-engine-secret'] as string | undefined;
+      if (!provided || provided !== expectedSecret) {
+        this.logger.warn(
+          `[PROGRESS-REJECTED] jobId=${id} — invalid X-AI-Engine-Secret ` +
+          `(provided=${provided ? '(set but wrong)' : '(missing)'})`,
+        );
+        throw new UnauthorizedException('Invalid or missing X-AI-Engine-Secret header');
+      }
+    }
+
+    try {
+      const result = await this.jobsService.handleProgress(id, body);
+      return { ok: true, progress: result.progress, phase: result.phase };
+    } catch (err) {
+      // Une mise à jour de progression ne doit jamais casser le pipeline :
+      // on journalise et on répond 200 pour que l'AI Engine ne s'arrête pas.
+      this.logger.warn(
+        `[PROGRESS-FAILED] jobId=${id} — ${(err as Error).message}`,
+      );
+      return { ok: false, error: (err as Error).message };
+    }
+  }
+
   // ── Quick-start: from GitHub repo ─────────────────────
   // FIX PHASE 11 — BUG 2 (STEP logs) :
   // Chaque étape du flux est maintenant loggée avec un numéro de STEP

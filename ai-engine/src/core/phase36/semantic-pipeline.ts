@@ -189,7 +189,10 @@ export async function runSemanticPipeline(
     );
   }
 
-  let doneCount = total - pending.length;
+  // FIX PHASE 40 — PROBLÈME C : base = chunks déjà faits (cache/resume).
+  // Le compteur remonté est `doneFromCache + réussites`, jamais les échecs.
+  const doneFromCache = total - pending.length;
+  let lastReportedFailed = 0;
   const schedule = await runScheduled<ModuleIR>(
     pending.map((chunk) => ({
       id: chunk.id,
@@ -224,11 +227,29 @@ export async function runSemanticPipeline(
     })),
     {
       concurrency: cfg.maxConcurrentRequests,
-      onProgress: (_completed, totalTasks, lastId) => {
-        doneCount++;
-        opts.onProgress?.(doneCount, total, `Module analysis ${doneCount}/${total} (${lastId})`);
-        if (doneCount % 5 === 0 || doneCount === totalTasks) {
-          log(`[PHASE36] project=${ctx.projectId} progress=${doneCount}/${total} chunks analyzed`);
+      onProgress: (_completed, totalTasks, lastId, info) => {
+        // FIX PHASE 40 — PROBLÈME C : on remonte le nombre de chunks RÉELLEMENT
+        // analysés (cache/résumé + réussites), pas le nombre de tâches terminées.
+        // Un chunk dont l'appel IA a échoué (401 Groq, 429 épuisé, timeout)
+        // n'incrémente plus la progression.
+        const analyzed = doneFromCache + info.succeeded;
+        if (info.failed > lastReportedFailed) {
+          lastReportedFailed = info.failed;
+          log(
+            `[PHASE36] project=${ctx.projectId} chunk=${lastId} FAILED ` +
+            `(failed=${info.failed}/${totalTasks}) — progression NON incrémentée`,
+          );
+        }
+        opts.onProgress?.(
+          analyzed, total,
+          `Module analysis ${analyzed}/${total} analyzed` +
+          `${info.failed > 0 ? `, ${info.failed} failed` : ''} (last: ${lastId})`,
+        );
+        if (analyzed > 0 && (analyzed % 5 === 0 || _completed === totalTasks)) {
+          log(
+            `[PHASE36] project=${ctx.projectId} progress=${analyzed}/${total} chunks analyzed ` +
+            `(failed=${info.failed})`,
+          );
         }
       },
     },

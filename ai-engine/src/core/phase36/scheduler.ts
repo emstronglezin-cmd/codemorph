@@ -27,8 +27,19 @@ export interface ScheduledTask<T> {
 export interface ScheduleOptions {
   /** Concurrence max — défaut: AI_MAX_CONCURRENT_REQUESTS (1) */
   concurrency?: number;
-  /** Callback de progression après chaque tâche terminée */
-  onProgress?: (completed: number, total: number, lastId: string) => void;
+  /**
+   * Callback de progression après chaque tâche terminée.
+   * FIX PHASE 40 — PROBLÈME C : `completed` compte les tâches TERMINÉES
+   * (succès + échecs), comme avant. `succeeded` ne compte QUE les réussites.
+   * Toute barre de progression ou tout compteur « analysés » doit utiliser
+   * `succeeded` : un chunk dont l'appel IA a échoué n'est pas un chunk analysé.
+   */
+  onProgress?: (
+    completed: number,
+    total:     number,
+    lastId:    string,
+    info:      { succeeded: number; failed: number },
+  ) => void;
   /** Pacing local : si le budget tokens/minute est atteint, attendre la fenêtre suivante */
   rateLimitTpm?: number;
   /** Injecté pour les tests */
@@ -92,6 +103,14 @@ export async function runScheduled<T>(
 
   let nextIndex = 0;
   let completed = 0;
+  // FIX PHASE 40 — PROBLÈME C : compteurs séparés.
+  // AVANT : un seul compteur `completed` incrémenté dans tous les cas, y compris
+  //   quand `task.run()` levait. Le callback de progression annonçait donc
+  //   « N/M chunks analyzed » en comptant les chunks dont l'appel IA avait
+  //   ÉCHOUÉ. Avec des 401 Groq sur tous les chunks, la progression montait
+  //   jusqu'à 33/33 alors que rien n'avait été analysé.
+  let succeeded = 0;
+  let failed    = 0;
 
   const worker = async (): Promise<void> => {
     for (;;) {
@@ -109,11 +128,13 @@ export async function runScheduled<T>(
       try {
         const result = await task.run();
         results.set(task.id, result);
+        succeeded++;
       } catch (err) {
         errors.set(task.id, err instanceof Error ? err : new Error(String(err)));
+        failed++;
       }
       completed++;
-      options.onProgress?.(completed, tasks.length, task.id);
+      options.onProgress?.(completed, tasks.length, task.id, { succeeded, failed });
     }
   };
 

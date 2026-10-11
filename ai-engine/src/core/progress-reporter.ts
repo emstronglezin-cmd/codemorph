@@ -31,6 +31,9 @@ export class ProgressReporter {
   private aiRetriesCount = 0;
   private lastReportMs  = 0;
   private readonly MIN_INTERVAL_MS = 5_000; // max 1 rapport toutes les 5s
+  // FIX PHASE 40 — suivi des échecs de remise (borné : 1 log par code d'erreur)
+  private readonly failureCounts = new Map<number, number>();
+  private deliveryFailureLogged = false;
 
   constructor(progressUrl: string | undefined, jobId: string) {
     this.progressUrl = progressUrl;
@@ -120,15 +123,56 @@ export class ProgressReporter {
       const headers: Record<string, string> = { 'Content-Type': 'application/json' };
       if (aiEngineSecret) headers['X-AI-Engine-Secret'] = aiEngineSecret;
 
-      await fetch(this.progressUrl, {
+      const res = await fetch(this.progressUrl, {
         method:  'POST',
         headers,
         body:    JSON.stringify(update),
         signal:  ctrl.signal,
       });
       clearTimeout(timer);
-    } catch {
-      // Silencieux
+
+      // ── FIX PHASE 40 — PROBLÈME C : un échec HTTP n'était PAS détecté ──────
+      // AVANT : `await fetch(...)` sans jamais regarder `res.ok`. Le backend ne
+      //   déclarait AUCUNE route `POST /jobs/:id/progress` (seule l'URL était
+      //   construite dans jobs.service.ts) : chaque mise à jour tombait en 404
+      //   dans un silence total. C'est la raison pour laquelle le job restait
+      //   figé à la valeur statique de `calculateProgress('ir-generation')`,
+      //   soit 50 %, pendant que l'AI Engine annonçait 15/33 chunks.
+      // APRÈS : le statut est vérifié et journalisé. On borne le bruit à une
+      //   ligne par code d'erreur pour ne pas noyer les Runtime Logs.
+      if (!res.ok) {
+        this.noteDeliveryFailure(res.status);
+      } else if (this.deliveryFailureLogged) {
+        // La remise fonctionne de nouveau après un échec : le dire une fois.
+        console.log(`[ProgressReporter] delivery recovered (HTTP ${res.status})`);
+        this.deliveryFailureLogged = false;
+        this.failureCounts.clear();
+      }
+    } catch (err) {
+      // Erreur réseau / timeout : non bloquant, mais plus totalement muet.
+      this.noteDeliveryFailure(0, err instanceof Error ? err.message : 'network error');
     }
+  }
+
+  /** Journalise un échec de remise, au plus une fois par code d'erreur. */
+  private noteDeliveryFailure(status: number, detail?: string): void {
+    const count = (this.failureCounts.get(status) ?? 0) + 1;
+    this.failureCounts.set(status, count);
+    if (count > 1) return; // déjà signalé pour ce code
+
+    this.deliveryFailureLogged = true;
+    // Jamais de secret ici : uniquement statut, route et identifiant de job.
+    console.warn(
+      `[ProgressReporter] delivery FAILED jobId=${this.jobId} ` +
+      `httpStatus=${status === 0 ? 'network-error' : status} ` +
+      `target=${this.progressUrl} ${detail ? `detail=${detail.slice(0, 120)} ` : ''}` +
+      `hint=${
+        status === 404
+          ? 'le backend n expose pas cette route — verifier POST /jobs/:id/progress'
+          : status === 401 || status === 403
+            ? 'AI_ENGINE_SECRET different entre backend et AI Engine'
+            : 'verifier API_URL cote AI Engine'
+      }`,
+    );
   }
 }
