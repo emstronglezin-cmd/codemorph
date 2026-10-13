@@ -53,7 +53,13 @@ export interface SourceSnapshotCacheOptions {
   now?:          () => number;
 }
 
-/** TTL par défaut : 10 minutes (fenêtre de retry réelle ≈ 75 s). */
+/**
+ * TTL par défaut : 10 minutes.
+ * Couvre la fenêtre de retry réelle, y compris le pire cas : un réveil
+ * d'instance Render endormie impose un plancher de ~45 s par tentative
+ * (AI_ENGINE_HIBERNATION_WAIT_MS), soit ~180 s sur 5 tentatives — très en
+ * deçà de ce TTL.
+ */
 export const SOURCE_CACHE_TTL_MS = 10 * 60 * 1_000;
 
 /** Nombre max de jobs mis en cache simultanément. */

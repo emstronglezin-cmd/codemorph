@@ -52,12 +52,21 @@ healthRouter.get('/liveness', (_req: Request, res: Response): void => {
 });
 
 healthRouter.get('/readiness', (_req: Request, res: Response): void => {
-  const ready = !!process.env.OPENAI_API_KEY;
+  // ── FIX — readiness vérifiait uniquement OPENAI_API_KEY alors que le tier
+  // par défaut du pipeline tourne sur GROQ_API_KEY (app.config.ts / gate de tier
+  // dans ai-provider.ts). Un déploiement Render configuré avec la seule clé
+  // Groq — le cas documenté dans render.yaml — était donc déclaré « not-ready »
+  // (503) alors qu'il est parfaitement opérationnel. Si Render utilise cette
+  // route comme sonde de santé, l'instance est marquée indisponible à tort.
+  const hasGroq  = !!process.env['GROQ_API_KEY'];
+  const hasOpenAI = !!process.env['OPENAI_API_KEY'];
+  const ready = hasGroq || hasOpenAI;
   res.status(ready ? 200 : 503).json({
     status: ready ? 'ready' : 'not-ready',
     timestamp: new Date().toISOString(),
     checks: {
-      openai: ready ? 'ok' : 'missing-api-key',
+      groq:   hasGroq   ? 'ok' : 'missing-api-key',
+      openai: hasOpenAI ? 'ok' : 'missing-api-key',
     },
   });
 });

@@ -26,6 +26,14 @@ export interface RetryableErrorOptions {
   httpStatus?: number;
   /** Délai annoncé par le serveur (header Retry-After), en ms */
   retryAfterMs?: number;
+  /**
+   * PLANCHER de délai avant la prochaine tentative, en ms.
+   * Utilisé quand le serveur n'envoie PAS de Retry-After mais que l'on connaît
+   * une durée physique minimale à attendre (ex: réveil d'une instance Render
+   * free tier endormie, ~1 minute selon la documentation Render).
+   * Ce n'est pas un contournement de limite : c'est un allongement de l'attente.
+   */
+  minDelayMs?: number;
   /** Identifiant de requête corrélé (X-Request-Id), pour traces safe */
   requestId?: string;
   /** Nom du composant/provider à l'origine de l'erreur (jamais de secret) */
@@ -43,6 +51,7 @@ export class RetryableError extends Error {
   readonly kind: RetryableErrorKind;
   readonly httpStatus?: number;
   readonly retryAfterMs?: number;
+  readonly minDelayMs?: number;
   readonly requestId?: string;
   readonly provider?: string;
 
@@ -52,6 +61,7 @@ export class RetryableError extends Error {
     this.kind = options.kind ?? 'unknown';
     this.httpStatus = options.httpStatus;
     this.retryAfterMs = options.retryAfterMs;
+    this.minDelayMs = options.minDelayMs;
     this.requestId = options.requestId;
     this.provider = options.provider;
     if (cause) {
@@ -76,6 +86,12 @@ export function isNonRetryableError(err: unknown): boolean {
     ((err as { name?: string }).name === 'NonRetryableError' ||
       (err as { nonRetryable?: boolean }).nonRetryable === true)
   );
+}
+
+/** Extrait minDelayMs d'une erreur quelconque (undefined si absent/invalide). */
+export function minDelayMsOf(err: unknown): number | undefined {
+  const v = (err as { minDelayMs?: unknown } | null)?.minDelayMs;
+  return typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : undefined;
 }
 
 /** Extrait retryAfterMs d'une erreur quelconque (undefined si absent/invalide). */

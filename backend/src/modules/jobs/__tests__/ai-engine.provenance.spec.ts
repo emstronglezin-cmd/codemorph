@@ -119,7 +119,7 @@ describe('classifyRateLimitProvenance — déduction depuis les en-têtes réels
     const prov = classifyRateLimitProvenance(ORIGIN_HEADERS);
     expect(prov.provenance).toBe('origin');
     expect(prov.provider).toBe('ai-engine-origin');
-    expect(prov.hints).toContain('originMarkers=');
+    expect(prov.hints).toContain('appMarkers=');
     expect(prov.hints).toContain('rndrId=');
     expect(prov.hints).toContain('renderOrigin=Render');
   });
@@ -129,7 +129,8 @@ describe('classifyRateLimitProvenance — déduction depuis les en-têtes réels
     const prov = classifyRateLimitProvenance(EDGE_ONLY_HEADERS);
     expect(prov.provenance).toBe('edge');
     expect(prov.provider).toBe('edge-or-proxy');
-    expect(prov.hints).toContain('originMarkers=none');
+    expect(prov.hints).toContain('appMarkers=none');
+    expect(prov.hints).toContain('platformMarkers=none');
   });
 
   it('`server: cloudflare` n\'est JAMAIS traité comme un marqueur d\'origine', () => {
@@ -149,16 +150,32 @@ describe('classifyRateLimitProvenance — déduction depuis les en-têtes réels
   });
 
   it('accepte des en-têtes en casse mixte (AxiosHeaders normalise, mais pas toujours)', () => {
+    // ── CORRIGÉ : l'ancien test n'envoyait QUE `X-Render-Origin-Server`, un
+    // en-tête de la PLATEFORME Render. Il attendait `origin`, ce qui est
+    // exactement l'hypothèse fausse réfutée par le 429 de production
+    // (x-render-routing=hibernate-rate-limited + rndr-id, application endormie).
+    // La casse mixte est maintenant vérifiée sur un marqueur APPLICATIF.
     const prov = classifyRateLimitProvenance({
-      'Server':                 'cloudflare',
-      'X-Render-Origin-Server': 'Render',
+      'Server':       'cloudflare',
+      'X-Powered-By': 'Express',
     });
     expect(prov.provenance).toBe('origin');
   });
 
-  it('chaque marqueur d\'origine suffit isolément à prouver l\'origine', () => {
-    for (const header of ['rndr-id', 'x-render-origin-server', 'x-render-routing', 'x-powered-by', 'x-request-id']) {
+  it('chaque marqueur APPLICATIF suffit isolément à prouver l\'origine', () => {
+    for (const header of ['x-powered-by', 'x-request-id']) {
       expect(classifyRateLimitProvenance({ [header]: 'x' }).provenance).toBe('origin');
+    }
+  });
+
+  // ── CORRECTION DU CLASSIFICATEUR DE PHASE 39 ──────────────────────────────
+  // Les en-têtes Render prouvent que Render a traité la requête, PAS que le
+  // process Node a tourné : Render les pose aussi sur ses propres rejets.
+  it('un marqueur de PLATEFORME Render seul ne prouve PAS l\'origine applicative', () => {
+    for (const header of ['rndr-id', 'x-render-origin-server', 'x-render-routing']) {
+      const prov = classifyRateLimitProvenance({ [header]: 'x' });
+      expect(prov.provenance).toBe('render-platform');
+      expect(prov.provider).toBe('render-platform');
     }
   });
 

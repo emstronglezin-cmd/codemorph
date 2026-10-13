@@ -19,7 +19,7 @@
 //   CONVERSION_RETRY_MAX_DELAY_MS   défaut 120000  plafond backoff (2 min)
 //   CONVERSION_RETRY_AFTER_CAP_MS   défaut 120000  plafond Retry-After (2 min)
 // ============================================================
-import { retryAfterMsOf } from './retryable.error';
+import { minDelayMsOf, retryAfterMsOf } from './retryable.error';
 
 export function envInt(key: string, defaultValue: number, min: number, max: number): number {
   const raw = process.env[key];
@@ -85,10 +85,15 @@ export function computeRetryDelayMs(err: unknown, attemptsMade: number, opts: Re
   const raCap  = opts.retryAfterCapMs ?? envInt('CONVERSION_RETRY_AFTER_CAP_MS', 120_000, 1_000, 3_600_000);
   const random = opts.randomFn ?? Math.random;
 
+  // 0. PLANCHER physique porté par l'erreur (ex: réveil d'instance endormie).
+  //    Appliqué en DERNIER via Math.max : il ne peut qu'ALLONGER l'attente,
+  //    jamais la raccourcir — aucune limite n'est contournée.
+  const floorMs = minDelayMsOf(err);
+
   // 1. Retry-After fourni par le serveur → respecté (plafonné)
   const retryAfterMs = retryAfterMsOf(err);
   if (retryAfterMs !== undefined) {
-    return Math.max(0, Math.min(retryAfterMs + 1_000, raCap));
+    return Math.max(floorMs ?? 0, Math.min(retryAfterMs + 1_000, raCap));
   }
 
   // 2. Backoff exponentiel + jitter ±25%
@@ -96,7 +101,7 @@ export function computeRetryDelayMs(err: unknown, attemptsMade: number, opts: Re
   const exponential = base * Math.pow(2, attempt - 1);
   const capped = Math.min(exponential, max);
   const jittered = capped * (0.75 + random() * 0.5);
-  return Math.round(Math.min(jittered, max));
+  return Math.round(Math.max(floorMs ?? 0, Math.min(jittered, max)));
 }
 
 /**

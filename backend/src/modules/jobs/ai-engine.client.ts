@@ -21,7 +21,7 @@ import { randomUUID } from 'crypto';
 
 import { RetryableError }        from '../../queue/retryable.error';
 import { NonRetryableError }     from '../../queue/non-retryable.error';
-import { parseRetryAfterHeader } from '../../queue/retry-delay';
+import { envInt, parseRetryAfterHeader } from '../../queue/retry-delay';
 
 export interface AiConvertRequest {
   jobId:          string;
@@ -103,22 +103,67 @@ const SUPPORTED_PAIRS: Array<{ source: string; target: string }> = [
 export interface RateLimitProvenance {
   /** Nom de fournisseur déduit (jamais une supposition codée en dur). */
   provider: string;
-  /** 'origin' = réponse produite/traversée par l'app ; 'edge' = avant l'app. */
-  provenance: 'origin' | 'edge' | 'unknown';
+  /**
+   * 'origin'          = le process Node de l'AI Engine a produit la réponse.
+   * 'render-platform' = Render a traité la requête, mais RIEN ne prouve que
+   *                     l'application a tourné.
+   * 'hibernation'     = Render a REJETÉ la requête parce que l'instance free
+   *                     tier est endormie — l'app n'a jamais vu la requête.
+   * 'edge'            = rejet avant Render (CDN/proxy seul).
+   */
+  provenance: 'origin' | 'render-platform' | 'hibernation' | 'edge' | 'unknown';
   /** En-têtes non sensibles utiles, formatés pour les logs. */
   hints: string;
   /** Conclusion lisible par un opérateur. */
   verdict: string;
 }
 
-/** Marqueurs prouvant que la réponse a atteint l'origine applicative. */
-const ORIGIN_MARKERS = [
+/**
+ * Marqueurs émis par le PROCESS NODE de l'AI Engine lui-même.
+ * Ce sont les seuls qui prouvent que l'application a réellement traité la
+ * requête : `x-powered-by: Express` est posé par Express, `x-request-id` est
+ * écho par notre middleware requestLogger.
+ */
+const APP_MARKERS = ['x-powered-by', 'x-request-id'] as const;
+
+/**
+ * ── FIX — CORRECTION DU CLASSIFICATEUR DE PHASE 39 ────────────────────────
+ * Marqueurs de la PLATEFORME Render. Ils prouvent que Render a traité la
+ * requête, PAS que l'application a tourné : Render les pose aussi sur ses
+ * PROPRES réponses de rejet, y compris quand l'instance est endormie et n'a
+ * jamais reçu la requête.
+ *
+ * Preuve en production : un 429 portant `rndr-id` ET
+ * `x-render-routing: hibernate-rate-limited` avec durationMs=72 — le process
+ * Node ne peut ni démarrer ni répondre en 72 ms. La phase 39 rangeait ce cas
+ * en provenance=origin et orientait l'opérateur vers « la limite de débit de
+ * l'application », alors que la cause réelle est le spin-down free tier
+ * (documenté dans render.yaml : « web service avec sleep après 15min
+ * d'inactivité »).
+ */
+const RENDER_PLATFORM_MARKERS = [
   'rndr-id',
   'x-render-origin-server',
   'x-render-routing',
-  'x-powered-by',
-  'x-request-id',
 ] as const;
+
+/**
+ * Valeur de `x-render-routing` signalant un rejet lié à l'hibernation.
+ * Observé en production : `hibernate-rate-limited`.
+ */
+const HIBERNATION_ROUTING_RE = /hibernate/i;
+
+/** Vrai si les en-têtes montrent un rejet par la porte d'hibernation Render. */
+export function isRenderHibernationRejection(
+  rawHeaders: Record<string, string | undefined> | undefined,
+): boolean {
+  for (const [k, v] of Object.entries(rawHeaders ?? {})) {
+    if (k.toLowerCase() === 'x-render-routing' && typeof v === 'string' && HIBERNATION_ROUTING_RE.test(v)) {
+      return true;
+    }
+  }
+  return false;
+}
 
 export function classifyRateLimitProvenance(
   rawHeaders: Record<string, string | undefined> | undefined,
@@ -129,8 +174,10 @@ export function classifyRateLimitProvenance(
     if (v !== undefined && v !== null) headers[k.toLowerCase()] = String(v);
   }
 
-  const markersFound = ORIGIN_MARKERS.filter((m) => headers[m]);
-  const originReached = markersFound.length > 0;
+  const appMarkersFound      = APP_MARKERS.filter((m) => headers[m]);
+  const platformMarkersFound = RENDER_PLATFORM_MARKERS.filter((m) => headers[m]);
+  const appReached           = appMarkersFound.length > 0;
+  const hibernation          = HIBERNATION_ROUTING_RE.test(headers['x-render-routing'] ?? '');
 
   const hints = [
     headers['server']               ? `server=${headers['server'].slice(0, 40)}`                        : null,
@@ -143,19 +190,53 @@ export function classifyRateLimitProvenance(
     headers['x-request-id']         ? `upstreamRequestId=${headers['x-request-id'].slice(0, 64)}`       : null,
     headers['content-type']         ? `contentType=${headers['content-type'].slice(0, 48)}`             : null,
     headers['content-length']       ? `contentLength=${headers['content-length'].slice(0, 16)}`         : null,
-    markersFound.length             ? `originMarkers=${markersFound.join(',')}`                         : `originMarkers=none`,
+    appMarkersFound.length          ? `appMarkers=${appMarkersFound.join(',')}`                         : `appMarkers=none`,
+    platformMarkersFound.length     ? `platformMarkers=${platformMarkersFound.join(',')}`               : `platformMarkers=none`,
   ].filter(Boolean).join(' ');
 
-  if (originReached) {
+  // ── 1. HIBERNATION — l'instance free tier est endormie ────────────────────
+  // Testé EN PREMIER : c'est le seul cas où Render renvoie un 429 avec ses
+  // propres marqueurs de plateforme alors que l'application n'a pas tourné.
+  if (hibernation) {
+    return {
+      provider:   'render-hibernation',
+      provenance: 'hibernation',
+      hints,
+      verdict:
+        'Render a REJETÉ la requête à l\'éveil de l\'instance ' +
+        `(${headers['x-render-routing']}). L'AI Engine est sur le plan free et s'est ` +
+        'endormi après 15 min sans trafic ; le réveil prend environ une minute ' +
+        '(documentation Render). Ce n\'est NI une limite de débit applicative, NI un ' +
+        'blocage Cloudflare : l\'application n\'a jamais reçu la requête. ' +
+        'Corriger en attendant le réveil (retry espacé), pas en augmentant la cadence.',
+    };
+  }
+
+  // ── 2. ORIGINE APPLICATIVE — le process Node a vraiment répondu ───────────
+  if (appReached) {
     return {
       provider:   'ai-engine-origin',
       provenance: 'origin',
       hints,
       verdict:
-        'La réponse 429 porte au moins un marqueur d\'origine applicative ' +
-        `(${markersFound.join(', ')}). Elle a donc atteint le process Node de l'AI Engine ` +
-        '(ou son routeur Render), et NON un simple CDN. Chercher la limite de débit côté ' +
-        'application / plan Render, pas côté Cloudflare.',
+        'La réponse 429 porte un marqueur émis par l\'application elle-même ' +
+        `(${appMarkersFound.join(', ')}). Elle a donc atteint le process Node de l'AI ` +
+        'Engine. Chercher la limite de débit côté application, pas côté Cloudflare.',
+    };
+  }
+
+  // ── 3. PLATEFORME RENDER — traitée par Render, pas par l'app ──────────────
+  if (platformMarkersFound.length > 0) {
+    return {
+      provider:   'render-platform',
+      provenance: 'render-platform',
+      hints,
+      verdict:
+        'La réponse 429 porte uniquement des marqueurs de la plateforme Render ' +
+        `(${platformMarkersFound.join(', ')}), aucun marqueur applicatif ` +
+        '(ni x-powered-by, ni x-request-id). Render a traité la requête mais rien ne ' +
+        "prouve que le process Node a tourné. Vérifier l'état de l'instance " +
+        '(endormie / en cours de démarrage / suspendue) avant de suspecter le code.',
     };
   }
 
@@ -165,8 +246,8 @@ export function classifyRateLimitProvenance(
       provenance: 'edge',
       hints,
       verdict:
-        'La réponse 429 ne porte AUCUN marqueur d\'origine applicative ' +
-        "(ni rndr-id, ni x-render-origin-server, ni x-powered-by, ni x-request-id) " +
+        'La réponse 429 ne porte AUCUN marqueur applicatif ni Render ' +
+        "(ni x-powered-by, ni x-request-id, ni rndr-id, ni x-render-origin-server) " +
         'alors qu\'un en-tête d\'intermédiaire est présent. La requête a été rejetée ' +
         "AVANT d'atteindre le process Node — d'où l'absence de log Runtime. " +
         'C\'est la seule configuration qui prouve un rejet par la couche intermédiaire.',
@@ -178,7 +259,7 @@ export function classifyRateLimitProvenance(
     provenance: 'unknown',
     hints,
     verdict:
-      'Aucun marqueur d\'origine et aucun marqueur d\'intermédiaire : provenance indéterminée. ' +
+      'Aucun marqueur applicatif, Render ou intermédiaire : provenance indéterminée. ' +
       'Ne pas conclure. Capturer la réponse brute avant de modifier quoi que ce soit.',
   };
 }
@@ -466,9 +547,40 @@ export class AiEngineClient {
       const retryAfterMs = parseRetryAfterHeader(headers['retry-after']);
       const prov = classifyRateLimitProvenance(headers);
 
+      // ── CAS PARTICULIER : rejet à l'éveil d'une instance free tier ────────
+      // `x-render-routing: hibernate-rate-limited` + durée de quelques dizaines
+      // de ms = Render a refusé de réveiller l'instance. L'application n'a pas
+      // tourné. Augmenter la cadence des tentatives aggrave le cas : il faut au
+      // contraire laisser le temps du spin-up (~1 minute, doc Render).
+      if (prov.provenance === 'hibernation') {
+        const hibernationWaitMs = envInt('AI_ENGINE_HIBERNATION_WAIT_MS', 45_000, 5_000, 600_000);
+        this.logger.warn(
+          `[DISPATCH-429-HIBERNATION] jobId=${jobId} requestId=${requestId} url=${targetUrl} ` +
+          `durationMs=${durationMs} httpStatus=429 errorType=hibernation ` +
+          `layer=render-routing renderRouting=${(headers['x-render-routing'] ?? '').slice(0, 40)} ` +
+          `provider=${prov.provider} provenance=hibernation ` +
+          `retryAfterHeader=${headers['retry-after'] ?? '(absent)'} ` +
+          `nextAttemptFloorMs=${hibernationWaitMs} ` +
+          `body=${bodyInfo} hints=[${prov.hints || 'none'}] ` +
+          `verdict="${prov.verdict}" action=WAIT_FOR_SPIN_UP_VIA_QUEUE_BACKOFF`,
+        );
+        return new RetryableError(
+          `AI Engine unreachable: Render free-tier instance is hibernating ` +
+          `(${headers['x-render-routing']}). The service spins back up in about a minute; ` +
+          `the job will be retried automatically with a wait floor of ` +
+          `${Math.round(hibernationWaitMs / 1000)}s.`,
+          {
+            kind: 'rate-limit', httpStatus: 429, retryAfterMs,
+            minDelayMs: hibernationWaitMs, requestId, provider: prov.provider,
+          },
+          axErr instanceof Error ? axErr : undefined,
+        );
+      }
+
       this.logger.error(
         `[DISPATCH-429] jobId=${jobId} requestId=${requestId} url=${targetUrl} ` +
         `durationMs=${durationMs} httpStatus=429 errorType=rate-limit ` +
+        `layer=${prov.provenance === 'origin' ? 'ai-engine-app' : prov.provenance === 'render-platform' ? 'render-platform' : prov.provenance} ` +
         `provider=${prov.provider} provenance=${prov.provenance} ` +
         `retryAfterMs=${retryAfterMs ?? 'none'} ` +
         `retryAfterHeader=${headers['retry-after'] ?? '(absent)'} ` +
