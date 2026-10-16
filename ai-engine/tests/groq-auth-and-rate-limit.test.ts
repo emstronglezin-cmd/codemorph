@@ -220,8 +220,7 @@ describe('Problème B — comptabilité des tokens du rate-limiter', () => {
     const limiter = new GroqRateLimiter();
     return limiter.acquire(4000).then((release) => {
       release(1234, 'success');
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      expect((limiter as any).tokensUsedInWindow).toBe(1234);
+      expect(limiter.telemetry()['tpmUsed']).toBe(1234);
       expect(limiter.totalFailedRequests).toBe(0);
     });
   });
@@ -231,8 +230,7 @@ describe('Problème B — comptabilité des tokens du rate-limiter', () => {
     const release = await limiter.acquire(4000);
     release(0, 'failed');
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    expect((limiter as any).tokensUsedInWindow).toBe(0);
+    expect(limiter.telemetry()['tpmUsed']).toBe(0);
     expect(limiter.totalFailedRequests).toBe(1);
     // Le compteur de diagnostic montre ce que l'ancien code aurait facturé.
     expect(limiter.phantomTokensAvoided).toBeGreaterThan(0);
@@ -246,16 +244,14 @@ describe('Problème B — comptabilité des tokens du rate-limiter', () => {
     }
     // Avec l'ancien code, la fenêtre aurait été saturée dès le 2e échec
     // (2 × ~4 000 > 7 000 TPM) et chaque appel suivant aurait attendu ~60 s.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    expect((limiter as any).tokensUsedInWindow).toBe(0);
+    expect(limiter.telemetry()['tpmUsed']).toBe(0);
   });
 
   it('un succès sans usage rapporté reste prudent (facture la projection)', async () => {
     const limiter = new GroqRateLimiter();
     const release = await limiter.acquire(4000);
     release(0, 'success');
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    expect((limiter as any).tokensUsedInWindow).toBeGreaterThanOrEqual(3500);
+    expect(limiter.telemetry()['tpmUsed']).toBeGreaterThanOrEqual(3500);
   });
 
   it('sémaphore : jamais plus de MAX_CONCURRENT admissions simultanées', async () => {

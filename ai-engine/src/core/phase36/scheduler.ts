@@ -120,7 +120,10 @@ export async function runScheduled<T>(
       if (!task) return;
 
       // ── Pacing AVANT l'envoi (empêche les requêtes trop rapprochées) ──
-      if (task.estimatedTokens !== undefined && task.estimatedTokens > 0) {
+      // FIX — `tpm <= 0` désactive cette porte : le GroqRateLimiter du provider
+      // applique déjà le budget TPM (fenêtre glissante) et le RPM. Les laisser
+      // tous deux actifs faisait attendre la même requête à deux guichets.
+      if (tpm > 0 && task.estimatedTokens !== undefined && task.estimatedTokens > 0) {
         await waitForTokenBudget(task.estimatedTokens);
         tokensInWindow += task.estimatedTokens;
       }

@@ -168,43 +168,78 @@ export function buildGroqAuthMessage(httpStatus: number): string {
 // Exportée pour les tests : la comptabilité des tokens est le cœur du
 // problème B, elle doit être vérifiable unitairement.
 export class GroqRateLimiter {
-  // ── Token-bucket state ─────────────────────────────────────────────────────
-  private windowStart      = 0;
-  private tokensUsedInWindow = 0;
+  // ── FENÊTRE GLISSANTE (rolling window) ─────────────────────────────────────
+  // FIX — Le budget TPM de Groq est une fenêtre GLISSANTE de 60 s (« processed
+  // within any rolling 60-second window », doc Groq). L'ancien code utilisait
+  // une fenêtre FIXE qui se vidait d'un coup, et attendait `resteDeFenêtre + 2s`
+  // — soit 55 à 59 s d'attente observées en production — alors que les tokens
+  // libérés en continu auraient permis de repartir bien plus tôt.
+  // Chaque consommation est maintenant horodatée et expire individuellement.
+  private events: Array<{ at: number; tokens: number }> = [];
+  private requestTimes: number[] = [];
 
-  // Groq free tier: 8000 TPM. Budget configurable (marge par défaut ~12%)
-  private readonly TPM_LIMIT    = GroqRateLimiter.envInt('AI_RATE_LIMIT_TPM', 7_000, 500, 1_000_000);
-  // Estimation conservatrice par requête si l'estimation réelle n'est pas fournie
+  // ── Limites réelles du fournisseur ─────────────────────────────────────────
+  // FIX — Les valeurs par défaut ci-dessous sont les limites PUBLIÉES par Groq
+  // pour `openai/gpt-oss-120b` sur le plan Free (30 RPM / 8 000 TPM /
+  // 1 000 RPD / 200 000 TPD), appliquées au niveau de l'ORGANISATION.
+  // Elles ne sont plus devinées : si Groq renvoie ses en-têtes
+  // `x-ratelimit-limit-tokens`, la valeur apprise remplace le défaut.
+  // Une marge de sécurité est appliquée (jamais de dépassement volontaire).
+  private readonly TPM_LIMIT = GroqRateLimiter.envInt('AI_RATE_LIMIT_TPM', 7_200, 500, 1_000_000); // 8 000 réel, marge 10 %
+  /**
+   * FIX — Dimension RPM, ABSENTE de l'ancien code. La limite réelle est
+   * 30 RPM ; `AI_MIN_INTERVAL_MS=8000` plafonnait implicitement le débit à
+   * 7,5 req/min, soit 4× moins que le quota. RPM et TPM sont maintenant
+   * deux compteurs distincts.
+   */
+  private readonly RPM_LIMIT = GroqRateLimiter.envInt('AI_RATE_LIMIT_RPM', 24, 1, 10_000); // 30 réel, marge 20 %
+  /**
+   * Estimation de REPLI, utilisée UNIQUEMENT quand aucune estimation réelle
+   * n'est fournie. FIX — l'ancien code l'appliquait comme un PLANCHER
+   * systématique (`Math.max(estimé, 3_500)`), ce qui écrasait toute estimation
+   * réelle inférieure et annulait l'effet de la projection prudente : un prompt
+   * de 1 600 tokens + 1 200 de réserve (2 800) était remonté à 3 500.
+   */
   private readonly TOKENS_PER_REQ = 3_500;
-  // Délai minimal absolu entre deux requêtes (ms)
-  private readonly MIN_INTERVAL_MS = GroqRateLimiter.envInt('AI_MIN_INTERVAL_MS', 8_000, 0, 120_000);
-  // Fenêtre TPM en millisecondes (1 minute)
-  private readonly WINDOW_MS       = 60_000;
+  /**
+   * FIX — Réserve de tokens de SORTIE utilisée pour l'admission.
+   * L'ancien code réservait systématiquement GROQ_MAX_TOKENS (2 800) : pour un
+   * prompt de 1 600 tokens, 4 400 étaient bloqués AVANT toute génération, soit
+   * 55 % du budget réel. La réserve est maintenant bornée et recalée sur le
+   * maximum de sortie réellement observé (jamais sous-estimée).
+   */
+  private readonly OUTPUT_RESERVE = GroqRateLimiter.envInt('AI_OUTPUT_TOKEN_RESERVE', 1_200, 0, 8_000);
+  private observedMaxOutput = 0;
+  /** Délai minimal entre deux départs (ms) — paceur, pas substitute de RPM. */
+  private readonly MIN_INTERVAL_MS = GroqRateLimiter.envInt('AI_MIN_INTERVAL_MS', 2_000, 0, 120_000);
+  private readonly WINDOW_MS = 60_000;
+  /** Marge aléatoire ajoutée aux attentes pour éviter les réveils synchrones. */
+  private readonly JITTER_MS = GroqRateLimiter.envInt('AI_RATE_LIMIT_JITTER_MS', 750, 0, 10_000);
 
-  // FIX PHASE 40 — PROBLÈME B : paceur réel.
-  // AVANT : `lastRequestEndTime` n'était mis à jour qu'à la LIBÉRATION du slot,
-  //   et le test `sinceLastMs < MIN_INTERVAL_MS` était fait APRÈS l'acquisition
-  //   du sémaphore. Plusieurs requêtes arrivant ensemble lisaient donc la même
-  //   valeur, dormaient la même durée, puis partaient ENSEMBLE : le délai
-  //   minimal ne cadence rien, il retarde seulement un paquet.
-  // APRÈS : le prochain créneau est réservé de façon atomique à l'acquisition.
+  // FIX PHASE 40 — paceur : le prochain créneau est réservé atomiquement.
   private nextSlotAt = 0;
 
-  // ── Semaphore : max N requêtes en vol simultané ────────────────────────────
+  // ── Semaphore ──────────────────────────────────────────────────────────────
   private readonly MAX_CONCURRENT = GroqRateLimiter.envInt('AI_PROVIDER_MAX_CONCURRENT', 3, 1, 16);
-  inflight = 0; // public pour logging dans groqChat
+  inflight = 0;
   private waitQueue: Array<() => void> = [];
 
-  // ── Stats globales (pour logs de progression) ─────────────────────────────
-  totalRequestsSent  = 0;
-  totalWaitMs        = 0;
+  // ── Limites APPRISES depuis les en-têtes x-ratelimit-* de Groq ─────────────
+  private learnedTpmLimit: number | undefined;
+  private learnedRemainingTokens: number | undefined;
+  private learnedResetAt: number | undefined;
+
+  // ── Télémétrie ─────────────────────────────────────────────────────────────
+  totalRequestsSent   = 0;
+  totalWaitMs         = 0;
   totalThrottledCount = 0;
-  // FIX PHASE 40 — appels échoués (aucun token réellement consommé).
-  // Séparé des requêtes envoyées : un échec ne doit pas être confondu avec une
-  // consommation de quota.
   totalFailedRequests = 0;
-  // Tokens facturés à tort par l'ancien code (compteur de diagnostic).
   phantomTokensAvoided = 0;
+  /** Détail des attentes, pour distinguer quota / paceur / RPM / sémaphore. */
+  waitBreakdown = { semaphoreMs: 0, pacerMs: 0, rpmMs: 0, tpmMs: 0 };
+  totalTokensEstimated = 0;
+  totalTokensActual    = 0;
+  totalRetries         = 0;
 
   static envInt(key: string, defaultValue: number, min: number, max: number): number {
     const raw = process.env[key];
@@ -214,137 +249,292 @@ export class GroqRateLimiter {
     return Math.min(max, Math.max(min, parsed));
   }
 
-  // ── Enregistrer la consommation réelle de tokens ──────────────────────────
-  recordTokens(tokens: number): void {
-    const now = Date.now();
-    // Réinitialiser la fenêtre si elle a expiré
-    if (now - this.windowStart >= this.WINDOW_MS) {
-      this.windowStart        = now;
-      this.tokensUsedInWindow = 0;
-    }
-    this.tokensUsedInWindow += tokens;
-  }
-
   // ── PHASE 36: estimation tokens d'un prompt (input) ────────────────────────
   static estimatePromptTokens(messages: Array<{ content: string }>): number {
     const chars = messages.reduce((acc, m) => acc + (m.content?.length ?? 0), 0);
     return Math.ceil((chars / 4) * 1.08); // conservateur (sur-estime légèrement)
   }
 
+  /** Limite TPM effective : valeur apprise du fournisseur si disponible. */
+  private get effectiveTpmLimit(): number {
+    return this.learnedTpmLimit !== undefined
+      ? Math.min(this.learnedTpmLimit, this.TPM_LIMIT)
+      : this.TPM_LIMIT;
+  }
+
+  private prune(now: number): void {
+    const cutoff = now - this.WINDOW_MS;
+    for (;;) {
+      const first = this.events[0];
+      if (!first || first.at > cutoff) break;
+      this.events.shift();
+    }
+    for (;;) {
+      const first = this.requestTimes[0];
+      if (first === undefined || first > cutoff) break;
+      this.requestTimes.shift();
+    }
+  }
+
+  private tokensInWindow(): number {
+    let sum = 0;
+    for (const e of this.events) sum += e.tokens;
+    return sum;
+  }
+
+  /**
+   * Délai MINIMAL avant que `needed` tokens expirent de la fenêtre glissante.
+   * C'est la correction centrale : on n'attend plus la fin de la fenêtre
+   * entière, seulement le temps que la quantité nécessaire se libère.
+   * Retourne 0 si le budget est déjà disponible.
+   */
+  private msUntilTokensFree(needed: number, now: number): number {
+    if (needed <= 0) return 0;
+    let freed = 0;
+    for (const e of this.events) {
+      freed += e.tokens;
+      if (freed >= needed) {
+        return Math.max(0, e.at + this.WINDOW_MS - now);
+      }
+    }
+    return 0; // les consommations enregistrées ne suffiront pas → ne pas bloquer
+  }
+
+  /** Délai minimal avant qu'un créneau RPM se libère. */
+  private msUntilRequestSlot(now: number): number {
+    if (this.requestTimes.length < this.RPM_LIMIT) return 0;
+    const oldest = this.requestTimes[0];
+    if (oldest === undefined) return 0;
+    return Math.max(0, oldest + this.WINDOW_MS - now);
+  }
+
+  /** Enregistre la consommation réelle (fenêtre glissante). */
+  recordTokens(tokens: number): void {
+    const now = Date.now();
+    this.prune(now);
+    this.events.push({ at: now, tokens });
+  }
+
+  /**
+   * FIX — Exploite les en-têtes de limitation renvoyés par Groq.
+   * `x-ratelimit-limit-tokens`     : TPM réel de l'organisation
+   * `x-ratelimit-remaining-tokens` : budget restant dans la fenêtre courante
+   * `x-ratelimit-reset-tokens`     : délai avant réinitialisation (ex: "7.66s")
+   * Aucune de ces valeurs n'était lue auparavant : le limiteur devinait.
+   * Jamais de secret journalisé ici.
+   */
+  observeRateLimitHeaders(headers: Record<string, unknown> | undefined): void {
+    if (!headers) return;
+    const get = (name: string): string | undefined => {
+      for (const [k, v] of Object.entries(headers)) {
+        if (k.toLowerCase() === name && v !== undefined && v !== null) return String(v);
+      }
+      return undefined;
+    };
+
+    const limitTok = Number.parseFloat(get('x-ratelimit-limit-tokens') ?? '');
+    if (Number.isFinite(limitTok) && limitTok > 0) {
+      if (this.learnedTpmLimit !== limitTok) {
+        this.learnedTpmLimit = limitTok;
+        console.log(`[GroqRateLimiter] 📏 TPM limite apprise du fournisseur : ${limitTok} (config locale ${this.TPM_LIMIT})`);
+      }
+    }
+    const remaining = Number.parseFloat(get('x-ratelimit-remaining-tokens') ?? '');
+    if (Number.isFinite(remaining) && remaining >= 0) this.learnedRemainingTokens = remaining;
+
+    const resetRaw = get('x-ratelimit-reset-tokens');
+    if (resetRaw) {
+      const secs = Number.parseFloat(resetRaw);
+      if (Number.isFinite(secs) && secs >= 0) {
+        this.learnedResetAt = Date.now() + secs * 1000;
+      }
+    }
+  }
+
   /**
    * Réserve un créneau d'envoi.
-   * @returns release(tokensUsed?, outcome?) — DOIT être appelé dans un finally.
-   *   outcome='failed' signifie qu'aucun token n'a été consommé chez le
-   *   fournisseur (401, 429 refusé, erreur réseau) : rien n'est alors facturé
-   *   au budget TPM.
+   * @returns release(tokensUsed?, outcome?, headers?) — DOIT être appelé dans un finally.
    */
   async acquire(
     estimatedTokens?: number,
-  ): Promise<(tokensUsed?: number, outcome?: 'success' | 'failed') => void> {
+  ): Promise<(tokensUsed?: number, outcome?: 'success' | 'failed', headers?: Record<string, unknown>) => void> {
     const waitStart = Date.now();
-    // PHASE 36: projection TPM basée sur la taille réelle (input estimé + output)
-    const projectedPerReq = Math.max(estimatedTokens ?? 0, this.TOKENS_PER_REQ);
+    // Le repli conservateur ne s'applique QUE sans estimation réelle : un
+    // plancher systématique écraserait les petites requêtes et gaspillerait le
+    // budget TPM (bug détecté par les tests de cette phase).
+    const projectedPerReq = (estimatedTokens ?? 0) > 0
+      ? (estimatedTokens as number)
+      : this.TOKENS_PER_REQ;
+    this.totalTokensEstimated += projectedPerReq;
 
-    // ── 1. Semaphore : attendre un slot concurrent libre ─────────────────────
-    // FIX PHASE 40 — même race de sur-admission que celle corrigée côté Backend
-    // (phase 39) : l'ancienne version décrémentait `inflight` puis réveillait un
-    // waiter en microtâche. Un appel arrivant dans cette fenêtre était admis,
-    // puis le waiter incrémentait à son tour → MAX_CONCURRENT dépassé.
-    // Le slot est maintenant TRANSFÉRÉ sans jamais être décrémenté.
+    // ── 1. Semaphore ─────────────────────────────────────────────────────────
+    const semStart = Date.now();
     if (this.inflight >= this.MAX_CONCURRENT) {
       await new Promise<void>((resolve) => this.waitQueue.push(resolve));
     } else {
       this.inflight++;
     }
+    this.waitBreakdown.semaphoreMs += Date.now() - semStart;
 
-    // ── 2. Délai minimal entre requêtes — VRAI paceur ────────────────────────
-    // FIX PHASE 40 — PROBLÈME B : réservation atomique du prochain créneau.
-    // Une seule requête à la fois peut lire/écrire `nextSlotAt`, donc les départs
-    // sont réellement espacés de MIN_INTERVAL_MS au lieu de partir en paquet.
+    // ── 2. Paceur (délai minimal entre départs) ──────────────────────────────
+    const paceStart = Date.now();
     {
       const nowMs       = Date.now();
       const scheduledAt = Math.max(nowMs, this.nextSlotAt);
       this.nextSlotAt   = scheduledAt + this.MIN_INTERVAL_MS;
       const intervalWait = scheduledAt - nowMs;
-      if (intervalWait > 0) {
-        console.log(`[GroqRateLimiter] ⏳ Interval wait ${(intervalWait / 1000).toFixed(1)}s (min ${this.MIN_INTERVAL_MS / 1000}s between requests)`);
-        this.totalThrottledCount++;
-        await new Promise((r) => setTimeout(r, intervalWait));
-      }
+      if (intervalWait > 0) await new Promise((r) => setTimeout(r, intervalWait));
     }
+    this.waitBreakdown.pacerMs += Date.now() - paceStart;
 
-    // ── 3. Token-bucket : attendre si la requête dépasserait la limite TPM ────
-    // PHASE 36: avec la projection réelle, une requête trop grosse pour le
-    // quota minute ATTEND le reset (au lieu de partir en 429 systématique).
+    // ── 3. RPM : dimension séparée du TPM ────────────────────────────────────
+    const rpmStart = Date.now();
     for (;;) {
       const now = Date.now();
-      if (now - this.windowStart >= this.WINDOW_MS) {
-        // Fenêtre expirée — réinitialiser
-        this.windowStart        = now;
-        this.tokensUsedInWindow = 0;
-        break;
-      }
-      const projectedTokens = this.tokensUsedInWindow + projectedPerReq;
-      if (projectedTokens <= this.TPM_LIMIT) break;
-
-      // Si la requête seule dépasse le budget minute entier, attendre ne sert
-      // à rien de la boucler — partir après UNE attente de reset de fenêtre
-      // (le backoff 429 de groqChat absorbe l'éventuel refus résiduel).
-      const windowRemaining = Math.max(0, this.WINDOW_MS - (now - this.windowStart));
-      const tpmWaitMs = windowRemaining + 2_000; // +2s marge
-      console.log(`[GroqRateLimiter] 🚦 TPM limit approaching (${this.tokensUsedInWindow}/${this.TPM_LIMIT} tokens, projected=${projectedTokens}) — waiting ${(tpmWaitMs / 1000).toFixed(1)}s for window reset`);
+      this.prune(now);
+      const waitMs = this.msUntilRequestSlot(now);
+      if (waitMs <= 0) break;
+      const total = waitMs + Math.round(Math.random() * this.JITTER_MS);
+      console.log(`[GroqRateLimiter] 🚦 RPM ${this.requestTimes.length}/${this.RPM_LIMIT} atteint — attente ${(total / 1000).toFixed(1)}s (limite Groq 30 RPM)`);
       this.totalThrottledCount++;
-      await new Promise((r) => setTimeout(r, tpmWaitMs));
-      this.windowStart        = Date.now();
-      this.tokensUsedInWindow = 0;
-      break;
+      await new Promise((r) => setTimeout(r, total));
     }
+    this.waitBreakdown.rpmMs += Date.now() - rpmStart;
 
-    const totalWait = Date.now() - waitStart;
+    // ── 4. TPM : fenêtre glissante, attente MINIMALE calculée ────────────────
+    const tpmStart = Date.now();
+    for (;;) {
+      const now = Date.now();
+      this.prune(now);
+      const used      = this.tokensInWindow();
+      const projected = used + projectedPerReq;
+      const limit     = this.effectiveTpmLimit;
+      if (projected <= limit) break;
+
+      // Quantité à libérer, puis délai EXACT pour y parvenir.
+      const needed  = projected - limit;
+      let waitMs    = this.msUntilTokensFree(needed, now);
+
+      // Si le fournisseur annonce son propre délai de reset, on s'y fie.
+      if (this.learnedResetAt !== undefined) {
+        const providerWait = this.learnedResetAt - now;
+        if (providerWait > 0) waitMs = Math.max(waitMs, providerWait);
+        this.learnedResetAt = undefined; // consommé
+      }
+
+      // Une requête qui dépasse à elle seule le budget minute ne peut pas
+      // attendre utilement : on la laisse partir après le délai calculé
+      // (le backoff 429 de groqChat absorbe un éventuel refus résiduel).
+      const aloneExceeds = projectedPerReq > limit;
+      if (waitMs <= 0 && !aloneExceeds) waitMs = 1_000;
+      if (waitMs <= 0) break;
+
+      const total = waitMs + Math.round(Math.random() * this.JITTER_MS);
+      console.log(
+        `[GroqRateLimiter] 🚦 TPM ${used}/${limit} (projeté=${projected}, à libérer=${needed}) ` +
+        `— attente calculée ${(total / 1000).toFixed(1)}s${aloneExceeds ? ' [requête > budget minute]' : ''}`,
+      );
+      this.totalThrottledCount++;
+      await new Promise((r) => setTimeout(r, total));
+      if (aloneExceeds) break;
+    }
+    this.waitBreakdown.tpmMs += Date.now() - tpmStart;
+
+    const now2 = Date.now();
+    this.prune(now2);
+    this.requestTimes.push(now2);
+
+    const totalWait = now2 - waitStart;
     this.totalWaitMs += totalWait;
     this.totalRequestsSent++;
 
     if (totalWait > 1000) {
-      console.log(`[GroqRateLimiter] ✅ Slot acquired (waited ${(totalWait / 1000).toFixed(1)}s, inflight=${this.inflight}/${this.MAX_CONCURRENT}, req#${this.totalRequestsSent})`);
+      console.log(
+        `[GroqRateLimiter] ✅ Slot acquis (attente ${(totalWait / 1000).toFixed(1)}s, ` +
+        `inflight=${this.inflight}/${this.MAX_CONCURRENT}, req#${this.totalRequestsSent}, ` +
+        `rpm=${this.requestTimes.length}/${this.RPM_LIMIT}, tpm=${this.tokensInWindow()}/${this.effectiveTpmLimit})`,
+      );
     }
 
-    // ── Retourner release() que l'appelant DOIT appeler dans finally ──────────
-    return (tokensUsed?: number, outcome: 'success' | 'failed' = 'success') => {
-      // FIX PHASE 40 — PROBLÈME B : les appels ÉCHOUÉS n'étaient pas
-      // comptabilisés correctement. `tokensUsed` valait 0 sur un échec, donc le
-      // code tombait dans la branche `else` et facturait `projectedPerReq` au
-      // budget TPM — alors que le fournisseur n'avait consommé AUCUN token.
-      //
-      // Conséquence mesurée sur le cas rapporté : chaque 401 remplissait la
-      // fenêtre TPM de tokens fantômes. Avec une limite à 7 000 TPM et une
-      // projection d'environ 4 400 tokens par requête, un seul échec suffisait
-      // pour que la requête suivante attende le reset complet de la fenêtre
-      // (~54 s) EN PLUS du délai minimal de 8 s. C'est exactement la latence
-      // décrite dans les logs.
-      //
-      // APRÈS : un échec ne facture rien. La protection TPM reste intégralement
-      // appliquée aux appels qui ont réellement consommé des tokens.
+    return (
+      tokensUsed?: number,
+      outcome: 'success' | 'failed' = 'success',
+      headers?: Record<string, unknown>,
+    ) => {
+      // Les limites réelles du fournisseur priment toujours sur nos estimations.
+      this.observeRateLimitHeaders(headers);
+
       const next = this.waitQueue.shift();
       if (outcome === 'failed') {
+        // Un appel rejeté n'a consommé AUCUN token chez le fournisseur.
         this.totalFailedRequests++;
         this.phantomTokensAvoided += projectedPerReq;
-        if (next) { next(); return; }        // transfert de slot, pas de décrément
+        if (next) { next(); return; }
         this.inflight = Math.max(0, this.inflight - 1);
         return;
       }
 
       if (tokensUsed && tokensUsed > 0) {
         this.recordTokens(tokensUsed);
+        this.totalTokensActual += tokensUsed;
       } else {
         // Succès sans usage rapporté → on reste conservateur.
         this.recordTokens(projectedPerReq);
+        this.totalTokensActual += projectedPerReq;
       }
 
-      // Débloquer le prochain waiter du semaphore (transfert, pas de décrément)
       if (next) { next(); return; }
       this.inflight = Math.max(0, this.inflight - 1);
     };
   }
+
+  /**
+   * FIX — Projection PRUDENTE mais non excessive.
+   * L'ancien code réservait `input + GROQ_MAX_TOKENS` (2 800) : pour un prompt
+   * de 1 600 tokens, 4 400 tokens étaient bloqués avant toute génération, soit
+   * 55 % du budget réel de 8 000 TPM — une seule requête tenait par fenêtre.
+   * La réserve de sortie est maintenant bornée et recalée sur le plus gros
+   * output réellement observé : on ne sous-estime jamais, on ne sur-réserve
+   * plus systématiquement.
+   */
+  reserveFor(estimatedInputTokens: number): number {
+    const outputReserve = Math.max(this.OUTPUT_RESERVE, this.observedMaxOutput);
+    if (estimatedInputTokens > 0) return estimatedInputTokens + outputReserve;
+    return this.TOKENS_PER_REQ; // aucune estimation réelle → repli conservateur
+  }
+
+  /** Recale la réserve de sortie sur le plus gros output réellement observé. */
+  noteOutputTokens(outputTokens: number): void {
+    if (outputTokens > this.observedMaxOutput) this.observedMaxOutput = outputTokens;
+  }
+
+  noteRetry(): void { this.totalRetries++; }
+
+  /** Instantané de télémétrie (aucune donnée sensible). */
+  telemetry(): Record<string, unknown> {
+    const now = Date.now();
+    this.prune(now);
+    return {
+      requestsSent:    this.totalRequestsSent,
+      failedRequests:  this.totalFailedRequests,
+      phantomTokensAvoided: this.phantomTokensAvoided,
+      retries:         this.totalRetries,
+      throttledCount:  this.totalThrottledCount,
+      totalWaitMs:     this.totalWaitMs,
+      waitBreakdown:   { ...this.waitBreakdown },
+      tokensEstimated: this.totalTokensEstimated,
+      tokensActual:    this.totalTokensActual,
+      tpmUsed:         this.tokensInWindow(),
+      tpmLimit:        this.effectiveTpmLimit,
+      rpmUsed:         this.requestTimes.length,
+      rpmLimit:        this.RPM_LIMIT,
+      inflight:        this.inflight,
+      maxConcurrent:   this.MAX_CONCURRENT,
+      learnedTpmLimit:       this.learnedTpmLimit ?? null,
+      learnedRemainingTokens: this.learnedRemainingTokens ?? null,
+    };
+  }
+
 }
 
 // Singleton global — partagé entre toutes les instances AIProvider
@@ -1575,8 +1765,20 @@ export class AIProvider {
     // PHASE 36: projection TPM = tokens input estimés du prompt + output demandé
     // → les requêtes volumineuses attendent le reset de fenêtre au lieu de partir en 429.
     const estimatedInputTokens = GroqRateLimiter.estimatePromptTokens(messages);
-    const projectedTokens = estimatedInputTokens + GROQ_MAX_TOKENS;
-    console.log(`[AI-BUDGET] provider=groq estimatedInputTokens=${estimatedInputTokens} maxOutputTokens=${GROQ_MAX_TOKENS} projectedTotal=${projectedTokens}`);
+    // FIX — Réservation PRUDENTE mais non excessive.
+    // AVANT : `estimatedInputTokens + GROQ_MAX_TOKENS` réservait 2 800 tokens de
+    //   sortie avant toute génération. Pour un prompt de ~1 600 tokens, 4 400
+    //   étaient bloqués soit 55 % du budget réel de 8 000 TPM : UNE seule
+    //   requête tenait par fenêtre de 60 s, d'où ~60 s d'attente par chunk.
+    // APRÈS : réserve bornée (AI_OUTPUT_TOKEN_RESERVE, défaut 1 200) recalée
+    //   automatiquement sur le plus gros output réellement observé.
+    const projectedTokens = groqRateLimiter.reserveFor(estimatedInputTokens);
+    console.log(
+      `[AI-BUDGET] provider=groq estimatedInputTokens=${estimatedInputTokens} ` +
+      `maxOutputTokens=${GROQ_MAX_TOKENS} reservedTotal=${projectedTokens} ` +
+      `observedMaxOutput=${groqRateLimiter.telemetry()['learnedTpmLimit'] === null ? 'n/a' : 'see-telemetry'} ` +
+      `tpmLimit=${groqRateLimiter.telemetry()['tpmLimit']} rpmLimit=${groqRateLimiter.telemetry()['rpmLimit']}`,
+    );
     const waitStart = Date.now();
     const release = await groqRateLimiter.acquire(projectedTokens);
     const waitedMs = Date.now() - waitStart;
@@ -1613,6 +1815,9 @@ export class AIProvider {
             // Stripping <think>...</think> (qwen3.6-27b reasoning mode)
             rawContent = rawContent.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
             tokensUsed = res.usage?.total_tokens ?? 0;
+            // FIX — recaler la réserve de sortie sur la consommation réelle :
+            // la projection d'admission devient empirique au lieu d'être devinée.
+            groqRateLimiter.noteOutputTokens(res.usage?.completion_tokens ?? 0);
             const durationMs = Date.now() - callStart;
 
             if (modelId !== this.model) {
@@ -1661,6 +1866,14 @@ export class AIProvider {
             const is429 = status === 429
               || msg.includes('429') || msg.includes('rate limit') || msg.includes('Rate limit');
             if (is429) {
+              // FIX — Les en-têtes x-ratelimit-* de Groq donnent la limite RÉELLE
+              // de l'organisation et le délai exact de réinitialisation
+              // (`x-ratelimit-reset-tokens`, ex: "7.66s"). Ils n'étaient jamais
+              // lus : le limiteur devinait et attendait la fin d'une fenêtre
+              // fixe. Aucune donnée sensible ici (uniquement des compteurs).
+              const rlHeaders = (err as { headers?: Record<string, unknown> })?.headers;
+              groqRateLimiter.observeRateLimitHeaders(rlHeaders);
+              groqRateLimiter.noteRetry();
               // Extraire le délai Retry-After suggéré par l'API Groq — respecter exactement
               const retryMatch = msg.match(/(\d+(?:\.\d+)?)s/);
               const waitSec = retryMatch?.[1]

@@ -19,7 +19,8 @@
 //   AI_RETRY_DELAY_MS              (default: 2000)   délai de base du backoff progressif
 //   AI_RETRY_MAX_ATTEMPTS          (default: 4)      tentatives max par requête (jamais de boucle infinie)
 //   AI_RETRY_MAX_DELAY_MS          (default: 60000)  plafond d'attente d'un backoff
-//   AI_RATE_LIMIT_TPM              (default: 6500)   budget tokens/minute utilisé pour le pacing local
+//   AI_PHASE36_PACING_TPM          (default: 0)      pacing TPM local (0 = désactivé,
+//                                                    le GroqRateLimiter du provider fait foi)
 //   AI_CACHE_ENABLED               (default: true)   cache disque des analyses de modules
 //   AI_CACHE_TTL_HOURS             (default: 24)     durée de vie des entrées de cache
 //   AI_CACHE_DIR                   (default: <tmp>/codemorph-phase36-cache)
@@ -120,7 +121,16 @@ export function getPhase36Config(): Phase36Config {
     retryDelayMs:          intFromEnv('AI_RETRY_DELAY_MS', 2_000, 0, 120_000),
     retryMaxAttempts:      intFromEnv('AI_RETRY_MAX_ATTEMPTS', 4, 1, 10),
     retryMaxDelayMs:       intFromEnv('AI_RETRY_MAX_DELAY_MS', 60_000, 1_000, 600_000),
-    rateLimitTpm:          intFromEnv('AI_RATE_LIMIT_TPM', 6_500, 500, 1_000_000),
+    // FIX — DOUBLE LIMITATION SUPPRIMÉE.
+    // Ce pacing local et le GroqRateLimiter d'ai-provider lisaient TOUS DEUX
+    // AI_RATE_LIMIT_TPM (défauts 6 500 ici, 7 000 là) et s'appliquaient EN
+    // SÉRIE sur la même requête, chacun avec sa propre fenêtre fixe et sa
+    // propre estimation. Un chunk pouvait donc attendre jusqu'à ~60 s à chaque
+    // porte. Défaut 0 = désactivé : le limiteur du provider est la seule source
+    // de vérité (fenêtre glissante, RPM séparé, en-têtes x-ratelimit-* de Groq).
+    // La fonctionnalité reste disponible : poser AI_PHASE36_PACING_TPM > 0 la
+    // réactive explicitement.
+    rateLimitTpm:          intFromEnv('AI_PHASE36_PACING_TPM', 0, 0, 1_000_000),
 
     cacheEnabled:          boolFromEnv('AI_CACHE_ENABLED', true),
     cacheTtlHours:         intFromEnv('AI_CACHE_TTL_HOURS', 24, 1, 24 * 30),
