@@ -501,9 +501,21 @@ function fixFileImports(
           lines[imp.lineNumber] = fixedLine;
         }
       } else {
-        // Impossible à résoudre
+        // Impossible à résoudre.
+        //
+        // FIX PHASE 45 — AVANT : la ligne d'import était REMPLACÉE par un
+        // commentaire (`// ${imp.raw}`), ce qui supprimait l'import du fichier
+        // livré. Conséquence : le symbole utilisé plus bas devenait indéfini, et
+        // comme aucune compilation n'était exécutée, le défaut passait
+        // inaperçu jusqu'à l'exécution chez l'utilisateur.
+        //
+        // MAINTENANT : l'import est CONSERVÉ et le TODO est ajouté AU-DESSUS.
+        // Le module manquant reste donc visible par `tsc --noEmit`
+        // (« Cannot find module ») au lieu d'être masqué, et le rapport
+        // `importsUnresolved` continue de le compter. On ne devine pas de
+        // fichier à créer : c'est un constat, pas une réparation spéculative.
         unresolved.push(imp.moduleSpec);
-        const todoComment = `// TODO(import-verifier): Cannot resolve '${imp.moduleSpec}' — file may need to be created\n// ${imp.raw}`;
+        const todoComment = `// TODO(import-verifier): Cannot resolve '${imp.moduleSpec}' — file may need to be created\n${imp.raw}`;
         if (imp.lineNumber < lines.length) {
           lines[imp.lineNumber] = todoComment;
         }

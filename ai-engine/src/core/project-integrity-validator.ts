@@ -481,6 +481,154 @@ function checkEmptySources(files: GeneratedFile[]): IntegrityIssue[] {
   return issues;
 }
 
+/**
+ * PHASE 45 — Modèles canoniques : détecte les interfaces/types EXPORTÉS portant
+ * le même nom dans plusieurs fichiers mais déclarant des propriétés différentes.
+ *
+ * C'est le défaut « deux interfaces Task incompatibles » : le service en utilise
+ * une, le composant une autre, et la propriété de complétion diverge
+ * (`completed` vs `isDone`). Rien ne le signalait.
+ *
+ * Déterministe et conservateur : on ne compare que les NOMS de propriétés des
+ * déclarations exportées. Deux déclarations identiques ne produisent rien.
+ */
+function checkDuplicateModels(files: GeneratedFile[]): IntegrityIssue[] {
+  const issues: IntegrityIssue[] = [];
+  // nom du type → [{ file, props }]
+  const decls = new Map<string, Array<{ file: string; props: Set<string> }>>();
+
+  const declPattern =
+    /export\s+(?:declare\s+)?(?:interface|type)\s+([A-Z][A-Za-z0-9_]*)[^{]*\{([^}]*)\}/g;
+
+  for (const f of files) {
+    const p = normalize(f.path);
+    if (!isSourceFile(p)) continue;
+    declPattern.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = declPattern.exec(f.content)) !== null) {
+      const name = m[1];
+      const body = m[2] ?? '';
+      if (!name) continue;
+      // Noms de propriétés : `foo:`, `foo?:`, `readonly foo:`
+      const props = new Set<string>();
+      const propPattern = /(?:^|[;{\s])(?:readonly\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*\??\s*:/g;
+      let pm: RegExpExecArray | null;
+      while ((pm = propPattern.exec(body)) !== null) {
+        if (pm[1]) props.add(pm[1]);
+      }
+      const list = decls.get(name) ?? [];
+      list.push({ file: p, props });
+      decls.set(name, list);
+    }
+  }
+
+  for (const [name, list] of decls) {
+    if (list.length < 2) continue;
+    // Compare deux à deux : dès qu'une divergence de propriétés apparaît → erreur.
+    const first = list[0];
+    if (!first) continue;
+    for (const other of list.slice(1)) {
+      const onlyFirst = [...first.props].filter((x) => !other.props.has(x));
+      const onlyOther = [...other.props].filter((x) => !first.props.has(x));
+      if (onlyFirst.length === 0 && onlyOther.length === 0) continue; // identiques
+      issues.push({
+        code: 'model-property-mismatch',
+        severity: 'error',
+        file: other.file,
+        message:
+          `Modèle '${name}' déclaré de façon incompatible dans ${list.length} fichiers ` +
+          `(${first.file} vs ${other.file}) — il faut un modèle canonique unique`,
+        detail:
+          `proprietesUniquementDans${first.file}=[${onlyFirst.join(',')}] ` +
+          `proprietesUniquementDans${other.file}=[${onlyOther.join(',')}]`,
+      });
+      break; // une seule erreur par nom suffit
+    }
+  }
+  return issues;
+}
+
+/**
+ * PHASE 45 — Route d'entrée : l'application doit démarrer sur l'écran d'accueil.
+ *
+ * Avec Expo Router, `app/index.tsx` EST l'écran de lancement. Défaut observé :
+ * l'application démarrait sur « AddTask » au lieu de « Home ».
+ *
+ * Détection conservatrice, sans faux positif : on ne signale que le cas
+ * non ambigu d'un `<Redirect href="…">` explicite vers une route d'ajout /
+ * de création, ou d'un composant par défaut nommé Add…, Create… ou New….
+ */
+function checkEntryRoute(files: GeneratedFile[]): IntegrityIssue[] {
+  const entry = files.find((f) => normalize(f.path) === 'app/index.tsx');
+  if (!entry) return []; // pas d'Expo Router classique → on ne tranche pas
+
+  const issues: IntegrityIssue[] = [];
+  const ADD_ROUTE = /\/(add|create|new)([-/][a-z0-9-]*)?$/i;
+
+  // Cas 1 : redirection explicite vers une route d'ajout
+  const redirectHref = /<Redirect\s+[^>]*href\s*=\s*["'`]([^"'`]+)["'`]/.exec(entry.content)?.[1];
+  if (redirectHref !== undefined && ADD_ROUTE.test(redirectHref)) {
+    issues.push({
+      code: 'wrong-entry-route', severity: 'error', file: 'app/index.tsx',
+      message: `L'écran de lancement redirige vers '${redirectHref}' (écran d'ajout) au lieu de l'accueil`,
+      detail: redirectHref,
+    });
+  }
+
+  // Cas 2 : le composant par défaut de l'entrée est un écran d'ajout
+  const defaultName = /export\s+default\s+function\s+([A-Za-z0-9_]+)/.exec(entry.content)?.[1]
+    ?? /export\s+default\s+([A-Za-z0-9_]+)/.exec(entry.content)?.[1];
+  if (defaultName && /^(Add|Create|New)[A-Z]/.test(defaultName)) {
+    issues.push({
+      code: 'wrong-entry-route', severity: 'error', file: 'app/index.tsx',
+      message: `L'écran de lancement est '${defaultName}' — l'application doit démarrer sur l'accueil`,
+      detail: defaultName,
+    });
+  }
+  return issues;
+}
+
+/**
+ * PHASE 45 — Câblage des formulaires : un écran qui saisit du texte doit
+ * transmettre ses données (mutation d'état ou navigation avec paramètres).
+ *
+ * Défaut observé : le flux « ajouter une tâche » ne transmettait rien.
+ *
+ * Détection à HAUTE PRÉCISION pour éviter les faux positifs : on n'examine que
+ * les écrans sous `app/` contenant un `TextInput`, et on accepte comme preuve de
+ * câblage n'importe lequel de :
+ *   • un appel de navigation avec paramètres (`router.push({ … params … })`,
+ *     `router.replace`, `router.back`),
+ *   • un appel à une fonction importée d'un store/service (`useTaskStore`,
+ *     `taskService.add…`, `add…(`, `create…(`, `set…(`),
+ *   • un setter `useState` (`setXxx(`).
+ */
+function checkFormWiring(files: GeneratedFile[]): IntegrityIssue[] {
+  const issues: IntegrityIssue[] = [];
+  for (const f of files) {
+    const p = normalize(f.path);
+    if (!p.startsWith('app/') || !isSourceFile(p)) continue;
+    if (!/\bTextInput\b/.test(f.content)) continue;
+
+    const wired =
+      /\brouter\s*\.\s*(push|replace|navigate|back)\s*\(/.test(f.content) ||
+      /\buse[A-Z][A-Za-z0-9]*Store\b/.test(f.content) ||
+      /\b[A-Za-z0-9_]*(Service|Store|Repository)\s*\.\s*[A-Za-z0-9_]+\s*\(/.test(f.content) ||
+      /\b(add|create|save|submit|insert)[A-Za-z0-9_]*\s*\(/.test(f.content) ||
+      /\bset[A-Z][A-Za-z0-9_]*\s*\(/.test(f.content);
+
+    if (!wired) {
+      issues.push({
+        code: 'form-not-wired', severity: 'error', file: p,
+        message: `Écran de saisie sans transmission de données : aucune mutation d'état ` +
+                 `ni navigation avec paramètres détectée`,
+        detail: p,
+      });
+    }
+  }
+  return issues;
+}
+
 // ── Point d'entrée ────────────────────────────────────────────────────────────
 
 /**
@@ -497,6 +645,9 @@ export function validateProjectIntegrity(files: GeneratedFile[]): IntegrityRepor
     ...checkLocalImports(files, resolvable, aliases),
     ...checkDependencies(files, manifest.declared),
     ...checkRoutes(files),
+    ...checkDuplicateModels(files),
+    ...checkEntryRoute(files),
+    ...checkFormWiring(files),
     ...checkDuplicates(files),
     ...checkEmptySources(files),
   ];

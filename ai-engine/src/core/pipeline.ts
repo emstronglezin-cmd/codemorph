@@ -59,7 +59,7 @@ import type { LayerDetectionResult } from './layer-detector';
 // ── NEW PHASES: Application Spec, Content Validation, Delivery Check ─────────
 import { buildApplicationSpec, summarizeSpecForPrompt }  from './application-spec-builder';
 import { validateAllFiles, formatContentReport }          from './content-validator';
-import { runStaticValidationSync }                        from './static-validator';
+import { runStaticValidationSync, runStaticValidation }   from './static-validator';
 import { validateProjectIntegrity, formatIntegrityReport } from './project-integrity-validator';
 import { runDeliveryCheck, formatDeliveryReport }         from './delivery-checker';
 import { buildFunctionalTestResults, formatTestResultsReport } from './functional-test-runner';
@@ -1011,13 +1011,66 @@ export class ConversionPipeline {
     // ── PHASE 12 (NOUVEAU): Delivery Check — READY vs NEEDS_REPAIR ───────────
     jlog.info('🚦 Phase 12: Delivery Check (READY / NEEDS_REPAIR)', { jobId: ctx.jobId });
     const finalContentValidation = validateAllFiles(enhancedFiles, ctx.sourceLanguage ?? 'dart');
-    const staticVal = runStaticValidationSync(enhancedFiles, ctx.sourceLanguage ?? 'dart');
+
+    // ── PHASE 45 : la validation post-génération DOIT s'exécuter ────────────
+    // AVANT : `runStaticValidationSync` (variante SANS tsc) puis un objet
+    // `tsCompilation: { attempted: false }` codé en dur. Résultat : aucune
+    // compilation n'était jamais tentée, et le « Validation time » affiché dans
+    // les métriques correspondait à la seule validation du SCHÉMA IR (Phase 6),
+    // d'où une durée quasi nulle.
+    //
+    // MAINTENANT : la variante asynchrone exécute réellement `tsc --noEmit` sur
+    // les fichiers générés (répertoire temporaire), et la phase est minutée.
+    // Désactivable via AI_RUN_TSC_VALIDATION=false pour les environnements sans
+    // binaire tsc — mais alors le rapport l'indique explicitement.
+    const validationStart = Date.now();
+    const runTsc = process.env['AI_RUN_TSC_VALIDATION'] !== 'false';
+    const staticVal = runTsc
+      ? await runStaticValidation(enhancedFiles, process.cwd(), ctx.sourceLanguage ?? 'dart')
+      : runStaticValidationSync(enhancedFiles, ctx.sourceLanguage ?? 'dart');
+    const postValidationMs = Date.now() - validationStart;
+    console.log(
+      `[PIPELINE] Post-generation validation: ${postValidationMs}ms ` +
+      `(tsc ${staticVal.tsCompilation?.attempted ? (staticVal.tsCompilation.success ? 'PASSED' : 'FAILED') : 'NOT RUN'})`,
+    );
+    jlog.info('⏱️  Phase 12: Post-generation validation timed', {
+      jobId: ctx.jobId, durationMs: postValidationMs,
+      tscAttempted: staticVal.tsCompilation?.attempted ?? false,
+      tscSuccess:   staticVal.tsCompilation?.success ?? false,
+      unverifiableModules: staticVal.tsCompilation?.unverifiableModules?.length ?? 0,
+    });
 
     // ── PHASE 44 : intégrité structurelle déterministe (sans IA) ────────────
     // Détecte ce que le score de fidélité ne mesurait pas : imports locaux non
     // résolus, dépendances absentes du manifeste, routes cassées, doublons,
     // configuration/point d'entrée manquants.
     const integrityReport = validateProjectIntegrity(enhancedFiles);
+
+    // ── PHASE 45 : les imports que le GÉNÉRATEUR n'a pas su résoudre ────────
+    // `import-verifier` les connaît déjà et les marque d'un TODO dans le code
+    // livré. Un projet ne doit JAMAIS être livré avec de tels imports : on les
+    // injecte dans le rapport d'intégrité, qui est la source unique de vérité
+    // du verdict de livraison.
+    if (finalReport.importsUnresolved > 0) {
+      for (let i = 0; i < finalReport.importsUnresolved; i++) {
+        integrityReport.issues.push({
+          code:     'unresolved-local-import',
+          severity: 'error',
+          message:  `Import non résolu identifié par le générateur (TODO import-verifier) — ` +
+                    `le projet ne doit pas être livré en l'état`,
+        });
+      }
+      integrityReport.errorCount += finalReport.importsUnresolved;
+      integrityReport.byCode['unresolved-local-import'] =
+        (integrityReport.byCode['unresolved-local-import'] ?? 0) + finalReport.importsUnresolved;
+      integrityReport.passed  = integrityReport.errorCount === 0;
+      integrityReport.verdict = 'FAIL';
+      console.log(
+        `[PIPELINE] ⛔ ${finalReport.importsUnresolved} import(s) non résolu(s) signalé(s) par ` +
+        `le générateur → verdict d'intégrité forcé à FAIL`,
+      );
+    }
+
     console.log(formatIntegrityReport(integrityReport));
     jlog.info('🔎 Phase 12: Project Integrity Check', {
       jobId: ctx.jobId, verdict: integrityReport.verdict,
@@ -1051,7 +1104,8 @@ export class ConversionPipeline {
       finalFidelityScore,
       finalContentValidation,
       {
-        tsCompilation:  { attempted: false, success: false, errors: [], warnings: [] },
+        // PHASE 45 — résultat RÉEL de la compilation, plus de valeur codée en dur.
+        tsCompilation:  staticVal.tsCompilation ?? { attempted: false, success: false, errors: [], warnings: [] },
         brokenImports:  staticVal.brokenImports,
         sourceImports:  staticVal.sourceImports,
         emptyFiles:     staticVal.emptyFiles,

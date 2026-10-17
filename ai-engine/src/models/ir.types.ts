@@ -828,6 +828,14 @@ export interface StaticValidationResult {
     success:    boolean;
     errors:     string[];
     warnings:   string[];
+    /**
+     * PHASE 45 — Modules externes (react-native, expo…) impossibles à résoudre
+     * parce que les dépendances du projet GÉNÉRÉ ne sont pas installées dans le
+     * répertoire temporaire de validation. Ces erreurs ne sont PAS comptées
+     * comme des échecs : elles sont déclarées « non vérifiables ».
+     * `undefined` signifie que le champ n'a pas été renseigné (ancien appelant).
+     */
+    unverifiableModules?: string[];
   };
   brokenImports: string[];       // import paths that resolve to nothing
   sourceImports: string[];       // imports from source language (Dart, Swift etc.)
@@ -859,7 +867,10 @@ export type IntegrityIssueCode =
   | 'missing-config'
   | 'missing-entrypoint'
   | 'invalid-config-json'
-  | 'empty-source-file';
+  | 'empty-source-file'
+  // PHASE 45
+  | 'wrong-entry-route'
+  | 'form-not-wired';
 
 export interface IntegrityIssue {
   code:     IntegrityIssueCode;

@@ -204,27 +204,76 @@ async function attemptTsCompilation(
     };
     fs.writeFileSync(path.join(tmpDir, 'tsconfig.json'), JSON.stringify(tsConfig, null, 2));
 
-    // Run tsc
-    const tscBin = path.join(workDir, 'node_modules', '.bin', 'tsc');
-    const hasTsc = fs.existsSync(tscBin);
-    if (!hasTsc) {
+    // ── PHASE 45 : localisation robuste du binaire tsc ──────────────────────
+    // AVANT : `path.join(workDir, 'node_modules', '.bin', 'tsc')` uniquement.
+    // Avec des workspaces npm, `tsc` est HOISTÉ à la racine du monorepo : depuis
+    // `ai-engine/`, le chemin n'existe pas et la fonction retournait
+    // silencieusement `attempted: false` — la compilation n'était donc jamais
+    // tentée, sans aucun signal.
+    // On remonte maintenant l'arborescence, avec repli sur require.resolve.
+    let tscBin: string | null = null;
+    let dir = path.resolve(workDir);
+    for (let i = 0; i < 8; i++) {
+      const candidate = path.join(dir, 'node_modules', '.bin', 'tsc');
+      if (fs.existsSync(candidate)) { tscBin = candidate; break; }
+      const parent = path.dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+    if (!tscBin) {
+      try {
+        // Repli : le paquet typescript résolu depuis ce module.
+        const tsEntry = require.resolve('typescript/package.json', { paths: [workDir, __dirname] });
+        const bin = path.join(path.dirname(tsEntry), 'bin', 'tsc');
+        if (fs.existsSync(bin)) tscBin = bin;
+      } catch { /* non résolu */ }
+    }
+    if (!tscBin) {
+      console.warn('[StaticValidator] tsc introuvable — compilation NON tentée (signalé, pas ignoré)');
       return { attempted: false, success: false, errors: [], warnings: [] };
     }
 
     try {
-      execSync(`${tscBin} --noEmit`, { cwd: tmpDir, stdio: 'pipe', timeout: 30_000 });
+      const cmd = tscBin.endsWith('.js') ? `node "${tscBin}" --noEmit` : `"${tscBin}" --noEmit`;
+      execSync(cmd, { cwd: tmpDir, stdio: 'pipe', timeout: 60_000 });
       return { attempted: true, success: true, errors: [], warnings: [] };
     } catch (tscErr: unknown) {
       const output = (tscErr as { stdout?: Buffer; stderr?: Buffer })?.stdout?.toString() ?? '';
-      const errors = output
-        .split('\n')
-        .filter((l) => /error TS/.test(l))
-        .slice(0, 20);
+      const allErrors = output.split('\n').filter((l) => /error TS/.test(l));
+
+      // ── PHASE 45 : classification honnête des erreurs ────────────────────
+      // Le projet GÉNÉRÉ n'a pas ses node_modules dans ce répertoire temporaire.
+      // `tsc` signale donc « Cannot find module 'react-native' » pour chaque
+      // dépendance externe. Compter cela comme un échec produirait un faux
+      // négatif systématique ; l'ignorer produirait un faux positif.
+      // On sépare donc :
+      //   • erreurs sur des modules EXTERNES (spécificateur non relatif)
+      //     → « non vérifiable sans installer les dépendances » ;
+      //   • tout le reste (imports relatifs, types, symboles indéfinis)
+      //     → vrais échecs, qui font échouer la validation.
+      const EXTERNAL_MODULE = /Cannot find module '([^'.][^']*)'|Cannot find module "([^".][^"]*)"/;
+      const external: string[] = [];
+      const real:     string[] = [];
+      for (const line of allErrors) {
+        const m = EXTERNAL_MODULE.exec(line);
+        if (m) external.push((m[1] ?? m[2] ?? '').trim());
+        else real.push(line);
+      }
+      const unverifiableModules = [...new Set(external.filter(Boolean))];
+
       const warnings = output
         .split('\n')
         .filter((l) => /warning/i.test(l))
         .slice(0, 10);
-      return { attempted: true, success: false, errors, warnings };
+
+      return {
+        attempted: true,
+        // Le succès ne dépend QUE des erreurs réellement vérifiables.
+        success:   real.length === 0,
+        errors:    real.slice(0, 20),
+        warnings,
+        unverifiableModules,
+      };
     }
   } catch {
     return { attempted: false, success: false, errors: [], warnings: [] };

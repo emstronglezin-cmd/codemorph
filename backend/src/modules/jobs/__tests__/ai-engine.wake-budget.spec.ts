@@ -120,8 +120,10 @@ describe('Budget de réveil — AiEngineClient', () => {
     expect(err.kind).toBe('rate-limit');
     expect(err.httpStatus).toBe(429);
     // Cœur du correctif : le plancher de réveil est bien porté par l'erreur.
-    expect(err.minDelayMs).toBeGreaterThanOrEqual(36_000); // 45 s × jitter 0.8
-    expect(err.minDelayMs).toBeLessThanOrEqual(54_000);    // 45 s × jitter 1.2
+    // Le plancher ne descend JAMAIS sous le délai de base (jitter ascendant) :
+    // c'est la garantie que le temps de réveil Render (~1 min) est couvert.
+    expect(err.minDelayMs).toBeGreaterThanOrEqual(45_000);
+    expect(err.minDelayMs).toBeLessThanOrEqual(63_000);    // 45 s × 1.4
     expect(postMock).toHaveBeenCalledTimes(1);
   });
 
@@ -139,7 +141,7 @@ describe('Budget de réveil — AiEngineClient', () => {
       floors.push(err.minDelayMs ?? 0);
     }
     // Tous au-dessus du plancher de base, et le 4e ≥ le 1er (progression).
-    for (const f of floors) expect(f).toBeGreaterThanOrEqual(36_000);
+    for (const f of floors) expect(f).toBeGreaterThanOrEqual(45_000);
     expect(floors[3]).toBeGreaterThanOrEqual(floors[0] as number);
   });
 

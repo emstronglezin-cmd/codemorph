@@ -45,6 +45,23 @@ function checkNavigation(files: GeneratedFile[]): { pass: boolean; detail: strin
     return { pass: false, detail: 'No _layout.tsx / navigation root file found' };
   }
   if (!hasNavContent) {
+    // ── FIX PHASE 45 — FAUX POSITIF sur Expo Router ────────────────────────
+    // Expo Router est un routeur BASÉ SUR LES FICHIERS : `<Stack />` seul est
+    // parfaitement valide, les routes sont dérivées de l'arborescence `app/`.
+    // Exiger `Stack.Screen` déclarait à tort NEEDS_REPAIR tout projet Expo
+    // Router correct. On n'accepte l'absence de Screen explicite que s'il existe
+    // réellement des fichiers de route sous app/ — sinon l'échec est conservé.
+    const routeFiles = files.filter((f) =>
+      /^app\//.test(f.path) &&
+      /\.(tsx?|jsx?)$/.test(f.path) &&
+      !/_layout\.(tsx?|jsx?)$/.test(f.path));
+    if (routeFiles.length > 0) {
+      return {
+        pass: true,
+        detail: `Expo Router file-based navigation (${layoutFile.path}) with ` +
+                `${routeFiles.length} route file(s) — explicit Screen definitions are optional`,
+      };
+    }
     return { pass: false, detail: `${layoutFile.path} exists but has no Screen definitions` };
   }
   const screenCount = (layoutFile.content.match(/Stack\.Screen|Tab\.Screen/g) ?? []).length;
@@ -207,6 +224,13 @@ export function runDeliveryCheck(
           : `${integrity.byCode['missing-route-target']} route(s) point to a missing screen`,
       },
       {
+        item:   'Canonical models (no duplicate incompatible types)',
+        passed: (integrity.byCode['model-property-mismatch'] ?? 0) === 0,
+        detail: (integrity.byCode['model-property-mismatch'] ?? 0) === 0
+          ? 'No exported type is declared with conflicting properties'
+          : `${integrity.byCode['model-property-mismatch']} type(s) declared incompatibly in several files`,
+      },
+      {
         item:   'Project scaffold complete',
         passed: ((integrity.byCode['missing-config'] ?? 0) +
                  (integrity.byCode['missing-entrypoint'] ?? 0) +
@@ -308,7 +332,12 @@ export function runDeliveryCheck(
   if (integrity) {
     for (const code of ['unresolved-local-import', 'missing-dependency', 'missing-route-target',
                         'duplicate-file', 'invalid-config-json', 'missing-config',
-                        'missing-entrypoint', 'empty-source-file'] as const) {
+                        'missing-entrypoint', 'empty-source-file',
+                        // PHASE 45 — deux modèles incompatibles (ex. deux `Task`
+                        // avec `completed` vs `isDone`) cassent le flux utilisateur.
+                        'model-property-mismatch',
+                        // PHASE 45 — flux utilisateur cassé
+                        'wrong-entry-route', 'form-not-wired'] as const) {
       const n = integrity.byCode[code] ?? 0;
       if (n > 0) blockers.push(`Integrity: ${n} × ${code}`);
     }

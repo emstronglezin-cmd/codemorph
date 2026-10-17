@@ -345,7 +345,16 @@ export class AiEngineClient {
   private computeWakeFloorMs(attempt: number): number {
     const base   = this.hibernationBaseWaitMs;
     const capped = Math.min(base + (attempt - 1) * 15_000, 180_000);
-    const jitter = 0.8 + Math.random() * 0.4; // ±20 %
+    // FIX PHASE 45 — le jitter ne doit JAMAIS descendre sous le délai de base.
+    //
+    // La Phase 43 utilisait un jitter de ±20 %, ce qui pouvait ramener le
+    // plancher à 36 s pour un spin-up Render documenté à ~1 minute : le plancher
+    // ne couvrait alors plus le cas qu'il est censé couvrir. Un test existant
+    // (`ai-engine.hibernation.spec.ts`) l'a détecté.
+    //
+    // Le jitter sert à désynchroniser les jobs concurrents, pas à raccourcir
+    // l'attente physique : il est donc strictement ASCENDANT (+0 à +40 %).
+    const jitter = 1.0 + Math.random() * 0.4;
     return Math.round(capped * jitter);
   }
 
