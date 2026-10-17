@@ -124,6 +124,31 @@ export interface RateLimitProvenance {
  * requête : `x-powered-by: Express` est posé par Express, `x-request-id` est
  * écho par notre middleware requestLogger.
  */
+/**
+ * États distincts du service AI Engine (FIX PHASE 43).
+ * Un 429 ne signifie PAS automatiquement « en veille » : il faut l'en-tête
+ * `x-render-routing` pour l'affirmer.
+ */
+export type AiServiceState =
+  | 'ready'           // l'application répond et est opérationnelle
+  | 'up-unavailable'  // l'application répond mais n'est pas prête (ex: clé manquante)
+  | 'starting'        // Render a routé, l'application n'a pas encore répondu
+  | 'asleep'          // rejet d'hibernation Render (x-render-routing)
+  | 'rate-limited'    // 429 réel
+  | 'server-error'    // 5xx émis par l'application
+  | 'network-error'   // aucune réponse HTTP (DNS, refus, reset)
+  | 'app-error';      // autre réponse applicative
+
+export interface AiServiceProbe {
+  state: AiServiceState;
+  httpStatus?: number;
+  uptime?: string;
+  durationMs: number;
+  detail: string;
+  /** Qui a réellement répondu : l'app, la plateforme Render, ou personne. */
+  source: 'app' | 'render-platform' | 'network' | 'unknown' | 'mock';
+}
+
 const APP_MARKERS = ['x-powered-by', 'x-request-id'] as const;
 
 /**
@@ -284,6 +309,50 @@ export class AiEngineClient {
   private dispatchInFlight = 0;
   private dispatchWaitQueue: Array<() => void> = [];
   private readonly MAX_DISPATCH_CONCURRENT = 2; // conservatif pour Render free tier
+
+  // ── FIX PHASE 43 — Budget de RÉVEIL, distinct du temps de traitement IA ──
+  // Une instance Render free tier endormie met ~1 min à redémarrer (doc Render).
+  // Ce budget borne le temps passé à ATTENDRE le réveil, sans toucher au timeout
+  // global de conversion (inchangé). Suivi par jobId : le job et son snapshot
+  // sont conservés d'une tentative à l'autre, rien n'est recréé.
+  /** Horodatage de la dernière sonde par job (anti-boucle de réveil). */
+  private readonly lastProbeAt = new Map<string, number>();
+  private readonly lastProbeResult = new Map<string, AiServiceProbe>();
+
+  private readonly wakeTrack = new Map<string, {
+    firstAt: number; attempts: number; totalWaitMs: number;
+  }>();
+  /** Durée totale max consacrée au réveil d'un job (env: AI_ENGINE_WAKE_BUDGET_MS). */
+  private get wakeBudgetMs(): number {
+    return envInt('AI_ENGINE_WAKE_BUDGET_MS', 240_000, 30_000, 1_800_000);
+  }
+  /** Nombre max de tentatives de réveil pour un même job. */
+  private get wakeMaxAttempts(): number {
+    return envInt('AI_ENGINE_WAKE_MAX_ATTEMPTS', 6, 1, 20);
+  }
+  /** Délai de base avant une tentative de réveil (env: AI_ENGINE_HIBERNATION_WAIT_MS). */
+  private get hibernationBaseWaitMs(): number {
+    return envInt('AI_ENGINE_HIBERNATION_WAIT_MS', 45_000, 5_000, 600_000);
+  }
+
+  /**
+   * Backoff PROGRESSIF avec jitter pour le réveil d'une instance endormie.
+   * Progressif : chaque tentative attend un peu plus longtemps, car un spin-up
+   * Render peut dépasser la minute. Jitter ±20 % pour désynchroniser les jobs.
+   * Ce n'est qu'un PLANCHER : `computeRetryDelayMs` prend le max avec le backoff
+   * standard, il ne peut donc jamais raccourcir une attente existante.
+   */
+  private computeWakeFloorMs(attempt: number): number {
+    const base   = this.hibernationBaseWaitMs;
+    const capped = Math.min(base + (attempt - 1) * 15_000, 180_000);
+    const jitter = 0.8 + Math.random() * 0.4; // ±20 %
+    return Math.round(capped * jitter);
+  }
+
+  /** Oublie le suivi de réveil d'un job (succès ou abandon terminal). */
+  private clearWakeTrack(jobId: string): void {
+    this.wakeTrack.delete(jobId);
+  }
 
   constructor(
     private readonly http: HttpService,
@@ -476,6 +545,17 @@ export class AiEngineClient {
         `message=${data.message ?? '(none)'}`,
       );
       this.recordSuccess();
+      // FIX PHASE 43 — l'instance a répondu : le réveil a réussi. On oublie le
+      // suivi de budget pour ce job (évite toute fuite de la Map).
+      if (this.wakeTrack.has(req.jobId)) {
+        const t = this.wakeTrack.get(req.jobId);
+        this.logger.log(
+          `[DISPATCH-WAKE-RECOVERED] jobId=${req.jobId} requestId=${requestId} ` +
+          `wakeAttempts=${t?.attempts ?? 0} wakeElapsedMs=${Date.now() - (t?.firstAt ?? Date.now())} ` +
+          `serviceState=awake action=RESUME_NORMAL_DISPATCH`,
+        );
+        this.clearWakeTrack(req.jobId);
+      }
 
       // L'AI Engine répond { jobId, accepted: true, message } avec 202.
       // Tout autre 2xx est accepté : `accepted` vient alors du corps ou du statut.
@@ -553,25 +633,70 @@ export class AiEngineClient {
       // tourné. Augmenter la cadence des tentatives aggrave le cas : il faut au
       // contraire laisser le temps du spin-up (~1 minute, doc Render).
       if (prov.provenance === 'hibernation') {
-        const hibernationWaitMs = envInt('AI_ENGINE_HIBERNATION_WAIT_MS', 45_000, 5_000, 600_000);
+        // ── Budget de réveil : distinct du temps de traitement IA ────────────
+        const now = Date.now();
+        const track = this.wakeTrack.get(jobId) ?? { firstAt: now, attempts: 0, totalWaitMs: 0 };
+        track.attempts += 1;
+        const floorMs = this.computeWakeFloorMs(track.attempts);
+        track.totalWaitMs += floorMs;
+        this.wakeTrack.set(jobId, track);
+
+        const elapsedMs  = now - track.firstAt;
+        const budgetMs   = this.wakeBudgetMs;
+        // `>=` et non `>` : `wakeMaxAttempts` est le nombre MAX de tentatives de
+        // réveil. À la dernière tentative autorisée on abandonne au lieu de
+        // planifier un retry qui ne sera jamais exécuté.
+        const exhausted  = track.attempts >= this.wakeMaxAttempts
+          || elapsedMs + floorMs > budgetMs;
+
+        // ── Budget épuisé → erreur EXPLICITE et exploitable, pas un échec générique
+        if (exhausted) {
+          this.clearWakeTrack(jobId);
+          this.logger.error(
+            `[DISPATCH-WAKE-EXHAUSTED] jobId=${jobId} requestId=${requestId} url=${targetUrl} ` +
+            `httpStatus=429 errorType=hibernation wakeAttempts=${track.attempts} ` +
+            `wakeElapsedMs=${elapsedMs} wakeBudgetMs=${budgetMs} ` +
+            `wakeMaxAttempts=${this.wakeMaxAttempts} ` +
+            `renderRouting=${(headers['x-render-routing'] ?? '').slice(0, 40)} ` +
+            `serviceState=asleep-did-not-wake action=FAIL_EXPLICIT_NO_MORE_RETRIES ` +
+            `hint="Render free-tier instance did not wake up within the wake budget. ` +
+            `Fix: use a paid Render instance (paid plans do not spin down) or an external ` +
+            `keep-awake ping; then retry the same job — its source snapshot is preserved."`,
+          );
+          return new NonRetryableError(
+            `AI Engine did not wake up: the Render instance stayed hibernating ` +
+            `(x-render-routing: ${headers['x-render-routing'] ?? 'hibernate-rate-limited'}) ` +
+            `after ${track.attempts} attempts over ${Math.round(elapsedMs / 1000)}s ` +
+            `(wake budget ${Math.round(budgetMs / 1000)}s). ` +
+            `The AI Engine code was never reached — this is a platform wake-up failure, ` +
+            `not a conversion error. ` +
+            `Fix: switch the AI Engine to a paid Render instance (paid plans do not spin ` +
+            `down) or add an external keep-awake ping, then retry the same job — ` +
+            `its source snapshot is preserved, nothing needs re-uploading.`,
+          );
+        }
+
         this.logger.warn(
           `[DISPATCH-429-HIBERNATION] jobId=${jobId} requestId=${requestId} url=${targetUrl} ` +
-          `durationMs=${durationMs} httpStatus=429 errorType=hibernation ` +
+          `durationMs=${durationMs} httpStatus=429 errorType=hibernation serviceState=asleep ` +
           `layer=render-routing renderRouting=${(headers['x-render-routing'] ?? '').slice(0, 40)} ` +
           `provider=${prov.provider} provenance=hibernation ` +
           `retryAfterHeader=${headers['retry-after'] ?? '(absent)'} ` +
-          `nextAttemptFloorMs=${hibernationWaitMs} ` +
+          `wakeAttempt=${track.attempts}/${this.wakeMaxAttempts} ` +
+          `wakeElapsedMs=${elapsedMs}/${budgetMs} nextAttemptFloorMs=${floorMs} ` +
           `body=${bodyInfo} hints=[${prov.hints || 'none'}] ` +
           `verdict="${prov.verdict}" action=WAIT_FOR_SPIN_UP_VIA_QUEUE_BACKOFF`,
         );
         return new RetryableError(
           `AI Engine unreachable: Render free-tier instance is hibernating ` +
           `(${headers['x-render-routing']}). The service spins back up in about a minute; ` +
-          `the job will be retried automatically with a wait floor of ` +
-          `${Math.round(hibernationWaitMs / 1000)}s.`,
+          `the job will be retried automatically (attempt ${track.attempts}/${this.wakeMaxAttempts}) ` +
+          `with a wait floor of ${Math.round(floorMs / 1000)}s.`,
           {
             kind: 'rate-limit', httpStatus: 429, retryAfterMs,
-            minDelayMs: hibernationWaitMs, requestId, provider: prov.provider,
+            // Plancher PROGRESSIF avec jitter. `computeRetryDelayMs` l'applique via
+            // Math.max : il allonge l'attente, ne la raccourcit jamais.
+            minDelayMs: floorMs, requestId, provider: prov.provider,
           },
           axErr instanceof Error ? axErr : undefined,
         );
@@ -1001,6 +1126,116 @@ export class AiEngineClient {
 
   // ── Health check ─────────────────────────────────────────
   // FIX PHASE 32: route corrigée /health → /api/health (route réelle de l'AI Engine)
+  // ── FIX PHASE 43 — Sonde d'état RÉEL du service ────────────────────────────
+  //
+  // `health()` historique retourne `null` pour TOUTE erreur : il est impossible
+  // de distinguer une instance endormie d'un 5xx applicatif ou d'une panne DNS.
+  // Cette sonde classe explicitement les états, en s'appuyant sur les marqueurs
+  // d'origine déjà établis : seuls `x-powered-by` / un `x-request-id` écho prouvent
+  // que le process Node a répondu. Les en-têtes Render (`rndr-id`,
+  // `x-render-origin-server`, `server: cloudflare`) sont présents sur TOUTES les
+  // réponses et ne prouvent rien.
+  //
+  // Un 429 n'est PAS supposé signifier « en veille » : il faut l'en-tête
+  // `x-render-routing` pour l'affirmer.
+  /**
+   * Sonde l'état réel de l'AI Engine. Ne lève jamais d'exception.
+   * Cadencée : au plus une sonde par `AI_ENGINE_PROBE_MIN_INTERVAL_MS` (20 s)
+   * pour un même jobId, afin de ne jamais créer de boucle de réveil.
+   */
+  async probeServiceState(jobId?: string): Promise<AiServiceProbe> {
+    if (this.mockMode) {
+      return { state: 'ready', durationMs: 0, detail: 'mock mode', source: 'mock' };
+    }
+    // Anti-boucle : une seule sonde par intervalle pour un job donné.
+    if (jobId) {
+      const last = this.lastProbeAt.get(jobId);
+      const minInterval = envInt('AI_ENGINE_PROBE_MIN_INTERVAL_MS', 20_000, 1_000, 300_000);
+      if (last !== undefined && Date.now() - last < minInterval) {
+        const cached = this.lastProbeResult.get(jobId);
+        if (cached) return { ...cached, detail: `${cached.detail} (cached, throttled)` };
+      }
+      this.lastProbeAt.set(jobId, Date.now());
+    }
+
+    const url = `${this.baseUrl}/api/health`;
+    const start = Date.now();
+    try {
+      const res = await firstValueFrom(
+        this.http
+          .get<Record<string, unknown>>(url, { timeout: 8_000 })
+          .pipe(timeout(9_000)),
+      );
+      const durationMs = Date.now() - start;
+      const status = (res.data['status'] as string | undefined) ?? 'unknown';
+      const uptime = res.data['uptime'] as string | undefined;
+      const probe: AiServiceProbe = {
+        state: 'ready',
+        httpStatus: res.status,
+        uptime,
+        durationMs,
+        detail: `health responded status=${status}`,
+        source: 'app',
+      };
+      if (jobId) this.lastProbeResult.set(jobId, probe);
+      return probe;
+    } catch (err) {
+      const durationMs = Date.now() - start;
+      const axErr = err as AxiosError;
+      const status = axErr.response?.status;
+      const headers = (axErr.response?.headers ?? {}) as Record<string, string | undefined>;
+      const appAnswered = APP_MARKERS.some((m) => headers[m] !== undefined);
+
+      let probe: AiServiceProbe;
+      if (status === 429 && isRenderHibernationRejection(headers)) {
+        probe = {
+          state: 'asleep', httpStatus: 429, durationMs, source: 'render-platform',
+          detail: `Render refused to wake the instance (x-render-routing: ${headers['x-render-routing']})`,
+        };
+      } else if (status === 429) {
+        probe = {
+          state: 'rate-limited', httpStatus: 429, durationMs,
+          source: appAnswered ? 'app' : 'render-platform',
+          detail: appAnswered
+            ? 'genuine 429 from the application (app markers present)'
+            : '429 without hibernation marker and without app markers — platform, not app',
+        };
+      } else if (status === 503 && appAnswered) {
+        // L'ORDRE COMPTE : 503 avec marqueur applicatif = l'app tourne mais n'est
+        // pas prête (ex: clé API manquante → /readiness renvoie 503). Ce cas doit
+        // être testé AVANT les branches 5xx génériques, sinon il est masqué.
+        probe = {
+          state: 'up-unavailable', httpStatus: 503, durationMs, source: 'app',
+          detail: 'app answered 503 — running but not ready (e.g. missing API key)',
+        };
+      } else if (status !== undefined && status >= 500 && status <= 599 && !appAnswered) {
+        // 5xx SANS marqueur applicatif : le routing Render a répondu, l'app pas encore.
+        probe = {
+          state: 'starting', httpStatus: status, durationMs, source: 'render-platform',
+          detail: `${status} from Render routing with no app markers — service is starting up`,
+        };
+      } else if (status !== undefined && status >= 500) {
+        probe = {
+          state: 'server-error', httpStatus: status, durationMs, source: 'app',
+          detail: `${status} returned by the application itself`,
+        };
+      } else if (axErr.response === undefined) {
+        probe = {
+          state: 'network-error', durationMs, source: 'network',
+          detail: `no HTTP response at all: ${(axErr.code ?? axErr.message ?? 'unknown').slice(0, 80)}`,
+        };
+      } else {
+        probe = {
+          state: 'app-error', httpStatus: status, durationMs,
+          source: appAnswered ? 'app' : 'unknown',
+          detail: `unexpected status ${status} (appAnswered=${appAnswered})`,
+        };
+      }
+      if (jobId) this.lastProbeResult.set(jobId, probe);
+      return probe;
+    }
+  }
+
   async health(): Promise<AiHealthResponse | null> {
     if (this.mockMode) {
       return {

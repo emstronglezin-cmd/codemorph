@@ -1032,8 +1032,24 @@ export class JobsService implements OnModuleInit {
     if (job.userId !== userId) throw new NotFoundException(`Job ${id} not found`);
     if ([JobStatus.DONE, JobStatus.FAILED].includes(job.status)) return;
 
+    // FIX PHASE 43 — propager l'annulation à la file AVANT de statuer en base.
+    // Sans cela, un job en attente de réveil Render (backoff de 45 s+) repartait
+    // et continuait de consommer du quota après annulation.
+    let queueCancelled = false;
+    try {
+      queueCancelled = this.queueAdapter.cancelJob(id);
+    } catch (e) {
+      // L'annulation en file ne doit JAMAIS empêcher l'annulation en base.
+      this.logger.warn(
+        `[Job ${id}] Annulation file en échec (${(e as Error)?.message}) — ` +
+        `le statut en base est tout de même mis à jour`,
+      );
+    }
+
     await this.updateStatus(id, JobStatus.FAILED, { errorMessage: 'Cancelled by user' });
-    this.logger.log(`[Job ${id}] Cancelled by user ${userId}`);
+    this.logger.log(
+      `[Job ${id}] Cancelled by user ${userId} — queueCancelled=${queueCancelled}`,
+    );
   }
 
   // ── AI Engine probe — test HTTP Backend→AI Engine (Phase 32) ───

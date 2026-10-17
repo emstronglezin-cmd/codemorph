@@ -29,7 +29,7 @@ import { IQueueProvider, JobOptions } from './queue.provider.interface';
 // FIX PHASE 35 — NonRetryableError : stopper le retry sur jobs terminaux
 import { NonRetryableError } from './non-retryable.error';
 // FIX PHASE 37 — RetryableError : respecter Retry-After / backoff partagé
-import { retryAfterMsOf }   from './retryable.error';
+import { minDelayMsOf, retryAfterMsOf } from './retryable.error';
 import { computeRetryDelayMs } from './retry-delay';
 
 /** Interface minimale du processeur (évite import circulaire) */
@@ -70,12 +70,16 @@ interface MemoryJob {
   data:         unknown;
   opts:         JobOptions;
   attemptsMade: number;
-  status:       'waiting' | 'active' | 'completed' | 'failed';
+  status:       'waiting' | 'active' | 'completed' | 'failed' | 'cancelled';
   enqueuedAt:   number;
   completedAt?: number;
   error?:       string;
   // FIX PHASE 37 — dernière erreur (pour Retry-After / backoff partagé)
   lastError?:   unknown;
+  // FIX PHASE 43 — annulation propre : le timer de retry planifié doit pouvoir
+  // être annulé, sinon un job cancelé repart quand même après le backoff.
+  retryTimer?:     ReturnType<typeof setTimeout>;
+  cancelRequested?: boolean;
 }
 
 @Injectable()
@@ -91,6 +95,17 @@ export class MemoryQueueProvider implements IQueueProvider, OnModuleDestroy {
 
   /** Jobs terminés (pour référence, bornés par COMPLETED_TTL_MS) */
   private readonly completedJobs = new Map<string, MemoryJob>();
+
+  /**
+   * FIX PHASE 43 — Jobs en attente de RETRY (backoff en cours).
+   *
+   * Le `finally` du worker retire systématiquement le job de `activeJobs`, et le
+   * job n'est remis dans `waitingQueue` qu'à l'expiration du timer de backoff.
+   * Entre les deux, le job n'était dans AUCUNE collection : impossible à annuler.
+   * C'est exactement l'état d'un job qui attend le réveil d'une instance Render
+   * pendant 45 s — le cas où l'annulation est la plus nécessaire.
+   */
+  private readonly pendingRetry = new Map<string, MemoryJob>();
 
   /** Nombre de workers actifs */
   private activeWorkerCount = 0;
@@ -271,7 +286,11 @@ export class MemoryQueueProvider implements IQueueProvider, OnModuleDestroy {
       const isNonRetryable = err instanceof NonRetryableError ||
         (err as { nonRetryable?: boolean })?.nonRetryable === true;
 
-      if (isNonRetryable) {
+      if (job.cancelRequested) {
+        // FIX PHASE 43 — annulation demandée pendant le traitement : on arrête
+        // ici, sans planifier de retry et sans marquer le job « failed ».
+        this.finalizeCancelled(job);
+      } else if (isNonRetryable) {
         // Abandon immédiat — pas de retry, quelle que soit la tentative
         job.status      = 'failed';
         job.completedAt = Date.now();
@@ -288,7 +307,14 @@ export class MemoryQueueProvider implements IQueueProvider, OnModuleDestroy {
           `— retry dans ${delay}ms: ${message}`,
         );
         job.status = 'waiting';
-        setTimeout(() => {
+        this.pendingRetry.set(job.id, job);
+        job.retryTimer = setTimeout(() => {
+          job.retryTimer = undefined;
+          this.pendingRetry.delete(job.id);
+          if (job.cancelRequested) {
+            this.finalizeCancelled(job);
+            return;
+          }
           this.waitingQueue.unshift(job); // Remettre en tête de file (priorité retry)
           this.scheduleNextWorker();
         }, delay);
@@ -328,12 +354,113 @@ export class MemoryQueueProvider implements IQueueProvider, OnModuleDestroy {
     );
   }
 
+  // ── FIX PHASE 43 — Annulation PROPRE d'un job ────────────────────────────
+  //
+  // AVANT : la file n'avait AUCUN moyen d'annuler un job. `JobsService.cancel()`
+  // se contentait de passer le statut en base, et la file continuait de retenter
+  // le job — donc de taper l'AI Engine (et de consommer du quota Groq) pour un
+  // job que l'utilisateur avait déjà abandonné.
+  //
+  // `cancelJob()` :
+  //   • supprime le job de la file d'attente s'il n'a pas démarré ;
+  //   • annule le timer de retry planifié (sinon il repart après le backoff) ;
+  //   • pose un drapeau pour qu'un job déjà actif ne soit PAS retenté ;
+  //   • ne marque JAMAIS le job « failed » : il est « cancelled ».
+  /**
+   * Annule un job. Retourne true si le job était connu de la file.
+   * Idempotent : annuler deux fois ne provoque rien.
+   */
+  cancelJob(jobId: string): boolean {
+    const job = this.findJob(jobId);
+
+    if (!job) {
+      this.logger.warn(`[MemoryQueue] Annulation ignorée — job inconnu: ${jobId}`);
+      return false;
+    }
+    if (job.status === 'cancelled' || job.status === 'completed' || job.status === 'failed') {
+      return true; // déjà terminé : idempotent
+    }
+
+    job.cancelRequested = true;
+
+    // 1. Annuler le retry planifié (le cas le plus important pour l'hibernation :
+    //    un job en attente de réveil pendant 45 s ne doit pas repartir).
+    if (job.retryTimer) {
+      clearTimeout(job.retryTimer);
+      job.retryTimer = undefined;
+    }
+
+    // 2. Retirer de la file d'attente si pas encore démarré.
+    const idx = this.waitingQueue.findIndex((j) => j === job);
+    if (idx !== -1) {
+      this.waitingQueue.splice(idx, 1);
+      this.finalizeCancelled(job);
+    } else {
+      // Job actif : le worker s'arrêtera après l'appel en cours (drapeau posé).
+      this.logger.log(
+        `[MemoryQueue] 🛑 Annulation demandée pour le job actif ${jobId} ` +
+        `(attempt ${job.attemptsMade}) — aucun retry ne sera planifié`,
+      );
+    }
+    return true;
+  }
+
+  /**
+   * Recherche un job par son id INTERNE (`mem-N-<ts>`) OU par le `jobId` MÉTIER
+   * porté dans le payload.
+   *
+   * Cette double correspondance est indispensable : `JobsService.cancel()` ne
+   * connaît que le jobId métier, alors que la file génère son propre id interne.
+   * Sans elle, aucune annulation venue de l'API ne pourrait viser le bon job.
+   */
+  private findJob(key: string): MemoryJob | undefined {
+    const matches = (j: MemoryJob): boolean => {
+      if (j.id === key) return true;
+      const payloadJobId = (j.data as { jobId?: unknown } | undefined)?.jobId;
+      return typeof payloadJobId === 'string' && payloadJobId === key;
+    };
+    return (
+      this.waitingQueue.find(matches) ??
+      this.activeJobs.get(key) ??
+      this.pendingRetry.get(key) ??
+      this.completedJobs.get(key) ??
+      [...this.activeJobs.values()].find(matches) ??
+      [...this.pendingRetry.values()].find(matches) ??
+      [...this.completedJobs.values()].find(matches)
+    );
+  }
+
+  /** Marque définitivement un job comme annulé (une seule fois). */
+  private finalizeCancelled(job: MemoryJob): void {
+    if (job.status === 'cancelled') return;
+    job.status      = 'cancelled';
+    job.completedAt = Date.now();
+    const idx = this.waitingQueue.findIndex((j) => j === job);
+    if (idx !== -1) this.waitingQueue.splice(idx, 1);
+    this.activeJobs.delete(job.id);
+    this.pendingRetry.delete(job.id);
+    this.completedJobs.set(job.id, job);
+    this.logger.log(`[MemoryQueue] 🛑 Job ${job.id} annulé (aucun retry planifié)`);
+  }
+
   // ── Calcul du backoff ─────────────────────────────────────
   // FIX PHASE 37 — même politique que Bull (retry-delay.ts, source unique) :
   //   • RetryableError avec Retry-After → délai respecté (plafonné) ;
   //   • sinon → exponentiel borné (comportement historique préservé).
   private computeBackoff(job: MemoryJob): number {
-    if (retryAfterMsOf(job.lastError) !== undefined) {
+    // FIX PHASE 43 — le plancher de délai (`minDelayMs`) doit AUSSI déclencher
+    // la délégation à la politique partagée.
+    //
+    // AVANT : délégation uniquement si `retryAfterMs !== undefined`. Or un rejet
+    // d'hibernation Render (429 + `x-render-routing: hibernate-rate-limited`)
+    // n'envoie PAS de `Retry-After` : on retombait dans la branche legacy
+    // ci-dessous, qui IGNORE `minDelayMs`. Le plancher de réveil de 45 s posé
+    // par le classifieur n'était jamais lu → 2 s / 4 s / 8 s / 16 s = 30 s pour
+    // 5 tentatives, alors que l'instance met ~1 min à redémarrer.
+    //
+    // `computeRetryDelayMs` applique le plancher via Math.max : il ne peut
+    // qu'ALLONGER l'attente, jamais la raccourcir. Aucune limite contournée.
+    if (retryAfterMsOf(job.lastError) !== undefined || minDelayMsOf(job.lastError) !== undefined) {
       return computeRetryDelayMs(job.lastError, job.attemptsMade);
     }
 

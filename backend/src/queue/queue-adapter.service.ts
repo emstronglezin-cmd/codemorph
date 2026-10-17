@@ -118,6 +118,31 @@ export class QueueAdapterService implements IQueueProvider, OnModuleInit {
   }
 
   /** Tester la connexion Redis avec un timeout */
+  /**
+   * FIX PHASE 43 — Annulation propagée au provider actif.
+   *
+   * AVANT : `JobsService.cancel()` se contentait de passer le statut en base.
+   * La file continuait de retenter le job — donc de taper l'AI Engine et de
+   * consommer du quota Groq pour un job que l'utilisateur avait abandonné.
+   * @returns true si le provider actif a bien annulé le job.
+   */
+  cancelJob(jobId: string): boolean {
+    const provider = this.activeProvider;
+    if (!provider || typeof provider.cancelJob !== 'function') {
+      this.logger.warn(
+        `[QueueAdapter] Annulation non supportée par le provider ` +
+        `${provider?.providerName ?? 'none'} — jobId=${jobId}`,
+      );
+      return false;
+    }
+    const cancelled = provider.cancelJob(jobId);
+    this.logger.log(
+      `[QueueAdapter] Annulation jobId=${jobId} provider=${provider.providerName} ` +
+      `result=${cancelled ? 'cancelled' : 'job-inconnu'}`,
+    );
+    return cancelled;
+  }
+
   private async pingRedis(): Promise<boolean> {
     return new Promise((resolve) => {
       const timeoutHandle = setTimeout(() => {

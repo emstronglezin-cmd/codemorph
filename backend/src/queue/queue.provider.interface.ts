@@ -46,6 +46,15 @@ export interface IQueueProvider {
   add(name: string, data: unknown, opts?: JobOptions): Promise<void>;
 
   /**
+   * FIX PHASE 43 — Annule un job en attente ou en cours.
+   * Optionnel : un provider qui ne sait pas annuler ne l'implémente pas, et
+   * l'appelant retombe sur l'annulation en base seule (comportement historique).
+   * @param jobId  id interne du job OU jobId métier porté dans le payload
+   * @returns true si le job était connu du provider
+   */
+  cancelJob?(jobId: string): boolean;
+
+  /**
    * Indique si ce provider est actuellement disponible / opérationnel.
    */
   isHealthy(): boolean;
