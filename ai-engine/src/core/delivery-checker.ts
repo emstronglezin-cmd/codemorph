@@ -18,6 +18,7 @@
 import type {
   GeneratedFile, IRFidelityScore, ContentValidationReport,
   StaticValidationResult, DeliveryCheckResult, ApplicationSpec,
+  ProjectIntegrityReport,
 } from '../models/ir.types';
 
 // ── Critical file patterns that MUST be converted (not shells) ──────────────
@@ -146,6 +147,9 @@ export function runDeliveryCheck(
   contentReport:  ContentValidationReport,
   staticResult:   StaticValidationResult | null,
   appSpec?:       ApplicationSpec,
+  // PHASE 44 — rapport d'intégrité structurelle (déterministe, sans IA).
+  // Optionnel : les appelants existants continuent de fonctionner.
+  integrity?:     ProjectIntegrityReport,
 ): DeliveryCheckResult {
   console.log(`\n[DeliveryChecker] === Phase 12: Delivery Check ===`);
 
@@ -155,10 +159,15 @@ export function runDeliveryCheck(
   const configCheck    = checkConfig(files, appSpec);
   const shellCheck     = checkNoShellCritical(contentReport);
 
-  const compilationPassed =
-    staticResult?.tsCompilation.attempted === true
-      ? staticResult.tsCompilation.success
-      : true; // NOT_TESTABLE → don't block READY on this
+  // PHASE 44 — distinction explicite entre « compilation réussie » et
+  // « compilation jamais tentée ». AVANT : non tentée ⇒ compilationPassed=true,
+  // ce qui faisait passer READY un projet qui n'avait jamais été compilé.
+  // `compilationPassed` conserve sa sémantique historique (ne bloque pas READY),
+  // mais `compilationTested` expose la vérité et la checklist l'affiche.
+  const compilationTested = staticResult?.tsCompilation.attempted === true;
+  const compilationPassed = compilationTested
+    ? staticResult!.tsCompilation.success
+    : true; // NOT_TESTABLE → ne bloque pas READY, mais n'est PAS une réussite
 
   const noSourceImports = (staticResult?.sourceImports.length ?? contentReport.totalSourceImports) === 0;
 
@@ -167,10 +176,47 @@ export function runDeliveryCheck(
     {
       item:   'TypeScript compilation',
       passed: compilationPassed,
-      detail: staticResult?.tsCompilation.attempted
-        ? (staticResult.tsCompilation.success ? 'Passed' : `${staticResult.tsCompilation.errors.length} error(s)`)
-        : 'Not attempted (tsc not available in sandbox)',
+      detail: compilationTested
+        ? (staticResult!.tsCompilation.success ? 'Passed' : `${staticResult!.tsCompilation.errors.length} error(s)`)
+        // PHASE 44 — libellé explicite : « non testé » n'est pas « réussi ».
+        : 'NOT TESTED (tsc not run in this environment) — not a pass',
     },
+    // ── PHASE 44 : contrôles d'intégrité structurelle déterministe ──────────
+    // Ces items étaient ABSENTS de la checklist : brokenImports, dépendances
+    // manquantes et routes cassées ne bloquaient jamais le statut READY.
+    ...(integrity ? [
+      {
+        item:   'Local imports resolve',
+        passed: (integrity.byCode['unresolved-local-import'] ?? 0) === 0,
+        detail: (integrity.byCode['unresolved-local-import'] ?? 0) === 0
+          ? 'All relative/alias imports resolve to a generated file'
+          : `${integrity.byCode['unresolved-local-import']} unresolved local import(s)`,
+      },
+      {
+        item:   'Dependencies declared in package.json',
+        passed: (integrity.byCode['missing-dependency'] ?? 0) === 0,
+        detail: (integrity.byCode['missing-dependency'] ?? 0) === 0
+          ? 'Every imported package is declared in the manifest'
+          : `${integrity.byCode['missing-dependency']} package(s) imported but not declared`,
+      },
+      {
+        item:   'Navigation targets exist',
+        passed: (integrity.byCode['missing-route-target'] ?? 0) === 0,
+        detail: (integrity.byCode['missing-route-target'] ?? 0) === 0
+          ? 'Every referenced route has a matching screen'
+          : `${integrity.byCode['missing-route-target']} route(s) point to a missing screen`,
+      },
+      {
+        item:   'Project scaffold complete',
+        passed: ((integrity.byCode['missing-config'] ?? 0) +
+                 (integrity.byCode['missing-entrypoint'] ?? 0) +
+                 (integrity.byCode['invalid-config-json'] ?? 0)) === 0,
+        detail: `manifest/entrypoint/config issues: ${
+          (integrity.byCode['missing-config'] ?? 0) +
+          (integrity.byCode['missing-entrypoint'] ?? 0) +
+          (integrity.byCode['invalid-config-json'] ?? 0)}`,
+      },
+    ] : []),
     {
       item:   'No source-language imports in target',
       passed: noSourceImports,
@@ -256,6 +302,22 @@ export function runDeliveryCheck(
     blockers.push(`Fidelity score too low: ${fidelityScore.overall}% (need ≥40%)`);
   }
 
+  // ── PHASE 44 : les erreurs d'intégrité sont des blockers ──────────────────
+  // Un import qui ne résout pas, une dépendance absente du manifeste ou une
+  // route cassée empêchent le projet de tourner : READY est interdit.
+  if (integrity) {
+    for (const code of ['unresolved-local-import', 'missing-dependency', 'missing-route-target',
+                        'duplicate-file', 'invalid-config-json', 'missing-config',
+                        'missing-entrypoint', 'empty-source-file'] as const) {
+      const n = integrity.byCode[code] ?? 0;
+      if (n > 0) blockers.push(`Integrity: ${n} × ${code}`);
+    }
+    for (const code of ['conflicting-file'] as const) {
+      const n = integrity.byCode[code] ?? 0;
+      if (n > 0) warnings.push(`Integrity: ${n} × ${code}`);
+    }
+  }
+
   // Non-blocking warnings
   if (contentReport.totalTodos > 20) {
     warnings.push(`High TODO count: ${contentReport.totalTodos} TODOs in generated files`);
@@ -295,6 +357,12 @@ export function runDeliveryCheck(
     blockers,
     warnings,
     readyChecklist,
+    ...(integrity ? {
+      integrityVerdict:  integrity.verdict,
+      integrityErrors:   integrity.errorCount,
+      integrityWarnings: integrity.warningCount,
+    } : {}),
+    compilationTested,
   };
 }
 

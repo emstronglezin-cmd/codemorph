@@ -328,6 +328,8 @@ export interface ConversionResult {
   contentValidation?:    ContentValidationReport;
   // ── PHASE 12 (NOUVEAU): Delivery Check — READY / NEEDS_REPAIR ────────────
   deliveryCheck?:        DeliveryCheckResult;
+  // ── PHASE 44 : rapport d'intégrité structurelle (déterministe, sans IA) ──
+  integrityReport?:      ProjectIntegrityReport;
   // ── PHASE 8 fonctionnelle (NOUVEAU): Résultats des tests fonctionnels ─────
   testResults?:          TestResultsReport;
   // ── PHASE FINALE: Compilation, ZIP, Rapport ──────────────────────────────
@@ -840,6 +842,46 @@ export interface StaticValidationResult {
 
 export type DeliveryStatus = 'READY' | 'NEEDS_REPAIR';
 
+// ── PHASE 44 : Project Integrity (validation structurelle déterministe) ───────
+// Défini ICI (et non dans project-integrity-validator.ts) pour éviter un cycle
+// d'imports : le validateur importe déjà GeneratedFile depuis ce module.
+
+export type IntegritySeverity = 'error' | 'warning' | 'info';
+
+export type IntegrityIssueCode =
+  | 'unresolved-local-import'
+  | 'missing-dependency'
+  | 'undeclared-symbol'
+  | 'model-property-mismatch'
+  | 'missing-route-target'
+  | 'duplicate-file'
+  | 'conflicting-file'
+  | 'missing-config'
+  | 'missing-entrypoint'
+  | 'invalid-config-json'
+  | 'empty-source-file';
+
+export interface IntegrityIssue {
+  code:     IntegrityIssueCode;
+  severity: IntegritySeverity;
+  file?:    string;
+  message:  string;
+  /** Valeur brute en cause (import, paquet, symbole…) — jamais de code source. */
+  detail?:  string;
+}
+
+export interface ProjectIntegrityReport {
+  issues:        IntegrityIssue[];
+  errorCount:    number;
+  warningCount:  number;
+  infoCount:     number;
+  passed:        boolean;
+  /** Statut de livraison honnête, distinct du score de fidélité. */
+  verdict:       'PASS' | 'PASS_WITH_WARNINGS' | 'FAIL';
+  checkedFiles:  number;
+  byCode:        Partial<Record<IntegrityIssueCode, number>>;
+}
+
 export interface DeliveryCheckResult {
   status:            DeliveryStatus;
   score:             number;         // real fidelity score (0-100)
@@ -853,6 +895,17 @@ export interface DeliveryCheckResult {
   blockers:          string[];       // what prevents READY status
   warnings:          string[];       // non-blocking issues
   readyChecklist:    { item: string; passed: boolean; detail?: string }[];
+  // ── PHASE 44 : intégrité structurelle déterministe ──────────────────────
+  /** Verdict du validateur d'intégrité (imports, dépendances, routes…). */
+  integrityVerdict?:  'PASS' | 'PASS_WITH_WARNINGS' | 'FAIL';
+  integrityErrors?:   number;
+  integrityWarnings?: number;
+  /**
+   * true si une compilation TypeScript a RÉELLEMENT été tentée.
+   * Distinct de `compilationPassed` : une compilation non tentée ne doit plus
+   * être comptée comme réussie.
+   */
+  compilationTested?: boolean;
 }
 
 // ── Test Results (Phase 8) ────────────────────────────────────────────────────

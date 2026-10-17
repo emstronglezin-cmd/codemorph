@@ -60,6 +60,7 @@ import type { LayerDetectionResult } from './layer-detector';
 import { buildApplicationSpec, summarizeSpecForPrompt }  from './application-spec-builder';
 import { validateAllFiles, formatContentReport }          from './content-validator';
 import { runStaticValidationSync }                        from './static-validator';
+import { validateProjectIntegrity, formatIntegrityReport } from './project-integrity-validator';
 import { runDeliveryCheck, formatDeliveryReport }         from './delivery-checker';
 import { buildFunctionalTestResults, formatTestResultsReport } from './functional-test-runner';
 // PHASE 28 PERF FIX: progression temps-réel
@@ -1011,6 +1012,40 @@ export class ConversionPipeline {
     jlog.info('🚦 Phase 12: Delivery Check (READY / NEEDS_REPAIR)', { jobId: ctx.jobId });
     const finalContentValidation = validateAllFiles(enhancedFiles, ctx.sourceLanguage ?? 'dart');
     const staticVal = runStaticValidationSync(enhancedFiles, ctx.sourceLanguage ?? 'dart');
+
+    // ── PHASE 44 : intégrité structurelle déterministe (sans IA) ────────────
+    // Détecte ce que le score de fidélité ne mesurait pas : imports locaux non
+    // résolus, dépendances absentes du manifeste, routes cassées, doublons,
+    // configuration/point d'entrée manquants.
+    const integrityReport = validateProjectIntegrity(enhancedFiles);
+    console.log(formatIntegrityReport(integrityReport));
+    jlog.info('🔎 Phase 12: Project Integrity Check', {
+      jobId: ctx.jobId, verdict: integrityReport.verdict,
+      errors: integrityReport.errorCount, warnings: integrityReport.warningCount,
+    });
+
+    // ── PHASE 44 : plafond de score honnête ─────────────────────────────────
+    // Le score de fidélité mesure la COUVERTURE de la conversion, pas la
+    // validité du code produit. Un projet dont les imports ne résolvent pas ou
+    // dont une dépendance manque ne peut pas être annoncé comme pleinement
+    // validé. Le plafond est appliqué ICI (après génération) et non dans le
+    // calcul de fidélité, pour ne pas fausser la mesure de couverture.
+    //   • FAIL                → plafond 59 % (ne peut pas être « validé »)
+    //   • PASS_WITH_WARNINGS  → plafond 89 % (jamais 100 %)
+    // Le score n'est jamais AUGMENTÉ par ce mécanisme.
+    const integrityCap =
+      integrityReport.verdict === 'FAIL' ? 59
+      : integrityReport.verdict === 'PASS_WITH_WARNINGS' ? 89
+      : 100;
+    if (finalFidelityScore.overall > integrityCap) {
+      console.log(
+        `[PIPELINE] Score plafonné ${finalFidelityScore.overall}% → ${integrityCap}% ` +
+        `(intégrité: ${integrityReport.verdict}, ${integrityReport.errorCount} erreur(s), ` +
+        `${integrityReport.warningCount} avertissement(s))`,
+      );
+      finalFidelityScore.overall = integrityCap;
+    }
+
     const deliveryCheck: DeliveryCheckResult = runDeliveryCheck(
       enhancedFiles,
       finalFidelityScore,
@@ -1026,6 +1061,7 @@ export class ConversionPipeline {
         overallPassed:  staticVal.overallPassed,
       },
       appSpec,
+      integrityReport,
     );
     console.log(formatDeliveryReport(deliveryCheck));
 
@@ -1205,6 +1241,8 @@ export class ConversionPipeline {
       contentValidation: finalContentValidation,
       // ── PHASE 12 (NOUVEAU): Delivery Check — READY / NEEDS_REPAIR ───────────
       deliveryCheck,
+      // ── PHASE 44 : rapport d'intégrité structurelle ─────────────────────
+      integrityReport,
       // ── PHASE 8 fonctionnelle (NOUVEAU): Résultats des tests fonctionnels ────
       testResults,
       // ── PHASE FINALE: Compilation, ZIP, Rapport ─────────────────────────────
