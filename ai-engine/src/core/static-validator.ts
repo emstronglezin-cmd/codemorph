@@ -17,7 +17,9 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import type { GeneratedFile } from '../models/ir.types';
-import type { StaticValidationResult, ValidationCheckResult } from '../models/ir.types';
+import type {
+  StaticValidationResult, ValidationCheckResult, SourceEntities,
+} from '../models/ir.types';
 import { validateProjectIntegrity } from './project-integrity-validator';
 
 // ── Source language import patterns ─────────────────────────────────────────
@@ -400,10 +402,79 @@ async function attemptTsCompilation(
 }
 
 // ── Main: run static validation ───────────────────────────────────────────────
+// ── PHASE 48 : survie des entités source ─────────────────────────────────────
+// Un projet généré peut être structurellement impeccable (imports résolus, tsc
+// vert, routes cohérentes) et ne pourtant contenir AUCUNE des entités métier de
+// la source. Sans ce contrôle, une telle conversion était rapportée PASS.
+
+const SUFFIXES = /(?:screen|service|widget|model|repository|controller|manager|impl|view|page)$/i;
+
+/** `TaskTile` / `task-tile` / `Task Tile` → `tasktile`. */
+function normEntity(name: string): string {
+  return name.replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
+}
+
+/** Nom de base sans suffixe de rôle : `TaskService` → `task`. */
+function baseEntity(name: string): string {
+  const n = normEntity(name);
+  return n.replace(SUFFIXES, '') || n;
+}
+
+export interface MissingSourceEntity {
+  kind:     'model' | 'service' | 'screen' | 'widget';
+  name:     string;
+  expected: string;
+}
+
+export function detectMissingSourceEntities(
+  files:    GeneratedFile[],
+  entities: SourceEntities,
+): MissingSourceEntity[] {
+  const missing: MissingSourceEntity[] = [];
+  const code      = files.map((f) => f.content).join('\n');
+  const pathsNorm = files.map((f) => normEntity(f.path.replace(/\.[^.]+$/, '')));
+  const inPath    = (needle: string): boolean => pathsNorm.some((p) => p.includes(needle));
+
+  // Modèles : on exige une DÉCLARATION du type, pas une simple occurrence.
+  for (const m of entities.models) {
+    const declared = new RegExp(
+      `\\b(?:interface|type|class)\\s+${m.replace(/[^A-Za-z0-9_]/g, '')}\\b`).test(code);
+    if (!declared) missing.push({ kind: 'model', name: m, expected: `interface|type|class ${m}` });
+  }
+
+  // Services : un fichier dont le chemin porte le nom de base, ou une déclaration.
+  for (const sv of entities.services) {
+    const base = baseEntity(sv);
+    const ok   = base.length > 1 && inPath(base) ||
+      new RegExp(`\\b(?:class|const|function)\\s+${sv.replace(/[^A-Za-z0-9_]/g, '')}\\b`).test(code);
+    if (!ok) missing.push({ kind: 'service', name: sv, expected: `fichier ou déclaration pour ${sv}` });
+  }
+
+  // Écrans et composants : un fichier dont le chemin porte le nom de base.
+  for (const sc of entities.screens) {
+    const base = baseEntity(sc);
+    if (!(base.length > 1 && inPath(base))) {
+      missing.push({ kind: 'screen', name: sc, expected: `écran ${sc} (route/fichier *${base}*)` });
+    }
+  }
+  for (const w of entities.widgets) {
+    const base = baseEntity(w);
+    if (!(base.length > 1 && inPath(base))) {
+      missing.push({ kind: 'widget', name: w, expected: `composant ${w} (fichier *${base}*)` });
+    }
+  }
+  return missing;
+}
+
 export async function runStaticValidation(
   files:          GeneratedFile[],
   workDir:        string = process.cwd(),
   _sourceLanguage: string = 'dart',
+  /**
+   * PHASE 48 — entités de la source. Sans elles, le contrôle `source-entities`
+   * reste NOT_RUN : il ne peut pas deviner ce que la source contenait.
+   */
+  sourceEntities?: SourceEntities,
 ): Promise<StaticValidationResult> {
   console.log(`\n[StaticValidator] === Phase 7: Static Validation ===`);
   console.log(`[StaticValidator] Validating ${files.length} files...`);
@@ -438,6 +509,12 @@ export async function runStaticValidation(
     integrity.issues.filter((i) => i.code === code && i.file).map((i) => i.file as string);
 
   const typeChecksApply = files.some((f) => /\.(ts|tsx)$/.test(f.path));
+  // Une liste d'entités vide ne prouve rien : le contrôle est NOT_RUN, pas PASS.
+  const entitiesKnown = !!sourceEntities &&
+    (sourceEntities.models.length + sourceEntities.services.length +
+     sourceEntities.screens.length + sourceEntities.widgets.length) > 0;
+  const missingSourceEntities = entitiesKnown && sourceEntities
+    ? detectMissingSourceEntities(files, sourceEntities) : [];
 
   const checks: ValidationCheckResult[] = [
     {
@@ -527,6 +604,26 @@ export async function runStaticValidation(
       warnings: [],
       files: emptyFiles,
       detail: 'Fichiers sources vides ou sans code',
+    },
+    {
+      // PHASE 48 — les entités métier de la source survivent-elles ?
+      id: 'source-entities',
+      status: !entitiesKnown ? 'NOT_RUN'
+        : missingSourceEntities.length === 0 ? 'PASS' : 'FAIL',
+      durationMs: integrityMs,
+      errors: missingSourceEntities.map((m) =>
+        `${m.kind} source « ${m.name} » absent du projet généré — attendu : ${m.expected}`).slice(0, 40),
+      warnings: [],
+      files: [],
+      ...(entitiesKnown
+        ? {}
+        : { notRunReason: sourceEntities
+            ? 'aucune entité métier extraite de la source — rien à comparer'
+            : 'entités de la source non transmises au validateur' }),
+      detail: sourceEntities
+        ? `modèles ${sourceEntities.models.length}, services ${sourceEntities.services.length}, ` +
+          `écrans ${sourceEntities.screens.length}, composants ${sourceEntities.widgets.length}`
+        : 'Survie des modèles, services, écrans et composants de la source',
     },
     {
       // Aucun test n'est généré ni exécuté pour le projet cible : NOT_RUN explicite.

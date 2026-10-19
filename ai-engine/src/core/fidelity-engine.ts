@@ -253,6 +253,43 @@ function extractSourceProfile(sourceCode: string): SourceProfile {
     }
   }
 
+  // ── PHASE 48 : détection STRUCTURELLE des composants et des modèles ────────
+  // AVANT : les composants n'étaient reconnus que si leur nom finissait par
+  // « Widget » ou « Card », et les modèles que par « Model|Dto|Entity|Response ».
+  // Conséquence : `class Task` et `class TaskTile extends StatelessWidget` —
+  // le nommage Flutter ordinaire — n'étaient JAMAIS extraits. La liste d'entités
+  // source était donc vide, et tout contrôle s'appuyant dessus passait à tort.
+  const classified = new Set<string>([
+    ...profile.screens, ...profile.widgets, ...profile.stateClasses,
+    ...profile.services, ...profile.repositories,
+  ]);
+
+  // Composants : toute classe qui étend StatelessWidget / StatefulWidget et qui
+  // n'est pas déjà comptée comme écran.
+  for (const m of sourceCode.matchAll(
+    /class\s+(\w+)\s+extends\s+(?:StatelessWidget|StatefulWidget)\b/g)) {
+    const name = m[1];
+    if (!name || classified.has(name)) continue;
+    if (/(?:Screen|Page)$/.test(name)) { profile.screens.push(name); classified.add(name); continue; }
+    profile.widgets.push(name);
+    classified.add(name);
+  }
+
+  // Modèles : classes de données — corps contenant des champs `final` (ou des
+  // champs typés) et aucune méthode `build`. Indépendant du nom de la classe.
+  for (const m of sourceCode.matchAll(/class\s+(\w+)[^{]*\{([\s\S]*?)\n\}/g)) {
+    const name = m[1];
+    const body = m[2] ?? '';
+    if (!name || classified.has(name)) continue;
+    if (/\bbuild\s*\(/.test(body)) continue;               // widget, pas modèle
+    if (/^\s*(?:abstract\s+)?class\s/m.test(body)) continue;
+    const hasFields = /^\s*final\s+\w/m.test(body) ||
+                      /^\s*(?:String|int|double|bool|DateTime|List<|Map<)[^;]*;/m.test(body);
+    if (!hasFields) continue;
+    profile.models.push(name);
+    classified.add(name);
+  }
+
   // Dédupliquer
   for (const key of Object.keys(profile) as Array<keyof SourceProfile>) {
     if (Array.isArray(profile[key])) {
@@ -486,6 +523,35 @@ function computeAxis(
 
 // ── Fonction principale ───────────────────────────────────────────────────────
 
+/** Contrôles dont l'échec ou la non-exécution interdit un statut flatteur. */
+export const CRITICAL_CHECKS: ValidationCheckResult['id'][] = [
+  'local-imports', 'dependencies', 'typescript', 'config-entrypoint', 'routes',
+  'source-entities', 'tests', 'build',
+];
+
+/**
+ * PHASE 48 — règle UNIQUE de qualification, partagée entre le calcul du verdict
+ * et la rédaction du rapport utilisateur. Un contrôle absent du rapport compte
+ * comme non exécuté : jamais comme une réussite.
+ */
+export function summarizeValidation(checks: ValidationCheckResult[]): {
+  fullyValidated: boolean;
+  failedCritical: string[];
+  notRunCritical: string[];
+} {
+  const byId = new Map(checks.map((c) => [c.id, c]));
+  const failedCritical = CRITICAL_CHECKS.filter((id) => byId.get(id)?.status === 'FAIL');
+  const notRunCritical = CRITICAL_CHECKS.filter((id) => {
+    const st = byId.get(id)?.status;
+    return st === 'NOT_RUN' || st === undefined;
+  });
+  return {
+    fullyValidated: failedCritical.length === 0 && notRunCritical.length === 0,
+    failedCritical,
+    notRunCritical,
+  };
+}
+
 export function computeFidelityReport(params: {
   jobId:           string;
   sourceCode:      string;
@@ -570,18 +636,10 @@ export function computeFidelityReport(params: {
 
   // ── PHASE 47 : la couverture source ne qualifie PAS la livraison ──────────
   // Contrôles dont l'échec ou la non-exécution interdit un statut flatteur.
-  const CRITICAL: ValidationCheckResult['id'][] = [
-    'local-imports', 'dependencies', 'typescript', 'config-entrypoint', 'routes',
-    'tests', 'build',
-  ];
   const validation   = params.validation ?? [];
   const byId         = new Map(validation.map((c) => [c.id, c]));
-  // Une vérification absente du rapport = NON EXÉCUTÉE. Jamais une réussite.
-  const failedCritical = CRITICAL.filter((id) => byId.get(id)?.status === 'FAIL');
-  const notRunCritical = CRITICAL.filter((id) => {
-    const st = byId.get(id)?.status;
-    return st === 'NOT_RUN' || st === undefined;
-  });
+  // Règle unique, partagée avec le rapport utilisateur.
+  const { fullyValidated: fullyOk, failedCritical, notRunCritical } = summarizeValidation(validation);
 
   // Décomposition : chaque composant est mesuré ou vaut null. JAMAIS 100 par défaut.
   const pct = (ok: boolean): number => (ok ? 100 : 0);
@@ -604,7 +662,7 @@ export function computeFidelityReport(params: {
       : pct(byId.get('typescript')?.status === 'PASS'),
   };
 
-  const fullyValidated = failedCritical.length === 0 && notRunCritical.length === 0;
+  const fullyValidated = fullyOk;
 
   // Plafonds : un échec critique borne à 59, une non-exécution critique à 84.
   // Le score n'est jamais AUGMENTÉ par ce mécanisme.

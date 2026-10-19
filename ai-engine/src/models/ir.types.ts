@@ -328,6 +328,10 @@ export interface ConversionResult {
   contentValidation?:    ContentValidationReport;
   // ── PHASE 12 (NOUVEAU): Delivery Check — READY / NEEDS_REPAIR ────────────
   deliveryCheck?:        DeliveryCheckResult;
+  // ── PHASE 48 : la validation réellement exécutée est exposée au client ─────
+  fidelityValidation?:   FidelityValidationSummary;
+  validationChecks?:     ValidationCheckResult[];
+  validationDurationMs?: number;
   // ── PHASE 44 : rapport d'intégrité structurelle (déterministe, sans IA) ──
   integrityReport?:      ProjectIntegrityReport;
   // ── PHASE 8 fonctionnelle (NOUVEAU): Résultats des tests fonctionnels ─────
@@ -836,7 +840,19 @@ export type ValidationCheckId =
   | 'source-imports'     // imports du langage source résiduels
   | 'empty-files'        // fichiers sources vides
   | 'tests'              // tests disponibles du projet généré
-  | 'build';             // compilation / export du projet
+  | 'build'              // compilation / export du projet
+  | 'source-entities';   // modèles/services/écrans/composants source survivants
+
+/**
+ * PHASE 48 — entités extraites de la source, utilisées pour vérifier qu'elles
+ * survivent réellement dans le projet généré. Réutilise `SourceAnalysis`.
+ */
+export interface SourceEntities {
+  models:   string[];
+  services: string[];
+  screens:  string[];
+  widgets:  string[];
+}
 
 export interface ValidationCheckResult {
   id:          ValidationCheckId;
@@ -907,7 +923,9 @@ export type IntegrityIssueCode =
   | 'empty-source-file'
   // PHASE 45
   | 'wrong-entry-route'
-  | 'form-not-wired';
+  | 'form-not-wired'
+  // PHASE 48
+  | 'missing-layout-screen';
 
 export interface IntegrityIssue {
   code:     IntegrityIssueCode;
@@ -947,6 +965,22 @@ export interface FidelityScoreBreakdown {
   testsExecuted:         number | null;
   /** Compilation effectivement réussie. null = jamais tentée. */
   compilationSucceeded:  number | null;
+}
+
+// ── PHASE 48 : verdict réellement exposé au client ────────────────────────────
+// Le verdict plafonné était calculé puis perdu dans une variable locale du
+// pipeline : ni le rapport JSON ni le rapport utilisateur ne le voyaient.
+
+export interface FidelityValidationSummary {
+  /** Score de fidélité après plafonnement par les contrôles critiques. */
+  overallFidelityScore: number;
+  verdict:              'EXCELLENT' | 'GOOD' | 'PARTIAL' | 'POOR' | 'FAILED';
+  verdictReason:        string;
+  /** true uniquement si aucun contrôle critique n'est FAIL ni NOT_RUN. */
+  fullyValidated:       boolean;
+  failedCritical?:      string[];
+  notRunCritical?:      string[];
+  scoreBreakdown?:      FidelityScoreBreakdown;
 }
 
 export interface DeliveryCheckResult {

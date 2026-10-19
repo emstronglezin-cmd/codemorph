@@ -29,6 +29,10 @@ export interface PlanNormalizationReport {
   deduplicatedServices: Array<{ kept: string; dropped: string; service: string }>;
   duplicatePaths:       Array<{ path: string; kept: 'first' | 'richest' }>;
   entryRouteFixed:      boolean;
+  /** PHASE 48 — groupes de routes supprimés car dépourvus d'écran. */
+  prunedRouteGroups:    string[];
+  /** PHASE 48 — écrans retirés du layout racine faute de fichier cible. */
+  removedLayoutScreens: string[];
   notes:                string[];
 }
 
@@ -294,6 +298,84 @@ export function fixEntryRoute(files: GeneratedFile[]): { files: GeneratedFile[];
  * Point d'entrée : normalise un plan de fichiers générés.
  * Pur et déterministe — aucun appel modèle, aucune écriture disque.
  */
+/**
+ * PHASE 48 — Un groupe de routes Expo Router (`app/(tabs)/`, `app/(auth)/`…)
+ * dont le seul fichier est `_layout.tsx` ne contient AUCUN écran : son layout
+ * déclare pourtant des `<Screen name="…" />` qui ne résolvent vers rien.
+ *
+ * Le gabarit `RN_TAB_LAYOUT` était émis inconditionnellement alors qu'aucun
+ * écran n'était jamais placé dans `app/(tabs)/`. On supprime donc le groupe
+ * vide plutôt que d'inventer un écran factice.
+ */
+export function pruneEmptyRouteGroups(files: GeneratedFile[]): {
+  files:   GeneratedFile[];
+  pruned:  string[];
+} {
+  const pruned: string[] = [];
+  const groupOf = (p: string): string | null => {
+    const m = p.match(/^(.*\/\([^)]+\))\//);
+    return m?.[1] ?? null;
+  };
+
+  const byGroup = new Map<string, string[]>();
+  for (const f of files) {
+    const g = groupOf(f.path);
+    if (!g) continue;
+    byGroup.set(g, [...(byGroup.get(g) ?? []), f.path]);
+  }
+
+  const drop = new Set<string>();
+  for (const [group, paths] of byGroup) {
+    const others = paths.filter((p) => !/(^|\/)_layout\.(tsx?|jsx?)$/.test(p));
+    if (others.length > 0) continue;
+    for (const p of paths) {
+      if (/(^|\/)_layout\.(tsx?|jsx?)$/.test(p)) { drop.add(p); pruned.push(p); }
+    }
+    void group;
+  }
+  if (drop.size === 0) return { files, pruned };
+  return { files: files.filter((f) => !drop.has(f.path)), pruned };
+}
+
+/**
+ * PHASE 48 — Réconcilie les écrans déclarés dans `app/_layout.tsx` avec les
+ * fichiers réellement présents.
+ *
+ * Supprimer un groupe de routes vide sans mettre à jour le layout racine
+ * laissait un `<Stack.Screen name="(tabs)" />` pointant vers rien. Le validateur
+ * le signalait ensuite comme route cassée : la correction d'un défaut en
+ * produisait un autre. On retire donc les déclarations sans cible.
+ */
+export function reconcileRootLayout(files: GeneratedFile[]): {
+  files:    GeneratedFile[];
+  removed:  string[];
+} {
+  const removed: string[] = [];
+  const paths = new Set(files.map((f) => f.path));
+  const exists = (name: string): boolean => {
+    for (const ext of ['.tsx', '.ts', '.jsx', '.js']) if (paths.has(`app/${name}${ext}`)) return true;
+    for (const p of paths) if (p.startsWith(`app/${name}/`)) return true;
+    return false;
+  };
+
+  const next = files.map((f) => {
+    if (f.path !== 'app/_layout.tsx') return f;
+    let content = f.content;
+    // Éléments auto-fermants : <Stack.Screen name="X" ... />
+    content = content.replace(
+      /<(Stack|Tabs|Drawer)\.Screen\s+[^>]*?name=["']([^"']+)["'][^>]*?\/>/g,
+      (whole: string, _tag: string, name: string) => {
+        if (exists(name)) return whole;
+        removed.push(name);
+        return '';
+      },
+    );
+    return content === f.content ? f : { ...f, content };
+  });
+
+  return { files: next, removed };
+}
+
 export function normalizePlan(files: GeneratedFile[]): {
   files:  GeneratedFile[];
   report: PlanNormalizationReport;
@@ -324,14 +406,26 @@ export function normalizePlan(files: GeneratedFile[]): {
   const entry = fixEntryRoute(paths.files);
   if (entry.fixed) notes.push("Route d'entrée reciblée sur un écran réellement présent");
 
+  const groups = pruneEmptyRouteGroups(entry.files);
+  for (const p of groups.pruned) {
+    notes.push(`Groupe de routes vide supprimé : ${p} (aucun écran dans ce groupe)`);
+  }
+
+  const layout = reconcileRootLayout(groups.files);
+  for (const name of layout.removed) {
+    notes.push(`Écran retiré du layout racine car sans fichier correspondant : ${name}`);
+  }
+
   return {
-    files: entry.files,
+    files: layout.files,
     report: {
       addedDependencies:    manifest.added,
       unknownDependencies:  manifest.unknown,
       deduplicatedServices: services.deduplicated,
       duplicatePaths:       paths.duplicates,
       entryRouteFixed:      entry.fixed,
+      prunedRouteGroups:    groups.pruned,
+      removedLayoutScreens: layout.removed,
       notes,
     },
   };

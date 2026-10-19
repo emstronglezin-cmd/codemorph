@@ -273,12 +273,84 @@ export class IRGenerator {
     };
   }
 
+  // ── PHASE 48 : champs réels d'un modèle Dart ───────────────────────────────
+  // AVANT : `fields: [{ name: 'id', ... }]` codé en dur. Le modèle généré ne
+  // contenait donc QUE `id`, alors que la source déclarait `title`, `isDone`…
+  // C'est la cause directe des « modèles incompatibles entre services et
+  // composants » : chaque consommateur réinventait les propriétés manquantes.
+  private static readonly DART_TO_TS: Record<string, string> = {
+    String: 'string', int: 'number', double: 'number', num: 'number',
+    bool: 'boolean', DateTime: 'string', dynamic: 'unknown', Object: 'unknown',
+  };
+
+  private mapDartType(raw: string): string {
+    const t = raw.trim().replace(/\?$/, '');
+    const listM = t.match(/^List<\s*(.+?)\s*>$/);
+    if (listM) return `${this.mapDartType(listM[1] ?? 'unknown')}[]`;
+    const mapM = t.match(/^Map<\s*(.+?)\s*,\s*(.+?)\s*>$/);
+    if (mapM) return `Record<string, ${this.mapDartType(mapM[2] ?? 'unknown')}>`;
+    return IRGenerator.DART_TO_TS[t] ?? t;
+  }
+
+  private extractDartModelFields(
+    content: string, className: string,
+  ): IRDocument['dataLayer']['models'][0]['fields'] {
+    const start = content.search(new RegExp(`\\bclass\\s+${className}\\b`));
+    if (start < 0) return [];
+    const brace = content.indexOf('{', start);
+    if (brace < 0) return [];
+    let depth = 0; let end = -1;
+    for (let i = brace; i < content.length; i++) {
+      const ch = content[i];
+      if (ch === '{') depth++;
+      else if (ch === '}') { depth--; if (depth === 0) { end = i; break; } }
+    }
+    const body = end > 0 ? content.slice(brace + 1, end) : '';
+
+    const fields: IRDocument['dataLayer']['models'][0]['fields'] = [];
+    const fieldRe = /^[ \t]*(?:(?:final|const|late)\s+)*([A-Za-z_][\w<>?,\s]*?)\s+([a-z_]\w*)\s*(?:=[^;]*)?;[ \t]*$/gm;
+    let m: RegExpExecArray | null;
+    while ((m = fieldRe.exec(body)) !== null) {
+      const rawType = (m[1] ?? '').trim();
+      const name    = m[2] ?? '';
+      // Une déclaration de méthode ou de getter n'est pas un champ.
+      if (!name || rawType.includes('(') || /^(return|if|for|while|var)$/.test(rawType)) continue;
+      if (fields.some((f) => f.name === name)) continue;
+      const nullable = /\?\s*$/.test(rawType);
+      const tsType   = this.mapDartType(rawType);
+      fields.push({
+        name,
+        type:     tsType,
+        nullable,
+        unique:   name === 'id',
+        primary:  name === 'id',
+      });
+    }
+    return fields;
+  }
+
   // ── Transpile IR — build from AST without any AI call ────────────────────
   // Called when tier === 'transpile'. Avoids feeding ai.chat() which in transpile
   // mode returns a context stub (not JSON) → causing IR.screens = 0 → businessLogic=0
-  private buildTranspileIR(ctx: ConversionContext, ast: ASTResult, arch: ArchResult): IRGenerationResult {
+  /**
+   * PHASE 48 — graphes UI / backend / données construits de façon
+   * DÉTERMINISTE depuis l'AST, sans aucun appel IA.
+   *
+   * AVANT : `buildStaticIR` (palier sans clé API) renvoyait `uiGraph`,
+   * `backendGraph` et `dataLayer` VIDÉS EN DUR. Toute conversion passant par ce
+   * palier perdait l'intégralité de la structure métier de la source, et le
+   * planificateur n'avait plus qu'à émettre un gabarit générique — d'où des
+   * projets sans modèle, sans service et sans écran réel, alors même que tous
+   * les contrôles structurels passaient.
+   */
+  private buildDeterministicGraphs(
+    ctx: ConversionContext, ast: ASTResult,
+  ): {
+    uiGraph:      IRDocument['uiGraph'];
+    backendGraph: IRDocument['backendGraph'];
+    dataLayer:    IRDocument['dataLayer'];
+  } {
     const uiGraph = this.inferUIGraphFromAST(ast, ctx);
-    const frameworkMap = FRAMEWORK_DEP_MAPS[`${ctx.sourceFramework}->${ctx.targetFramework}`];
 
     // Build minimal backend graph from service/repository files
     const beFiles = ast.files.filter((f) => /service|repository|repo/i.test(f.path));
@@ -296,15 +368,31 @@ export class IRGenerator {
     // Build data layer from model files
     const modelFiles = ast.files.filter((f) => /model|entity/i.test(f.path));
     const dataLayer: IRDocument['dataLayer'] = {
-      models:        modelFiles.map((f) => ({
-        name:      f.classes[0] ?? f.path.split('/').pop()?.replace('.dart','') ?? 'Model',
-        table:     (f.classes[0] ?? 'model').toLowerCase() + 's',
-        fields:    [{ name: 'id', type: 'String', nullable: false, unique: true, primary: true }],
-        relations: [],
-      })),
+      models:        modelFiles.map((f) => {
+        const name   = f.classes[0] ?? f.path.split('/').pop()?.replace('.dart','') ?? 'Model';
+        const parsed = this.extractDartModelFields(f.content, name);
+        // Un modèle dont aucun champ n'a pu être analysé garde au moins `id`,
+        // mais ce repli est désormais l'exception, plus la règle.
+        const fields = parsed.length > 0
+          ? parsed
+          : [{ name: 'id', type: 'string', nullable: false, unique: true, primary: true }];
+        return {
+          name,
+          table:     name.toLowerCase() + 's',
+          fields,
+          relations: [],
+        };
+      }),
       relationships: [],
       migrations:    [],
     };
+
+    return { uiGraph, backendGraph, dataLayer };
+  }
+
+  private buildTranspileIR(ctx: ConversionContext, ast: ASTResult, arch: ArchResult): IRGenerationResult {
+    const frameworkMap = FRAMEWORK_DEP_MAPS[`${ctx.sourceFramework}->${ctx.targetFramework}`];
+    const { uiGraph, backendGraph, dataLayer } = this.buildDeterministicGraphs(ctx, ast);
 
     const sourceMetrics: IRSourceMetrics = {
       screensCount:   uiGraph.screens?.length ?? 0,
@@ -342,9 +430,10 @@ export class IRGenerator {
     const ir: IRDocument = {
       projectMeta:   this.buildProjectMeta(ctx, ast, arch),
       architecture:  this.buildArchitecture(arch),
-      uiGraph:       { screens: [], components: [], navigationFlow: [], stateFlow: [] },
-      backendGraph:  { routes: [], services: [], entities: [], middlewares: [] },
-      dataLayer:     { models: [], relationships: [], migrations: [] },
+      // PHASE 48 — plus de graphes vides : on réutilise les extracteurs
+      // déterministes du palier transpile. Le palier statique diffère par
+      // l'absence d'appel IA, pas par l'abandon de la structure de la source.
+      ...this.buildDeterministicGraphs(ctx, ast),
       dependencyMap: frameworkMap ?? { keep: [], replace: [], remove: [], add: [] },
       conversionPlan: this.buildConversionPlan(ctx, arch),
       validation:    this.buildValidation(ctx, ast, arch),

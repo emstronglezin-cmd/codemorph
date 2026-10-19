@@ -35,7 +35,29 @@ import type { RoundTripResult }   from './round-trip-fidelity';
 /** Score ou null (N/A) */
 type NullableScore = number | null;
 
+/**
+ * PHASE 48 — validation réellement exécutée, telle qu'observée.
+ * Le rapport utilisateur doit dire la même chose que les contrôles : un projet
+ * pouvait auparavant être présenté comme réussi alors qu'aucun test ni build
+ * n'avait tourné.
+ */
+export interface ReportValidationSection {
+  fullyValidated: boolean;
+  durationMs:     number;
+  failedCritical: string[];
+  notRunCritical: string[];
+  checks: Array<{
+    id:         string;
+    status:     'PASS' | 'FAIL' | 'NOT_RUN';
+    durationMs: number;
+    errors:     number;
+    reason?:    string;
+  }>;
+}
+
 export interface ConversionReport {
+  /** PHASE 48 — présent dès que la validation post-génération a tourné. */
+  validation?: ReportValidationSection;
   // 15 métriques principales (null = N/A)
   businessLogic:      NullableScore;
   navigation:         NullableScore;
@@ -97,11 +119,13 @@ export function buildConversionReport(params: {
   conversionType?:     string;
   duration?:           number;
   aiTier?:             string;
+  /** PHASE 48 — contrôles réellement exécutés. */
+  validation?:         ReportValidationSection;
 }): ConversionReport {
   const {
     fidelityScore, autoCorrectionReport, files,
     compilationResult, roundTripResult,
-    projectName, conversionType, duration, aiTier,
+    projectName, conversionType, duration, aiTier, validation,
   } = params;
 
   // Compter les repositories et services générés
@@ -168,6 +192,7 @@ export function buildConversionReport(params: {
     (compilationResult?.errors.filter((e) => e.severity === 'error').length ?? 0) === 0;
 
   return {
+    ...(validation ? { validation } : {}),
     businessLogic:     fidelityScore.businessLogic ?? null,
     navigation:        fidelityScore.navigation    ?? null,
     repositories:      repositoriesScore,
@@ -513,4 +538,37 @@ export function formatConversionReportHTML(report: ConversionReport): string {
   </div>
 </body>
 </html>`;
+}
+
+
+/**
+ * PHASE 48 — section Markdown décrivant ce qui a VRAIMENT été vérifié.
+ *
+ * Fonction autonome plutôt qu'un fragment injecté dans le template existant :
+ * le rapport utilisateur doit refléter les contrôles exécutés, sans quoi un
+ * projet sans test ni build exécuté continuait d'être présenté comme réussi.
+ */
+export function formatValidationSection(validation?: ReportValidationSection): string {
+  const v = validation;
+  if (!v) return '';
+  const icon = (st: string): string =>
+    st === 'PASS' ? '✅ PASS' : st === 'FAIL' ? '❌ FAIL' : '⏭️ NOT_RUN';
+
+  const rows = v.checks
+    .map((c) => `| ${c.id} | ${icon(c.status)} | ${c.durationMs} ms | ${c.errors} |`)
+    .join('\n');
+
+  const failed = v.failedCritical.length > 0
+    ? `\n**Contrôles critiques en ÉCHEC :** ${v.failedCritical.join(', ')}\n` : '';
+  const notRun = v.notRunCritical.length > 0
+    ? `**Contrôles critiques NON EXÉCUTÉS :** ${v.notRunCritical.join(', ')}\n` : '';
+  const warning = v.fullyValidated ? '' :
+    `\n> Un contrôle non exécuté n'est pas un contrôle réussi. Cette conversion ne\n` +
+    `> peut pas être déclarée entièrement validée tant que les contrôles ci-dessus\n` +
+    `> n'ont pas été exécutés avec succès.\n`;
+
+  return `\n## Validation réellement exécutée\n\n` +
+    `**Projet entièrement validé : ${v.fullyValidated ? '✅ OUI' : '❌ NON'}** — durée ${v.durationMs} ms\n\n` +
+    `| Contrôle | Statut | Durée | Erreurs |\n|----------|--------|-------|---------|\n` +
+    `${rows}\n${failed}${notRun}${warning}`;
 }

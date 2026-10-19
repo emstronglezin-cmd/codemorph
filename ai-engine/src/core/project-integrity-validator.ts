@@ -372,6 +372,57 @@ function checkRoutes(files: GeneratedFile[]): IntegrityIssue[] {
   return issues;
 }
 
+/**
+ * PHASE 48 — `<Stack.Screen name="X" />` / `<Tabs.Screen name="X" />` déclarés
+ * dans un `_layout` doivent correspondre à un fichier réellement présent dans le
+ * MÊME répertoire. `checkRoutes` ne couvre que les navigations `router.push`,
+ * si bien qu'un layout déclarant des écrans inexistants passait en PASS.
+ */
+function checkLayoutScreens(files: GeneratedFile[]): IntegrityIssue[] {
+  const issues: IntegrityIssue[] = [];
+  const allPaths = new Set(files.map((f) => normalize(f.path)));
+
+  const existsAsRoute = (dir: string, name: string): boolean => {
+    const base = dir === '' ? '' : `${dir}/`;
+    for (const ext of ['.tsx', '.ts', '.jsx', '.js']) {
+      if (allPaths.has(`${base}${name}${ext}`)) return true;
+    }
+    // Un sous-répertoire de route (avec son propre _layout ou index) convient.
+    for (const p of allPaths) {
+      if (p.startsWith(`${base}${name}/`)) return true;
+    }
+    return false;
+  };
+
+  const screenPattern = /<(?:Stack|Tabs|Drawer)\.Screen\s+[^>]*?name=["']([^"']+)["']/g;
+
+  for (const f of files) {
+    const path = normalize(f.path);
+    // Seuls les fichiers `_layout` d'Expo Router déclarent des écrans.
+    if (!/(^|\/)_layout\.(tsx?|jsx?)$/.test(path)) continue;
+    const dir = path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '';
+
+    let m: RegExpExecArray | null;
+    screenPattern.lastIndex = 0;
+    while ((m = screenPattern.exec(f.content)) !== null) {
+      const name = m[1] ?? '';
+      if (!name) continue;
+      // Groupes et routes dynamiques : on ne peut pas trancher ici.
+      if (name.startsWith('(') || name.includes('[')) continue;
+      if (existsAsRoute(dir, name)) continue;
+      issues.push({
+        code:     'missing-layout-screen',
+        severity: 'error',
+        file:     path,
+        message:  `Le layout déclare <Screen name="${name}" /> mais aucun fichier ` +
+                  `${dir === '' ? '' : dir + '/'}${name}.tsx n'existe`,
+        detail:   `${dir === '' ? '(racine)' : dir}/${name}`,
+      });
+    }
+  }
+  return issues;
+}
+
 /** Fichiers en double (même chemin normalisé) ou au contenu identique à l'octet. */
 function checkDuplicates(files: GeneratedFile[]): IntegrityIssue[] {
   const issues: IntegrityIssue[] = [];
@@ -645,6 +696,7 @@ export function validateProjectIntegrity(files: GeneratedFile[]): IntegrityRepor
     ...checkLocalImports(files, resolvable, aliases),
     ...checkDependencies(files, manifest.declared),
     ...checkRoutes(files),
+    ...checkLayoutScreens(files),
     ...checkDuplicateModels(files),
     ...checkEntryRoute(files),
     ...checkFormWiring(files),

@@ -49,12 +49,14 @@ import { verifyAndFixImports }      from './import-verifier';
 // PHASE FINALE: Nouveaux modules (5, 4, 8, 9)
 import { compileDartFiles }         from './dart-compiler';
 import { packageToZip }             from './zip-packager';
-import { buildConversionReport, formatConversionReport } from './conversion-report';
+import {
+  buildConversionReport, formatConversionReport, formatValidationSection,
+} from './conversion-report';
 import { extractDesignSystem, generateThemeFiles }       from './ui-fidelity-extractor';
 import { detectSourceLayers, summarizeLayerPresence }    from './layer-detector';
 import type { CompilationResult }   from './dart-compiler';
 import type { ZipPackageResult }    from './zip-packager';
-import type { ConversionReport }    from './conversion-report';
+import type { ConversionReport, ReportValidationSection } from './conversion-report';
 import type { LayerDetectionResult } from './layer-detector';
 // ── NEW PHASES: Application Spec, Content Validation, Delivery Check ─────────
 import { buildApplicationSpec, summarizeSpecForPrompt }  from './application-spec-builder';
@@ -67,7 +69,7 @@ import { buildFunctionalTestResults, formatTestResultsReport } from './functiona
 import { ProgressReporter }                               from './progress-reporter';
 // PHASE 29: Fidelity Engine (source vs ZIP comparison)
 import {
-  computeFidelityReport, analyzeSource,
+  computeFidelityReport, analyzeSource, summarizeValidation,
   fidelityReportToMarkdown, fidelityReportToHTML,
 } from './fidelity-engine';
 // PHASE 36: Free-tier large project pipeline — Global Context + Semantic Chunks
@@ -1023,12 +1025,45 @@ export class ConversionPipeline {
     // les fichiers générés (répertoire temporaire), et la phase est minutée.
     // Désactivable via AI_RUN_TSC_VALIDATION=false pour les environnements sans
     // binaire tsc — mais alors le rapport l'indique explicitement.
+    // PHASE 48 — l'analyse de source est calculée AVANT la validation : le
+    // contrôle `source-entities` doit pouvoir comparer les modèles, services,
+    // écrans et composants de la source à ce que le projet généré contient.
+    // Sans cela, un projet générique vide de toute logique métier passait tous
+    // les contrôles structurels et était rapporté comme valide.
+    const sourceAnalysisEarly = analyzeSource(
+      ctx.jobId, ctx.sourceCode, ctx.sourceFramework ?? 'flutter');
+    const sourceEntities = {
+      models:   sourceAnalysisEarly.models,
+      services: [...sourceAnalysisEarly.services, ...sourceAnalysisEarly.repositories],
+      screens:  sourceAnalysisEarly.screens,
+      widgets:  sourceAnalysisEarly.widgets,
+    };
+
     const validationStart = Date.now();
     const runTsc = process.env['AI_RUN_TSC_VALIDATION'] !== 'false';
     const staticVal = runTsc
-      ? await runStaticValidation(enhancedFiles, process.cwd(), ctx.sourceLanguage ?? 'dart')
+      ? await runStaticValidation(enhancedFiles, process.cwd(), ctx.sourceLanguage ?? 'dart', sourceEntities)
       : runStaticValidationSync(enhancedFiles, ctx.sourceLanguage ?? 'dart');
     const postValidationMs = Date.now() - validationStart;
+
+    // PHASE 48 — résumé de validation calculé UNE fois, au niveau de la
+    // fonction, pour que le rapport JSON, le Markdown injecté dans le ZIP et le
+    // résultat retourné décrivent exactement les mêmes contrôles.
+    const validationSummary = staticVal.checks ? summarizeValidation(staticVal.checks) : null;
+    const validationSection: ReportValidationSection | undefined =
+      staticVal.checks && validationSummary ? {
+        fullyValidated: validationSummary.fullyValidated,
+        durationMs:     staticVal.validationDurationMs ?? 0,
+        failedCritical: validationSummary.failedCritical,
+        notRunCritical: validationSummary.notRunCritical,
+        checks: staticVal.checks.map((c) => ({
+          id:         c.id,
+          status:     c.status,
+          durationMs: c.durationMs,
+          errors:     c.errors.length,
+          ...(c.notRunReason ? { reason: c.notRunReason } : {}),
+        })),
+      } : undefined;
     console.log(
       `[PIPELINE] Post-generation validation: ${postValidationMs}ms ` +
       `(tsc ${staticVal.tsCompilation?.attempted ? (staticVal.tsCompilation.success ? 'PASSED' : 'FAILED') : 'NOT RUN'})`,
@@ -1123,6 +1158,9 @@ export class ConversionPipeline {
     jlog.info('📊 Phase Finale 9: Conversion Report', { jobId: ctx.jobId });
     let conversionReportData: { text: string; json: string; markdown: string; html: string } | undefined;
     try {
+      // PHASE 48 — le rapport utilisateur reçoit les contrôles RÉELLEMENT
+      // exécutés. La règle de qualification est celle, unique, de
+      // `summarizeValidation` : aucune duplication de logique.
       const report: ConversionReport = buildConversionReport({
         fidelityScore:        finalFidelityScore,
         autoCorrectionReport,
@@ -1132,9 +1170,10 @@ export class ConversionPipeline {
         conversionType:       `${ctx.sourceFramework ?? 'unknown'} → ${ctx.targetFramework ?? 'unknown'}`,
         duration:             durationMs,
         aiTier:               tier,
+        ...(validationSection ? { validation: validationSection } : {}),
       });
 
-      const { formatConversionReportJSON, formatConversionReportMarkdown, formatConversionReportHTML } = await import('./conversion-report');
+      const { formatConversionReportJSON, formatConversionReportMarkdown, formatConversionReportHTML, formatValidationSection } = await import('./conversion-report');
       const reportText = formatConversionReport(report);
 
       // Afficher le rapport dans la console (Phase 9)
@@ -1143,7 +1182,7 @@ export class ConversionPipeline {
       conversionReportData = {
         text:     reportText,
         json:     formatConversionReportJSON(report),
-        markdown: formatConversionReportMarkdown(report),
+        markdown: formatConversionReportMarkdown(report) + formatValidationSection(validationSection),
         html:     formatConversionReportHTML(report),
       };
     } catch (rptErr) {
@@ -1167,7 +1206,8 @@ export class ConversionPipeline {
 
     try {
       // 1. Source analysis (avant le score)
-      sourceAnalysis = analyzeSource(ctx.jobId, ctx.sourceCode, ctx.sourceFramework ?? 'flutter');
+      // PHASE 48 — réutilise l'analyse déjà calculée avant la validation.
+      sourceAnalysis = sourceAnalysisEarly;
       jlog.info(`📊 Source analysis: ${sourceAnalysis.screens} screens, ${sourceAnalysis.services} services, ${sourceAnalysis.apiEndpoints} API endpoints`, {
         screens: sourceAnalysis.screens,
         services: sourceAnalysis.services,
@@ -1255,6 +1295,25 @@ export class ConversionPipeline {
           transformed: ax.transformed.slice(0, 10),
         })),
         phaseTimings,
+        // ── PHASE 48 : la validation réellement exécutée entre dans le JSON ──
+        // Sans ce bloc, le rapport JSON annonçait un verdict sans aucune trace
+        // des contrôles : impossible de contredire un « EXCELLENT » infondé.
+        validation: {
+          fullyValidated:     validationSection?.fullyValidated ?? false,
+          durationMs:         validationSection?.durationMs ?? 0,
+          failedCritical:     validationSection?.failedCritical ?? [],
+          notRunCritical:     validationSection?.notRunCritical ?? [],
+          verdict:            fe.verdict,
+          verdictReason:      fe.verdictReason,
+          scoreBreakdown:     fe.scoreBreakdown ?? null,
+          checks: (validationSection?.checks ?? []).map((c) => ({
+            id:         c.id,
+            status:     c.status,
+            durationMs: c.durationMs,
+            errors:     c.errors,
+            ...(c.reason ? { reason: c.reason } : {}),
+          })),
+        },
       };
       reportFilesToInject.push({
         path: '_codemorph-reports/conversion-report.json',
@@ -1264,7 +1323,11 @@ export class ConversionPipeline {
       // conversion-report.md
       reportFilesToInject.push({
         path: '_codemorph-reports/conversion-report.md',
-        content: fidelityReportToMarkdown(fe),
+        // PHASE 48 — le fichier nommé « conversion-report.md » était produit par
+        // `fidelityReportToMarkdown`, qui ignore totalement la validation :
+        // c'est la cause directe du désaccord entre le rapport affiché et les
+        // contrôles réellement exécutés. La section est maintenant ajoutée.
+        content: fidelityReportToMarkdown(fe) + formatValidationSection(validationSection),
       });
 
       // fidelity-report.html
@@ -1311,6 +1374,28 @@ export class ConversionPipeline {
       // ── PHASE 23/28: Score fidélité composite + rapport auto-correction ─────
       fidelityScore:        finalFidelityScore,
       autoCorrectionReport,
+      // ── PHASE 48 : le verdict plafonné et les contrôles réellement exécutés
+      // sont désormais EXPOSÉS. Avant ce correctif, `fidelityEngineReport` était
+      // une variable locale du pipeline : le verdict borné par les contrôles ne
+      // sortait que dans les logs console, jamais dans le rapport JSON ni dans
+      // le rapport utilisateur — d'où des rapports en désaccord avec la réalité.
+      ...(fidelityEngineReport ? {
+        fidelityValidation: {
+          overallFidelityScore: fidelityEngineReport.overallFidelityScore,
+          verdict:              fidelityEngineReport.verdict,
+          verdictReason:        fidelityEngineReport.verdictReason,
+          fullyValidated:       fidelityEngineReport.fullyValidated ?? false,
+          ...(fidelityEngineReport.failedCritical?.length
+            ? { failedCritical: fidelityEngineReport.failedCritical } : {}),
+          ...(fidelityEngineReport.notRunCritical?.length
+            ? { notRunCritical: fidelityEngineReport.notRunCritical } : {}),
+          ...(fidelityEngineReport.scoreBreakdown
+            ? { scoreBreakdown: fidelityEngineReport.scoreBreakdown } : {}),
+        },
+      } : {}),
+      ...(staticVal.checks ? { validationChecks: staticVal.checks } : {}),
+      ...(staticVal.validationDurationMs !== undefined
+        ? { validationDurationMs: staticVal.validationDurationMs } : {}),
       // ── PHASE 2.5 (NOUVEAU): ApplicationSpec — source de vérité ─────────────
       ...(appSpec !== undefined ? { applicationSpec: appSpec } : {}),
       // ── PHASE 6 (NOUVEAU): Content Validation — SHELL detection ─────────────
