@@ -29,7 +29,9 @@
 //   Score = somme(poids × score_axe) / somme(poids_axes_applicables)
 // ============================================================
 
-import type { GeneratedFile } from '../models/ir.types';
+import type {
+  GeneratedFile, ValidationCheckResult, FidelityScoreBreakdown,
+} from '../models/ir.types';
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -84,6 +86,20 @@ export interface FidelityReport {
   // Verdict
   verdict:             'EXCELLENT' | 'GOOD' | 'PARTIAL' | 'POOR' | 'FAILED';
   verdictReason:       string;
+  // ── PHASE 47 : la fidélité ne suffit plus à qualifier la livraison ─────────
+  /** Décomposition en 6 composants mesurés séparément (null = non mesuré). */
+  scoreBreakdown?:     FidelityScoreBreakdown;
+  /** Résultats par contrôle, tels qu'exécutés. */
+  validationChecks?:   ValidationCheckResult[];
+  /**
+   * true UNIQUEMENT si aucun contrôle critique n'est en FAIL et qu'aucun
+   * contrôle critique n'est en NOT_RUN. Distinct du verdict de fidélité.
+   */
+  fullyValidated?:     boolean;
+  /** Contrôles critiques non exécutés — empêche EXCELLENT. */
+  notRunCritical?:     string[];
+  /** Contrôles critiques en échec — empêche tout statut « validé ». */
+  failedCritical?:     string[];
   // Timing
   computedInMs:        number;
 }
@@ -476,6 +492,12 @@ export function computeFidelityReport(params: {
   generatedFiles:  GeneratedFile[];
   sourceFramework: string;
   targetFramework: string;
+  /**
+   * PHASE 47 — résultats RÉELS de la validation post-génération. Optionnel pour
+   * préserver les appelants existants, mais sans lui le rapport ne peut PAS
+   * prétendre à une conversion entièrement validée.
+   */
+  validation?:     ValidationCheckResult[];
 }): FidelityReport {
   const startMs = Date.now();
   const { jobId, sourceCode, generatedFiles, sourceFramework, targetFramework } = params;
@@ -546,13 +568,69 @@ export function computeFidelityReport(params: {
   const totalMissing     = axes.reduce((s, a) => s + a.missing.length, 0);
   const totalAdded       = axes.reduce((s, a) => s + a.added.length, 0);
 
+  // ── PHASE 47 : la couverture source ne qualifie PAS la livraison ──────────
+  // Contrôles dont l'échec ou la non-exécution interdit un statut flatteur.
+  const CRITICAL: ValidationCheckResult['id'][] = [
+    'local-imports', 'dependencies', 'typescript', 'config-entrypoint', 'routes',
+    'tests', 'build',
+  ];
+  const validation   = params.validation ?? [];
+  const byId         = new Map(validation.map((c) => [c.id, c]));
+  // Une vérification absente du rapport = NON EXÉCUTÉE. Jamais une réussite.
+  const failedCritical = CRITICAL.filter((id) => byId.get(id)?.status === 'FAIL');
+  const notRunCritical = CRITICAL.filter((id) => {
+    const st = byId.get(id)?.status;
+    return st === 'NOT_RUN' || st === undefined;
+  });
+
+  // Décomposition : chaque composant est mesuré ou vaut null. JAMAIS 100 par défaut.
+  const pct = (ok: boolean): number => (ok ? 100 : 0);
+  const structuralCodes: ValidationCheckResult['id'][] = [
+    'local-imports', 'dependencies', 'config-entrypoint', 'routes',
+  ];
+  const structuralMeasured = structuralCodes.filter((id) => byId.get(id)?.status !== undefined);
+  const scoreBreakdown: FidelityScoreBreakdown = {
+    sourceCoverage: overallFidelityScore,
+    structuralCoherence: structuralMeasured.length === 0 ? null
+      : Math.round(structuralMeasured.reduce(
+          (acc, id) => acc + pct(byId.get(id)?.status === 'PASS'), 0) / structuralMeasured.length),
+    // Aucune mesure fonctionnelle automatisée n'existe : explicitement null.
+    functionalPreservation: null,
+    staticValidation: byId.get('typescript')?.status === undefined ? null
+      : pct(byId.get('typescript')?.status === 'PASS'),
+    testsExecuted: byId.get('tests')?.status === 'PASS' ? 100 : null,
+    compilationSucceeded: byId.get('typescript')?.status === 'NOT_RUN' ? null
+      : byId.get('typescript') === undefined ? null
+      : pct(byId.get('typescript')?.status === 'PASS'),
+  };
+
+  const fullyValidated = failedCritical.length === 0 && notRunCritical.length === 0;
+
+  // Plafonds : un échec critique borne à 59, une non-exécution critique à 84.
+  // Le score n'est jamais AUGMENTÉ par ce mécanisme.
+  let cappedScore = overallFidelityScore;
+  if (failedCritical.length > 0)      cappedScore = Math.min(cappedScore, 59);
+  else if (notRunCritical.length > 0) cappedScore = Math.min(cappedScore, 84);
+
   // Verdict
   let verdict: FidelityReport['verdict'];
   let verdictReason: string;
-  if (overallFidelityScore >= 85) {
+  if (cappedScore >= 85 && fullyValidated) {
     verdict = 'EXCELLENT';
-    verdictReason = 'All key elements faithfully reproduced';
-  } else if (overallFidelityScore >= 70) {
+    verdictReason = 'All key elements faithfully reproduced and all critical checks passed';
+  } else if (failedCritical.length > 0) {
+    // Un contrôle critique en échec ne peut JAMAIS donner mieux que PARTIAL.
+    verdict = cappedScore >= 50 ? 'PARTIAL' : cappedScore >= 20 ? 'POOR' : 'FAILED';
+    verdictReason =
+      `Critical checks FAILED: ${failedCritical.join(', ')} — conversion not fully validated ` +
+      `(source coverage ${overallFidelityScore}%)`;
+  } else if (notRunCritical.length > 0 && cappedScore >= 70) {
+    // Non exécuté ≠ réussi : on plafonne à GOOD et on le dit.
+    verdict = 'GOOD';
+    verdictReason =
+      `Source coverage ${overallFidelityScore}% but critical checks NOT RUN: ` +
+      `${notRunCritical.join(', ')} — cannot be reported as fully validated`;
+  } else if (cappedScore >= 85) {
     verdict = 'GOOD';
     verdictReason = `${totalMissing} elements missing but core structure preserved`;
   } else if (overallFidelityScore >= 50) {
@@ -569,6 +647,11 @@ export function computeFidelityReport(params: {
   return {
     jobId,
     timestamp:           new Date().toISOString(),
+    scoreBreakdown,
+    ...(validation.length > 0 ? { validationChecks: validation } : {}),
+    fullyValidated,
+    ...(notRunCritical.length > 0 ? { notRunCritical } : {}),
+    ...(failedCritical.length > 0 ? { failedCritical } : {}),
     sourceFramework,
     targetFramework,
     sourceFileCount:     src.totalFiles,

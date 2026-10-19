@@ -1176,17 +1176,39 @@ export class ConversionPipeline {
       });
 
       // 2. Fidelity engine — compare raw source vs generated files
+      // PHASE 47 — on lui transmet les contrôles RÉELLEMENT exécutés. Avant ce
+      // correctif, `computeFidelityReport` ne voyait que la couverture source :
+      // une fidélité de 100 % suffisait à afficher « EXCELLENT » alors que des
+      // imports étaient cassés, des routes fausses et aucun build exécuté.
       fidelityEngineReport = computeFidelityReport({
         jobId:           ctx.jobId,
         sourceCode:      ctx.sourceCode,
         generatedFiles:  enhancedFiles,
         sourceFramework: ctx.sourceFramework ?? 'flutter',
         targetFramework: ctx.targetFramework ?? 'react-native',
+        ...(staticVal.checks ? { validation: staticVal.checks } : {}),
       });
 
       const fe = fidelityEngineReport;
       console.log(`\n[PHASE 29] ═══ FIDELITY ENGINE (source vs ZIP) ═══`);
       console.log(`[PHASE 29] Overall Fidelity Score: ${fe.overallFidelityScore}% (${fe.verdict})`);
+      console.log(`[PHASE 29] Entièrement validé : ${fe.fullyValidated ? 'OUI' : 'NON'}`);
+      if (fe.failedCritical?.length) {
+        console.log(`[PHASE 29] ⛔ Contrôles critiques en ÉCHEC : ${fe.failedCritical.join(', ')}`);
+      }
+      if (fe.notRunCritical?.length) {
+        console.log(`[PHASE 29] ⏭️  Contrôles critiques NON EXÉCUTÉS : ${fe.notRunCritical.join(', ')}`);
+      }
+      if (fe.scoreBreakdown) {
+        const b = fe.scoreBreakdown;
+        const f = (v: number | null): string => (v === null ? 'non mesuré' : `${v}%`);
+        console.log(`[PHASE 29] Décomposition : couverture source ${f(b.sourceCoverage)}, ` +
+          `cohérence structurelle ${f(b.structuralCoherence)}, ` +
+          `préservation fonctionnelle ${f(b.functionalPreservation)}, ` +
+          `validation statique ${f(b.staticValidation)}, ` +
+          `tests exécutés ${f(b.testsExecuted)}, ` +
+          `compilation ${f(b.compilationSucceeded)}`);
+      }
       console.log(`[PHASE 29] Applicable axes: ${fe.applicableAxes.join(', ')}`);
       console.log(`[PHASE 29] N/A axes: ${fe.naAxes.join(', ')}`);
       console.log(`[PHASE 29] Identical: ${fe.totalIdentical}  Transformed: ${fe.totalTransformed}  Missing: ${fe.totalMissing}  Added: ${fe.totalAdded}`);

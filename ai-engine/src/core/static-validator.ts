@@ -17,7 +17,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import type { GeneratedFile } from '../models/ir.types';
-import type { StaticValidationResult } from '../models/ir.types';
+import type { StaticValidationResult, ValidationCheckResult } from '../models/ir.types';
+import { validateProjectIntegrity } from './project-integrity-validator';
 
 // ── Source language import patterns ─────────────────────────────────────────
 const SOURCE_IMPORT_REGEXES: Array<{ pattern: RegExp; lang: string }> = [
@@ -416,12 +417,130 @@ export async function runStaticValidation(
   const missingRoutes  = detectMissingRoutes(files);
 
   // TypeScript compilation (attempted only if tsc available)
+  const tscStart       = Date.now();
   const tsCompilation  = await attemptTsCompilation(files, workDir);
+  const tscMs          = Date.now() - tscStart;
 
   const overallPassed =
     tsCompilation.success !== false
     && sourceImports.length === 0
     && emptyFiles.length === 0;
+
+  // ── PHASE 47 : résultats PAR CONTRÔLE ──────────────────────────────────────
+  // On RÉUTILISE les détecteurs existants (ci-dessus) et le validateur
+  // d'intégrité déjà présent — aucun validateur parallèle n'est créé. Chaque
+  // contrôle produit PASS / FAIL / NOT_RUN avec sa durée réelle.
+  const integrityStart = Date.now();
+  const integrity      = validateProjectIntegrity(files);
+  const integrityMs    = Date.now() - integrityStart;
+
+  const filesFor = (code: string): string[] =>
+    integrity.issues.filter((i) => i.code === code && i.file).map((i) => i.file as string);
+
+  const typeChecksApply = files.some((f) => /\.(ts|tsx)$/.test(f.path));
+
+  const checks: ValidationCheckResult[] = [
+    {
+      id: 'local-imports',
+      status: (brokenImports.length + (integrity.byCode['unresolved-local-import'] ?? 0)) === 0
+        ? 'PASS' : 'FAIL',
+      durationMs: integrityMs,
+      errors: [
+        ...brokenImports,
+        ...integrity.issues.filter((i) => i.code === 'unresolved-local-import').map((i) => i.message),
+      ].slice(0, 30),
+      warnings: [],
+      files: [...new Set([...filesFor('unresolved-local-import')])],
+      detail: 'Résolution des imports locaux contre les chemins réellement produits',
+    },
+    {
+      id: 'dependencies',
+      status: (integrity.byCode['missing-dependency'] ?? 0) === 0 ? 'PASS' : 'FAIL',
+      durationMs: integrityMs,
+      errors: integrity.issues.filter((i) => i.code === 'missing-dependency').map((i) => i.message).slice(0, 30),
+      warnings: [],
+      files: filesFor('missing-dependency'),
+      detail: 'Dépendances importées présentes dans le manifeste',
+    },
+    {
+      id: 'typescript',
+      // Une compilation non tentée est NOT_RUN, jamais PASS.
+      status: !typeChecksApply ? 'NOT_RUN'
+        : tsCompilation.attempted ? (tsCompilation.success ? 'PASS' : 'FAIL')
+        : 'NOT_RUN',
+      durationMs: tsCompilation.attempted ? tscMs : 0,
+      errors: tsCompilation.errors,
+      warnings: tsCompilation.warnings,
+      files: [],
+      ...(tsCompilation.attempted
+        ? {}
+        : { notRunReason: typeChecksApply
+            ? 'binaire tsc introuvable dans cet environnement'
+            : 'cible sans TypeScript' }),
+      detail: tsCompilation.unverifiableModules?.length
+        ? `tsc --noEmit exécuté ; ${tsCompilation.unverifiableModules.length} module(s) externe(s) ` +
+          `non vérifiable(s) sans leurs dépendances : ${tsCompilation.unverifiableModules.slice(0, 5).join(', ')}`
+        : 'tsc --noEmit sur les fichiers générés',
+    },
+    {
+      id: 'config-entrypoint',
+      status: ((integrity.byCode['missing-config'] ?? 0) +
+               (integrity.byCode['missing-entrypoint'] ?? 0) +
+               (integrity.byCode['invalid-config-json'] ?? 0)) === 0 ? 'PASS' : 'FAIL',
+      durationMs: integrityMs,
+      errors: integrity.issues
+        .filter((i) => ['missing-config', 'missing-entrypoint', 'invalid-config-json'].includes(i.code))
+        .map((i) => i.message).slice(0, 30),
+      warnings: [],
+      files: [],
+      detail: 'Manifeste, tsconfig, configuration Expo et point d\'entrée',
+    },
+    {
+      id: 'routes',
+      status: ((integrity.byCode['missing-route-target'] ?? 0) +
+               (integrity.byCode['wrong-entry-route'] ?? 0) + missingRoutes.length) === 0 ? 'PASS' : 'FAIL',
+      durationMs: integrityMs,
+      errors: [
+        ...missingRoutes,
+        ...integrity.issues
+          .filter((i) => ['missing-route-target', 'wrong-entry-route'].includes(i.code))
+          .map((i) => i.message),
+      ].slice(0, 30),
+      warnings: [],
+      files: [...new Set([...filesFor('missing-route-target'), ...filesFor('wrong-entry-route')])],
+      detail: 'Routes référencées vs écrans réellement présents',
+    },
+    {
+      id: 'source-imports',
+      status: sourceImports.length === 0 ? 'PASS' : 'FAIL',
+      durationMs: integrityMs,
+      errors: sourceImports.slice(0, 30),
+      warnings: [],
+      files: [],
+      detail: 'Imports du langage source résiduels dans la cible',
+    },
+    {
+      id: 'empty-files',
+      status: emptyFiles.length === 0 ? 'PASS' : 'FAIL',
+      durationMs: integrityMs,
+      errors: emptyFiles.slice(0, 30),
+      warnings: [],
+      files: emptyFiles,
+      detail: 'Fichiers sources vides ou sans code',
+    },
+    {
+      // Aucun test n'est généré ni exécuté pour le projet cible : NOT_RUN explicite.
+      id: 'tests', status: 'NOT_RUN', durationMs: 0, errors: [], warnings: [], files: [],
+      notRunReason: 'aucun test n\'est généré pour le projet cible ; aucun runner exécuté',
+      detail: 'Tests unitaires / composants du projet généré',
+    },
+    {
+      // Aucun build ni export Expo n'est exécuté dans cet environnement.
+      id: 'build', status: 'NOT_RUN', durationMs: 0, errors: [], warnings: [], files: [],
+      notRunReason: 'ni build ni export Expo exécuté (dépendances du projet non installées)',
+      detail: 'Build / export du projet cible',
+    },
+  ];
 
   console.log(`[StaticValidator] TypeScript: ${tsCompilation.attempted ? (tsCompilation.success ? '✅' : `❌ ${tsCompilation.errors.length} errors`) : '⏭️  not attempted'}`);
   console.log(`[StaticValidator] Broken imports: ${brokenImports.length === 0 ? '✅' : `❌ ${brokenImports.length}`}`);
@@ -429,10 +548,20 @@ export async function runStaticValidation(
   console.log(`[StaticValidator] Empty files: ${emptyFiles.length === 0 ? '✅' : `❌ ${emptyFiles.length}`}`);
   console.log(`[StaticValidator] Critical TODOs: ${criticalTodos.length === 0 ? '✅' : `⚠️  ${criticalTodos.length}`}`);
   console.log(`[StaticValidator] Missing routes: ${missingRoutes.length === 0 ? '✅' : `❌ ${missingRoutes.length}`}`);
+  console.log(`[StaticValidator] --- Résultats par contrôle (PHASE 47) ---`);
+  for (const c of checks) {
+    const icon = c.status === 'PASS' ? '✅' : c.status === 'FAIL' ? '❌' : '⏭️ ';
+    const extra = c.status === 'NOT_RUN' ? ` (${c.notRunReason ?? 'raison inconnue'})`
+      : c.status === 'FAIL' ? ` — ${c.errors.length} erreur(s)` : '';
+    console.log(`[StaticValidator] ${icon} ${c.id}: ${c.status} [${c.durationMs}ms]${extra}`);
+  }
+  console.log(`[StaticValidator] Durée totale de validation: ${tscMs + integrityMs}ms`);
   console.log(`[StaticValidator] Overall: ${overallPassed ? '✅ PASSED' : '❌ FAILED'}`);
   console.log(`[StaticValidator] ==========================================\n`);
 
   return {
+    checks,
+    validationDurationMs: tscMs + integrityMs,
     tsCompilation,
     brokenImports,
     sourceImports,

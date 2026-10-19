@@ -822,7 +822,44 @@ export interface ContentValidationReport {
 
 // ── Static Validation (Phase 7) ──────────────────────────────────────────────
 
+// ── PHASE 47 : résultat PAR CONTRÔLE, réellement exécuté ──────────────────────
+// Une vérification non exécutée n'est JAMAIS une réussite : elle vaut NOT_RUN.
+
+export type ValidationCheckStatus = 'PASS' | 'FAIL' | 'NOT_RUN';
+
+export type ValidationCheckId =
+  | 'local-imports'      // résolution des imports locaux
+  | 'dependencies'       // modules/dépendances déclarés
+  | 'typescript'         // tsc --noEmit (cibles TypeScript)
+  | 'config-entrypoint'  // fichiers de configuration + point d'entrée
+  | 'routes'             // routes générées vs écrans présents
+  | 'source-imports'     // imports du langage source résiduels
+  | 'empty-files'        // fichiers sources vides
+  | 'tests'              // tests disponibles du projet généré
+  | 'build';             // compilation / export du projet
+
+export interface ValidationCheckResult {
+  id:          ValidationCheckId;
+  status:      ValidationCheckStatus;
+  /** Durée réelle d'exécution en ms (0 pour NOT_RUN). */
+  durationMs:  number;
+  errors:      string[];
+  warnings:    string[];
+  /** Fichiers concernés (chemins uniquement, jamais de contenu). */
+  files:       string[];
+  /** Pourquoi le contrôle n'a pas été exécuté (uniquement si NOT_RUN). */
+  notRunReason?: string;
+  detail?:     string;
+}
+
 export interface StaticValidationResult {
+  /**
+   * PHASE 47 — résultats par contrôle. Présent dès que la validation a tourné.
+   * Optionnel pour ne casser aucun appelant existant.
+   */
+  checks?: ValidationCheckResult[];
+  /** Durée totale réelle de la validation post-génération, en ms. */
+  validationDurationMs?: number;
   tsCompilation: {
     attempted:  boolean;
     success:    boolean;
@@ -891,6 +928,25 @@ export interface ProjectIntegrityReport {
   verdict:       'PASS' | 'PASS_WITH_WARNINGS' | 'FAIL';
   checkedFiles:  number;
   byCode:        Partial<Record<IntegrityIssueCode, number>>;
+}
+
+// ── PHASE 47 : décomposition honnête du score de fidélité ─────────────────────
+// Chaque composant est soit une mesure réelle (0-100), soit `null` = NON MESURÉ.
+// Un composant non mesuré n'est JAMAIS compté comme 100.
+
+export interface FidelityScoreBreakdown {
+  /** Couverture des éléments source (écrans, modèles, services…). */
+  sourceCoverage:        number | null;
+  /** Cohérence structurelle (imports, routes, config, doublons). */
+  structuralCoherence:   number | null;
+  /** Préservation fonctionnelle (flux, formulaires, état). */
+  functionalPreservation: number | null;
+  /** Validation statique (tsc + imports + dépendances). */
+  staticValidation:      number | null;
+  /** Tests réellement exécutés. null = aucun test exécuté. */
+  testsExecuted:         number | null;
+  /** Compilation effectivement réussie. null = jamais tentée. */
+  compilationSucceeded:  number | null;
 }
 
 export interface DeliveryCheckResult {
