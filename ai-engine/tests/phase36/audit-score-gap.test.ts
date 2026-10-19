@@ -127,6 +127,9 @@ describe('AUDIT — écart score annoncé / réalité structurelle', () => {
 ║   erreurs                   : ${result.integrityReport?.errorCount ?? '?'}
 ║   avertissements            : ${result.integrityReport?.warningCount ?? '?'}
 ║   par code                  : ${JSON.stringify(result.integrityReport?.byCode ?? {})}
+║   détails                   : ${(result.integrityReport?.issues ?? []).map(i => `[${i.code}] ${i.file ?? ''} ${i.detail ?? ''}`).join(' | ')}
+║ fichiers vides (staticVal)  : ${staticVal.emptyFiles.join(', ') || '(aucun)'}
+║ blockers delivery           : ${((delivery as unknown as { blockers?: string[] })?.blockers ?? []).join(' | ') || '(aucun)'}
 ║ delivery verdict            : ${(delivery as { status?: string } | undefined)?.status ?? 'ABSENT'}
 ║ delivery.ready              : ${String((delivery as { ready?: boolean } | undefined)?.ready)}
 ║ dépendances déclarées       : ${declared.size}

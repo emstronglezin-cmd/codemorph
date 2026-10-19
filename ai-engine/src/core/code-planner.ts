@@ -12,6 +12,7 @@ import type { ConversionContext, IRDocument, GeneratedFile, ConversionSummary, I
 import { cleanLLMOutput, cleanGeneratedFiles }    from './output-cleaner';
 import { convertLargeFile, needsChunking }         from './file-chunker';
 import { verifyAndFixImports, detectTypeIssues, formatTypeReport } from './import-verifier';
+import { normalizePlan } from './plan-normalizer';
 // PHASE 29: Business Layer Extractor — conversion directe depuis le code source
 import {
   extractAndConvertBusinessLayers,
@@ -50,6 +51,21 @@ export class CodePlanner {
     result.files = cleanedBatch.files;
     if (cleanedBatch.totalModified > 0) {
       console.log(`[CodePlanner] Output Cleaner: ${cleanedBatch.totalModified} files cleaned, -${cleanedBatch.totalLinesRemoved} lines, -${cleanedBatch.totalCharsRemoved} chars`);
+    }
+
+    // ── PHASE 46 STEP 1.5: Normalisation structurelle du plan ────────────────
+    // DOIT s'exécuter AVANT la vérification d'imports : si des services en double
+    // sont écartés après coup, des imports peuvent pointer vers un fichier
+    // supprimé. La normalisation réconcilie le manifeste avec les imports réels,
+    // déduplique les services (deux conventions coexistaient), garantit l'unicité
+    // des chemins et recible la route d'entrée sur un écran existant.
+    const normalized = normalizePlan(result.files);
+    result.files = normalized.files;
+    if (normalized.report.notes.length > 0) {
+      console.log(`[CodePlanner] PHASE 46 — Plan normalization:`);
+      for (const note of normalized.report.notes) {
+        console.log(`[CodePlanner]   • ${note}`);
+      }
     }
 
     // ── PHASE 28 STEP 2: Import Verification ─────────────────────────────────
@@ -220,6 +236,8 @@ export class CodePlanner {
       this.staticFile('src/hooks/useApi.ts',    RN_USE_API_HOOK),
       this.staticFile('src/theme/colors.ts',    RN_THEME_COLORS),
       this.staticFile('src/theme/spacing.ts',   RN_THEME_SPACING),
+      // FIX PHASE 46 — requis par le barrel ci-dessous (`export * from './typography'`)
+      this.staticFile('src/theme/typography.ts', RN_THEME_TYPOGRAPHY),
       // Barrel export — résout les imports '../../theme' des composants UI
       this.staticFile('src/theme/index.ts',     RN_THEME_INDEX),
       this.staticFile('src/components/ui/Button.tsx',    RN_BUTTON_COMPONENT),
@@ -2315,6 +2333,51 @@ export const borderRadius = {
   full: 9999,
 };
 `;
+// ── FIX PHASE 46 — module typography MANQUANT ────────────────────────────────
+// Le barrel `src/theme/index.ts` faisait `export * from './typography'` alors
+// qu'AUCUN fichier `src/theme/typography.ts` n'était généré : chaque conversion
+// React Native livrait donc un import local non résolu. On génère le module
+// réel plutôt que de retirer l'export, car des composants peuvent consommer ces
+// jetons via `import { typography } from '../../theme'`.
+const RN_THEME_TYPOGRAPHY = `// src/theme/typography.ts — jetons typographiques
+import { TextStyle } from 'react-native';
+
+export const fontSizes = {
+  xs: 11,
+  sm: 13,
+  md: 15,
+  lg: 17,
+  xl: 21,
+  xxl: 27,
+  display: 34,
+} as const;
+
+export const fontWeights = {
+  regular: '400',
+  medium: '500',
+  semibold: '600',
+  bold: '700',
+} as const;
+
+export const lineHeights = {
+  tight: 16,
+  normal: 22,
+  relaxed: 28,
+  loose: 34,
+} as const;
+
+export const typography = {
+  display: { fontSize: fontSizes.display, fontWeight: fontWeights.bold, lineHeight: lineHeights.loose } as TextStyle,
+  title:   { fontSize: fontSizes.xl,      fontWeight: fontWeights.semibold, lineHeight: lineHeights.relaxed } as TextStyle,
+  heading: { fontSize: fontSizes.lg,      fontWeight: fontWeights.semibold, lineHeight: lineHeights.normal } as TextStyle,
+  body:    { fontSize: fontSizes.md,      fontWeight: fontWeights.regular, lineHeight: lineHeights.normal } as TextStyle,
+  caption: { fontSize: fontSizes.sm,      fontWeight: fontWeights.regular, lineHeight: lineHeights.tight } as TextStyle,
+  label:   { fontSize: fontSizes.xs,      fontWeight: fontWeights.medium, lineHeight: lineHeights.tight } as TextStyle,
+} as const;
+
+export type TypographyVariant = keyof typeof typography;
+`;
+
 // Barrel export — résout import { colors, spacing } from '../../theme' dans les composants UI
 // Les composants sont dans src/components/ui/ donc ../../theme = src/theme/index.ts
 const RN_THEME_INDEX = `// src/theme/index.ts — barrel export

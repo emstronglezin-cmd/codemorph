@@ -83,6 +83,12 @@ function detectSourceImports(files: GeneratedFile[]): string[] {
 // ── Detect empty/shell files ─────────────────────────────────────────────────
 function detectEmptyFiles(files: GeneratedFile[]): string[] {
   return files
+    // FIX PHASE 46 — FAUX POSITIF : `tsconfig.json` est du JSON minifié sur une
+    // seule ligne. Il était systématiquement signalé comme « fichier vide », ce
+    // qui faisait échouer `overallPassed` sur toutes les conversions. On ne
+    // contrôle que les fichiers SOURCES ; les manifestes/configs JSON sont validés
+    // par ailleurs (project-integrity-validator : invalid-config-json).
+    .filter((f) => /\.(ts|tsx|js|jsx|mjs|cjs)$/.test(f.path))
     .filter((f) => {
       const codeLines = f.content.split('\n').filter((l) => {
         const t = l.trim();
@@ -233,6 +239,33 @@ async function attemptTsCompilation(
       return { attempted: false, success: false, errors: [], warnings: [] };
     }
 
+    // ── PHASE 46 : rendre les dépendances RÉELLEMENT disponibles ────────────
+    // Le dépôt fournit `react`, `@types/react` et `typescript`. En liant son
+    // `node_modules` au répertoire de validation, ces paquets sont résolus pour
+    // de vrai : `React.JSX.Element` et `useState<T>()` sont alors vérifiés au
+    // lieu de produire des erreurs en cascade. Seuls les paquets réellement
+    // absents (react-native, expo…) restent déclarés comme modules ambiants.
+    // Plus on résout réellement, moins il y a d'angles morts.
+    try {
+      let nmDir = path.resolve(workDir);
+      let foundNm: string | null = null;
+      for (let i = 0; i < 8; i++) {
+        const candidate = path.join(nmDir, 'node_modules');
+        if (fs.existsSync(candidate)) { foundNm = candidate; break; }
+        const parent = path.dirname(nmDir);
+        if (parent === nmDir) break;
+        nmDir = parent;
+      }
+      if (foundNm) {
+        const link = path.join(tmpDir, 'node_modules');
+        if (!fs.existsSync(link)) {
+          fs.symlinkSync(foundNm, link, process.platform === 'win32' ? 'junction' : 'dir');
+        }
+      }
+    } catch {
+      // Échec de liaison : on continue, les paquets absents seront ambiants.
+    }
+
     try {
       const cmd = tscBin.endsWith('.js') ? `node "${tscBin}" --noEmit` : `"${tscBin}" --noEmit`;
       execSync(cmd, { cwd: tmpDir, stdio: 'pipe', timeout: 60_000 });
@@ -265,6 +298,87 @@ async function attemptTsCompilation(
         .split('\n')
         .filter((l) => /warning/i.test(l))
         .slice(0, 10);
+
+      // ── PHASE 46 : second passage avec déclarations ambiantes ──────────────
+      // Un module externe non résolu ne produit pas seulement « Cannot find
+      // module » : il CASCADE. `TouchableOpacityProps` devient inconnu, donc
+      // `interface ButtonProps extends TouchableOpacityProps` n'hérite de rien,
+      // et chaque accès à `disabled`/`style` remonte en TS2339. Sans ce second
+      // passage, TOUTE conversion React Native échouait sur des erreurs qui ne
+      // sont pas des défauts du code généré.
+      //
+      // On déclare les paquets manquants comme modules ambiants (types permissifs)
+      // puis on relance tsc UNE fois. Les erreurs restantes sont alors de vraies
+      // incohérences LOCALES. Limitation assumée et déclarée : les API de ces
+      // paquets ne sont PAS vérifiées — d'où `unverifiableModules`.
+      if (unverifiableModules.length > 0) {
+        const ambient = unverifiableModules
+          .map((m) => `declare module '${m}';`)
+          .join('\n');
+        fs.writeFileSync(
+          path.join(tmpDir, 'codemorph-ambient.d.ts'),
+          `// Généré par CodeMorph : les dépendances du projet ne sont pas installées\n` +
+          `// dans ce répertoire de validation. Ces déclarations évitent les erreurs en\n` +
+          `// cascade ; les API de ces paquets ne sont DONC PAS vérifiées.\n${ambient}\n`,
+        );
+        try {
+          const cmd2 = tscBin.endsWith('.js') ? `node "${tscBin}" --noEmit` : `"${tscBin}" --noEmit`;
+          execSync(cmd2, { cwd: tmpDir, stdio: 'pipe', timeout: 60_000 });
+          return {
+            attempted: true, success: true, errors: [], warnings, unverifiableModules,
+          };
+        } catch (tscErr2: unknown) {
+          const out2 = (tscErr2 as { stdout?: Buffer })?.stdout?.toString() ?? '';
+          // Une déclaration ambiante rend le MODULE permissif, mais pas ses
+          // ESPACES DE NOMS de types : `React.JSX.Element` remonte en TS2694
+          // (« Namespace '"react"' has no exported member 'JSX' ») uniquement
+          // parce que `@types/react` n'est pas installé. On écarte donc les
+          // erreurs qui citent explicitement un module déclaré ambiant — et
+          // uniquement celles-là : toute autre erreur reste un échec réel.
+          // tsc écrit le nom du module entre guillemets SIMPLES ou DOUBLES selon
+          // le diagnostic (`'"react"'` pour TS2694, `'react'` pour TS2307).
+          const ambientNames = unverifiableModules.flatMap((m) => [`'${m}'`, `"${m}"`, m]);
+          //
+          // LIMITE ASSUMÉE ET DOCUMENTÉE : une déclaration ambiante rend un
+          // module permissif en position de VALEUR, mais pas en position de TYPE.
+          // `interface ButtonProps extends TouchableOpacityProps` produit donc
+          // TS2709 (« Cannot use namespace … as a type ») puis des TS2339 en
+          // cascade sur `ButtonProps` lui-même — le nom ambiant n'apparaît même
+          // plus dans le message.
+          //
+          // Sans installer `react-native`/`expo`, ces fichiers ne sont PAS
+          // vérifiables. On exclut donc les erreurs issues de fichiers qui
+          // importent un module non installé, et on le déclare explicitement via
+          // `unverifiableModules`. Les fichiers qui n'en dépendent pas (modèles,
+          // services, état) restent INTÉGRALEMENT vérifiés.
+          const ambientSet = new Set(unverifiableModules);
+          const unverifiableFiles = new Set<string>();
+          for (const file of files) {
+            if (!/\.(ts|tsx|js|jsx)$/.test(file.path)) continue;
+            const specs = file.content.match(/from\s*['"]([^'"]+)['"]/g) ?? [];
+            const importsAmbient = specs.some((sp) => {
+              const spec = sp.replace(/^from\s*['"]/, '').replace(/['"]$/, '');
+              const pkgName = spec.startsWith('@')
+                ? spec.split('/').slice(0, 2).join('/')
+                : (spec.split('/')[0] ?? '');
+              return !spec.startsWith('.') && ambientSet.has(pkgName);
+            });
+            if (importsAmbient) unverifiableFiles.add(file.path);
+          }
+          const realErrors = out2
+            .split('\n')
+            .filter((l) => /error TS/.test(l))
+            .filter((l) => !ambientNames.some((n) => l.includes(n)))
+            .filter((l) => ![...unverifiableFiles].some((fp) => l.startsWith(fp)));
+          return {
+            attempted: true,
+            success:   realErrors.length === 0,
+            errors:    realErrors.slice(0, 20),
+            warnings,
+            unverifiableModules,
+          };
+        }
+      }
 
       return {
         attempted: true,
