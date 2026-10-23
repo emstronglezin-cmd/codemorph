@@ -277,11 +277,33 @@ export function fixEntryRoute(files: GeneratedFile[]): { files: GeneratedFile[];
   if (exists) return { files, fixed: false };
 
   // Choisir un écran réellement présent, en excluant les layouts et l'entrée.
-  const candidate = files
+  const candidates = files
     .map((f) => f.path.replace(/\\/g, '/'))
     .filter((p) => /^app\/[^/]+\.tsx?$/.test(p) && !/_layout\./.test(p) && p !== 'app/index.tsx')
-    .map((p) => p.replace(/^app\//, '').replace(/\.tsx?$/, ''))
-    .sort()[0];
+    .map((p) => p.replace(/^app\//, '').replace(/\.tsx?$/, ''));
+  if (candidates.length === 0) return { files, fixed: false };
+
+  // PHASE 49 — AVANT : `.sort()[0]`, donc le premier écran ALPHABÉTIQUE.
+  // Avec `add-task.tsx` et `home.tsx`, l'application s'ouvrait sur le formulaire
+  // d'ajout au lieu de l'accueil. Le choix est maintenant classé :
+  //   1. noms évoquant un accueil (home, main, list, dashboard, start…) ;
+  //   2. écran le plus référencé par les navigations des autres fichiers ;
+  //   3. ordre alphabétique, en dernier recours seulement.
+  const HOME_LIKE = /^(home|main|index|start|dashboard|tasks?|tasklist|list|root)$/i;
+  const inbound = new Map<string, number>();
+  for (const f of files) {
+    for (const m of f.content.matchAll(/(?:router\s*\.\s*(?:push|replace|navigate)|href\s*[:=])\s*\(?\s*['"`]\/([^'"`?#]+)/g)) {
+      const seg = (m[1] ?? '').split('/')[0];
+      if (seg) inbound.set(seg, (inbound.get(seg) ?? 0) + 1);
+    }
+  }
+  const candidate = [...candidates].sort((a, b) => {
+    const homeDiff = Number(HOME_LIKE.test(b)) - Number(HOME_LIKE.test(a));
+    if (homeDiff !== 0) return homeDiff;
+    const refDiff = (inbound.get(b) ?? 0) - (inbound.get(a) ?? 0);
+    if (refDiff !== 0) return refDiff;
+    return a.localeCompare(b);
+  })[0];
   if (!candidate) return { files, fixed: false };
 
   const next = [...files];

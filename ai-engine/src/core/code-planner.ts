@@ -346,10 +346,28 @@ export class CodePlanner {
 
     // ── Data models from IR ────────────────────────────────
     const dataLayer = ir.dataLayer ?? { models: [], relationships: [], migrations: [] };
+    const modelFiles: string[] = [];
     for (const model of (dataLayer.models ?? [])) {
+      const modelPath = `src/types/${model.name.toLowerCase()}.types.ts`;
+      modelFiles.push(modelPath);
       files.push({
-        path:     `src/types/${model.name.toLowerCase()}.types.ts`,
+        path:     modelPath,
         content:  this.generateTypeInterface(model),
+        language: 'typescript',
+        warnings: [],
+      });
+    }
+
+    // PHASE 49 — le barrel `src/types/index.ts` doit ré-exporter les modèles
+    // RÉELLEMENT produits. Sans cela, les consommateurs importaient un type
+    // depuis un chemin inexistant et `tsc` échouait.
+    if (modelFiles.length > 0) {
+      const reExports = modelFiles
+        .map((mp) => `export * from './${mp.replace(/^src\/types\//, '').replace(/\.ts$/, '')}';`)
+        .join('\n');
+      files.push({
+        path:     'src/types/index.ts',
+        content:  `// Central type exports — ré-exportations des modèles générés\n${reExports}\n`,
         language: 'typescript',
         warnings: [],
       });
@@ -360,7 +378,10 @@ export class CodePlanner {
     for (const svc of (backendGraph.services ?? []).slice(0, 10)) {
       files.push({
         path:     `src/services/${svc.name.toLowerCase()}.service.ts`,
-        content:  this.generateRNService(svc),
+        // PHASE 49 — un service dont la source est une classe Dart côté client
+        // n'a PAS d'API REST. On génère donc une implémentation locale fidèle
+        // plutôt que d'inventer des endpoints.
+        content:  this.generateServiceFile(svc, dataLayer.models ?? []),
         language: 'typescript',
         warnings: [],
       });
@@ -524,7 +545,9 @@ export class CodePlanner {
 
     files.push(
       this.staticFile('src/constants/index.ts', constantsContent),
-      this.staticFile('src/types/index.ts',     RN_TYPES_INDEX),
+      // PHASE 49 — le barrel est émis avec les modèles (voir plus bas) ;
+      // le gabarit statique ne sert que de repli, géré par deduplicatePaths.
+      this.staticFile('src/types/shared.ts',   RN_TYPES_INDEX),
       this.staticFile('.env.example',           envContent),
       this.staticFile('README.md',              this.generateRNReadme(ctx, files.length + 3)),
     );
@@ -640,6 +663,143 @@ export const useAuthStore = create<AuthState>((set) => ({
 
   // ── React Native Service from backendGraph ──────────────
   // PHASE 22: generateRNService — vraie implémentation basée sur le nom de méthode
+  /**
+   * PHASE 49 — Choix de l'implémentation d'un service.
+   *
+   * AVANT : `generateRNService` fabriquait systématiquement des appels HTTP vers
+   * des endpoints inventés (`/task/getall`), alors que la source Flutter est une
+   * classe côté client sans aucune API. Résultat : la logique métier (add,
+   * toggle, compteur) disparaissait et les écrans n'avaient rien à appeler.
+   *
+   * Règle générale appliquée ici : si un modèle correspondant existe, le service
+   * est généré comme un service LOCAL sur ce modèle. Sinon, on retombe sur le
+   * comportement historique.
+   */
+  private generateServiceFile(
+    svc:    IRDocument['backendGraph']['services'][0],
+    models: IRDocument['dataLayer']['models'],
+  ): string {
+    const base = svc.name.toLowerCase().replace(/service$/, '');
+    const model = models.find((m) => m.name.toLowerCase() === base)
+      ?? models.find((m) => base.includes(m.name.toLowerCase()))
+      ?? models.find((m) => svc.name.toLowerCase().includes(m.name.toLowerCase()));
+    if (!model) return this.generateRNService(svc);
+    return this.generateLocalService(svc, model);
+  }
+
+  /**
+   * PHASE 49 — Service local fidèle à une classe de service Dart côté client.
+   *
+   * Généré à partir des CHAMPS RÉELS du modèle : identifiant, champs requis pour
+   * la création, champ booléen d'état (avec son compteur). Aucune méthode n'est
+   * laissée en TODO et aucun endpoint n'est inventé.
+   */
+  private generateLocalService(
+    svc:   IRDocument['backendGraph']['services'][0],
+    model: IRDocument['dataLayer']['models'][0],
+  ): string {
+    const fields  = model.fields ?? [];
+    const idField = fields.find((f) => f.name === 'id') ?? fields[0];
+    const idName  = idField?.name ?? 'id';
+    const idType  = idField?.type ?? 'string';
+
+    // Champs à fournir à la création : requis, non-identifiant, non booléen d'état.
+    const boolField = fields.find((f) => f.type === 'boolean' && f.name !== idName);
+    const inputFields = fields.filter((f) =>
+      f.name !== idName && !(boolField && f.name === boolField.name));
+
+    const params = inputFields.map((f) => `${f.name}: ${f.type}`).join(', ');
+    const boolName  = boolField?.name;
+    const modelFile = `../types/${model.name.toLowerCase()}.types`;
+    const entityVar = `${model.name.charAt(0).toLowerCase()}${model.name.slice(1)}s`;
+
+    const toggleMethod = boolName ? `
+
+  /** Inverse l'état « ${boolName} » — équivalent du copyWith de la source. */
+  toggle(${idName}: ${idType}): void {
+    const index = this.${entityVar}.findIndex((t) => t.${idName} === ${idName});
+    if (index < 0) return;
+    const current = this.${entityVar}[index];
+    if (!current) return;
+    this.${entityVar} = this.${entityVar}.map((t, i) =>
+      i === index ? { ...t, ${boolName}: !t.${boolName} } : t);
+    this.notify();
+  }
+
+  /** Nombre d'éléments dont « ${boolName} » est vrai. */
+  get ${boolName}Count(): number {
+    return this.${entityVar}.filter((t) => t.${boolName}).length;
+  }` : '';
+
+    const declared = (svc.methods ?? []).map((m) => m.name);
+    const wantsRemove = declared.some((n) => /^(remove|delete)/i.test(n));
+
+    return `// ${svc.name} — service local généré depuis la source Dart.
+// Aucune API REST n'est inventée : la source est une classe côté client.
+import type { ${model.name} } from '${modelFile}';
+
+export type ${svc.name}Listener = (items: readonly ${model.name}[]) => void;
+
+export class ${svc.name} {
+  private ${entityVar}: ${model.name}[] = [];
+  private readonly listeners = new Set<${svc.name}Listener>();
+
+  /** Copie défensive en lecture seule — équivalent de List.unmodifiable. */
+  getAll(): readonly ${model.name}[] {
+    return [...this.${entityVar}];
+  }
+
+  /** Crée et enregistre un nouvel élément. */
+  add(${params}): ${model.name} {
+    const created: ${model.name} = {
+${[
+      `      ${idName}: this.nextId(),`,
+      ...inputFields.map((f) => `      ${f.name},`),
+      ...(boolName ? [`      ${boolName}: false,`] : []),
+    ].join('\n')}
+    } as ${model.name};
+    this.${entityVar} = [...this.${entityVar}, created];
+    this.notify();
+    return created;
+  }${toggleMethod}${wantsRemove ? `
+
+  /** Supprime l'élément correspondant. */
+  remove(${idName}: ${idType}): void {
+    const before = this.${entityVar}.length;
+    this.${entityVar} = this.${entityVar}.filter((t) => t.${idName} !== ${idName});
+    if (this.${entityVar}.length !== before) this.notify();
+  }` : ''}
+
+  get totalCount(): number {
+    return this.${entityVar}.length;
+  }
+
+  subscribe(listener: ${svc.name}Listener): () => void {
+    this.listeners.add(listener);
+    return () => { this.listeners.delete(listener); };
+  }
+
+  private notify(): void {
+    const snapshot = this.getAll();
+    for (const listener of this.listeners) listener(snapshot);
+  }
+
+  private nextId(): ${idType} {
+    return \`${model.name.toLowerCase()}-\${Date.now().toString(36)}-\${Math.random().toString(36).slice(2, 8)}\` as unknown as ${idType};
+  }
+
+  /** Réinitialisation — utilisée par les tests. */
+  reset(): void {
+    this.${entityVar} = [];
+    this.notify();
+  }
+}
+
+/** Instance partagée par l'application. */
+export const ${svc.name.charAt(0).toLowerCase()}${svc.name.slice(1)} = new ${svc.name}();
+`;
+  }
+
   private generateRNService(svc: IRDocument['backendGraph']['services'][0]): string {
     const methods = (svc.methods ?? []).slice(0, 10).map((m) => {
       const params = m.params.map((p: { name: string; type: string }) => `${p.name}: ${p.type}`).join(', ');
@@ -1739,7 +1899,7 @@ Return ONLY the complete file content.`;
   }
 
   private async generateComponentFile(_ctx: ConversionContext, name: string, props: Array<{ name: string; type: string; required: boolean }>, framework: string): Promise<string> {
-    if (this.ai.getTier() === 'static') return this.fallbackComponent(name);
+    if (this.ai.getTier() === 'static') return this.fallbackComponent(name, framework);
     const propTypes = props.map((p) => `${p.name}${p.required ? '' : '?'}: ${p.type}`).join('; ');
     // PHASE 23: Prompt V3 pour les composants — vraies props + events depuis l'IR
     const systemPrompt = `You are an AI Software Architect. Generate production-ready ${framework === 'react' ? 'React + TypeScript + TailwindCSS' : 'React Native + TypeScript'} UI components. NEVER use placeholders or TODOs. Return ONLY the complete file content — no markdown, no explanations.`;
@@ -1751,9 +1911,9 @@ Return ONLY the complete file content.`;
       const res = await this.ai.chat([{ role: 'system', content: systemPrompt }, { role: 'user', content: prompt }], 900);
       // PHASE 28: Nettoyage obligatoire de la sortie LLM
       const cleaned = cleanLLMOutput(res.content || '', `component:${name}`).content;
-      return cleaned || this.fallbackComponent(name);
+      return cleaned || this.fallbackComponent(name, framework);
     } catch {
-      return this.fallbackComponent(name);
+      return this.fallbackComponent(name, framework);
     }
   }
 
@@ -2132,7 +2292,16 @@ const s = StyleSheet.create({
 `;
   }
 
-  private fallbackComponent(name: string): string {
+  /**
+   * PHASE 49 — Composant de repli (palier sans IA).
+   *
+   * AVANT : cette méthode ignorait le framework cible et émettait TOUJOURS un
+   * `<div className=…>`. Pour une cible React Native, le fichier généré était
+   * donc invalide (`div` inconnu, `className` inexistant) : échec de `tsc` et
+   * composant inutilisable. La cible est maintenant respectée.
+   */
+  private fallbackComponent(name: string, framework: string = 'react'): string {
+    if (framework !== 'react') return this.fallbackNativeComponent(name);
     // PHASE 22: Composant fonctionnel minimal — jamais un composant vide avec juste un commentaire
     return `import React from 'react';
 
@@ -2155,6 +2324,46 @@ export function ${name}({ className, children, ...props }: ${name}Props): React.
     </div>
   );
 }
+`;
+  }
+
+  /**
+   * PHASE 49 — Composant de repli pour une cible native (React Native).
+   * N'émet que des primitives `react-native` : aucun `<div>`, aucun `className`.
+   */
+  private fallbackNativeComponent(name: string): string {
+    return `import React from 'react';
+import { StyleSheet, Text, View } from 'react-native';
+
+export interface ${name}Props {
+  title?: string;
+  children?: React.ReactNode;
+}
+
+/**
+ * ${name} — composant React Native généré depuis l'analyse de la source.
+ */
+export function ${name}({ title, children }: ${name}Props): React.JSX.Element {
+  return (
+    <View style={styles.container}>
+      {title ? <Text style={styles.title}>{title}</Text> : null}
+      {children}
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {
+    backgroundColor: '#ffffff',
+    borderColor: '#e2e8f0',
+    borderRadius: 8,
+    borderWidth: StyleSheet.hairlineWidth,
+    padding: 16,
+  },
+  title: { color: '#0f172a', fontSize: 16, fontWeight: '600', marginBottom: 8 },
+});
+
+export default ${name};
 `;
   }
 
@@ -2517,8 +2726,10 @@ export const API_URL    = process.env['EXPO_PUBLIC_API_URL'] ?? 'http://localhos
 export const TOKEN_KEY  = 'auth_token';
 export const USER_KEY   = 'auth_user';
 `;
-const RN_TYPES_INDEX = `// Central type exports
-export * from './index';
+const RN_TYPES_INDEX = `// Shared API response types.
+// PHASE 49 - ce fichier ne contient plus la ligne "export * from './index'" :
+// un barrel qui se re-exporte lui-meme est un cycle sterile. Les modeles
+// generes sont re-exportes par src/types/index.ts, ecrit dynamiquement.
 
 export interface ApiResponse<T> {
   data:    T;

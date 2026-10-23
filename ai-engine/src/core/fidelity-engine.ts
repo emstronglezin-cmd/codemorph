@@ -714,7 +714,15 @@ export function computeFidelityReport(params: {
     targetFramework,
     sourceFileCount:     src.totalFiles,
     targetFileCount:     tgt.totalFiles,
-    overallFidelityScore,
+    // PHASE 49 — le score PUBLIÉ est le score plafonné.
+    //
+    // AVANT : `cappedScore` ne servait qu'au verdict, et le rapport continuait
+    // d'afficher la couverture brute. Un projet dont les tests et le build
+    // n'ont pas été exécutés annonçait donc 100 % tout en étant verdict GOOD et
+    // `fullyValidated: false` — exactement le score flatteur que la validation
+    // réelle doit interdire. La couverture brute reste lisible séparément dans
+    // `scoreBreakdown.sourceCoverage`.
+    overallFidelityScore: cappedScore,
     axes,
     applicableAxes:      applicableAxes.map((a) => a.axis),
     naAxes:              naAxes.map((a) => a.axis),
