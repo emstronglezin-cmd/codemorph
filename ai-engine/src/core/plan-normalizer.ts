@@ -21,6 +21,9 @@
 // complète et en journalisant la décision.
 // ============================================================
 import type { GeneratedFile } from '../models/ir.types';
+import {
+  buildSymbolTable, rewriteLocalImports, type UnresolvedImport,
+} from './canonical-ir';
 
 /** Résultat de la normalisation, pour traçabilité. */
 export interface PlanNormalizationReport {
@@ -33,6 +36,15 @@ export interface PlanNormalizationReport {
   prunedRouteGroups:    string[];
   /** PHASE 48 — écrans retirés du layout racine faute de fichier cible. */
   removedLayoutScreens: string[];
+  /** PHASE 50 — imports locaux réécrits vers un fichier réellement généré. */
+  rewrittenImports:     number;
+  /**
+   * PHASE 50 — imports locaux qu'aucun fichier généré ne fournit. Ils sont
+   * commentés `NOT_CONVERTED` dans la sortie au lieu d'être laissés cassés :
+   * un import silencieux vers un fichier absent faisait échouer `typescript`
+   * et `local-imports` chez le destinataire sans que le rapport ne le dise.
+   */
+  unresolvedImports:    UnresolvedImport[];
   notes:                string[];
 }
 
@@ -438,8 +450,25 @@ export function normalizePlan(files: GeneratedFile[]): {
     notes.push(`Écran retiré du layout racine car sans fichier correspondant : ${name}`);
   }
 
+  // PHASE 50 — résolution canonique des imports locaux.
+  // La table de symboles est construite sur la liste RÉELLE des fichiers de
+  // sortie, donc un import qui visait un chemin source Dart
+  // (« ../widgets/task_tile ») est retargeté sur le fichier généré
+  // (« src/components/TaskTile.tsx »), casse comprise.
+  const resolved = resolveCanonicalImports(layout.files);
+  if (resolved.rewritten > 0) {
+    notes.push(`${resolved.rewritten} import(s) local(aux) retargeté(s) sur un fichier réellement généré`);
+  }
+  for (const u of resolved.unresolved) {
+    notes.push(
+      `Import non résolu dans ${u.file} : '${u.specifier}'` +
+      (u.intendedSymbol ? ` (symbole visé : ${u.intendedSymbol})` : '') +
+      ' — commenté NOT_CONVERTED dans la sortie',
+    );
+  }
+
   return {
-    files: layout.files,
+    files: resolved.files,
     report: {
       addedDependencies:    manifest.added,
       unknownDependencies:  manifest.unknown,
@@ -448,7 +477,37 @@ export function normalizePlan(files: GeneratedFile[]): {
       entryRouteFixed:      entry.fixed,
       prunedRouteGroups:    groups.pruned,
       removedLayoutScreens: layout.removed,
+      rewrittenImports:     resolved.rewritten,
+      unresolvedImports:    resolved.unresolved,
       notes,
     },
   };
+}
+
+/**
+ * PHASE 50 — Résout tous les imports locaux de tous les fichiers générés
+ * contre la table de symboles canonique.
+ *
+ * Général par construction : aucune connaissance du projet converti. Un
+ * import est retargeté si et seulement si un fichier réellement généré peut
+ * le fournir ; sinon il est explicitement marqué non converti.
+ */
+export function resolveCanonicalImports(files: GeneratedFile[]): {
+  files:      GeneratedFile[];
+  rewritten:  number;
+  unresolved: UnresolvedImport[];
+} {
+  const table = buildSymbolTable(files);
+  const unresolved: UnresolvedImport[] = [];
+  let rewritten = 0;
+
+  const out = files.map((file) => {
+    const result = rewriteLocalImports(file, table);
+    rewritten += result.rewritten;
+    unresolved.push(...result.unresolved);
+    if (result.content === file.content) return file;
+    return { ...file, content: result.content };
+  });
+
+  return { files: out, rewritten, unresolved };
 }

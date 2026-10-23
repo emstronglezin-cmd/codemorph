@@ -626,6 +626,27 @@ export async function runStaticValidation(
         : 'Survie des modèles, services, écrans et composants de la source',
     },
     {
+      // PHASE 50 — contrat service ↔ écrans, et symboles source non convertis.
+      // CRITIQUE : un écran qui appelle une méthode inexistante, ou un import
+      // marqué NOT_CONVERTED, produit un projet qui ne compile pas chez le
+      // destinataire. Ce contrôle doit donc bloquer la validation complète.
+      id: 'service-contract',
+      status: ((integrity.byCode['missing-service-method'] ?? 0)
+        + (integrity.byCode['unconverted-symbol'] ?? 0)) === 0 ? 'PASS' : 'FAIL',
+      durationMs: integrityMs,
+      errors: integrity.issues
+        .filter((i) => i.code === 'missing-service-method' || i.code === 'unconverted-symbol')
+        .map((i) => i.message).slice(0, 30),
+      warnings: [],
+      files: [
+        ...new Set([
+          ...filesFor('missing-service-method'),
+          ...filesFor('unconverted-symbol'),
+        ]),
+      ],
+      detail: 'Méthodes appelées par les écrans présentes sur les services ; symboles source convertis',
+    },
+    {
       // Aucun test n'est généré ni exécuté pour le projet cible : NOT_RUN explicite.
       id: 'tests', status: 'NOT_RUN', durationMs: 0, errors: [], warnings: [], files: [],
       notRunReason: 'aucun test n\'est généré pour le projet cible ; aucun runner exécuté',

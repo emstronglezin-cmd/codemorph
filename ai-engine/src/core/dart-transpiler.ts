@@ -28,6 +28,8 @@ export interface TranspileResult {
 
 // ── Type mappings Dart → TypeScript ──────────────────────────────────────────
 
+import { mapDartTypeToTS } from './canonical-ir';
+
 const TYPE_MAP: Record<string, string> = {
   'String':    'string',
   'int':       'number',
@@ -275,13 +277,22 @@ function transpileImport(line: string): string {
   if (pkg.startsWith('package:')) {
     const parts = pkg.replace('package:', '').split('/');
     const fileName = (parts[parts.length - 1] ?? '').replace('.dart', '');
-    return `import { ${toCamelCase(fileName)} } from './${fileName}'; // TODO: verify import`;
+    // PHASE 50 — plus de « // TODO: verify import » dans la sortie : le chemin
+    // est résolu par la passe canonique, ou marqué NOT_CONVERTED.
+    return `import { ${toPascal(fileName)} } from './${fileName}';`;
   }
   
-  // Relative imports
+  // Relative imports.
+  // PHASE 50 — AVANT : le chemin Dart source était recopié tel quel
+  // (« ../widgets/task_tile ») alors que le fichier généré vit ailleurs
+  // (« src/components/TaskTile.tsx ») → import cassé. Le spécificateur est
+  // laissé en l'état MAIS sous forme d'import nommé, puis résolu contre la
+  // table de symboles canonique par resolveCanonicalImports() dans
+  // plan-normalizer, qui connaît la liste réelle des fichiers de sortie.
   if (pkg.startsWith('../') || pkg.startsWith('./')) {
+    const stem = pkg.split('/').pop()?.replace('.dart', '') ?? 'mod';
     const tsPath = pkg.replace('.dart', '');
-    return `import * as ${toCamelCase(pkg.split('/').pop()?.replace('.dart','') ?? 'mod')} from '${tsPath}';`;
+    return `import { ${toPascal(stem)} } from '${tsPath}';`;
   }
   
   return `// import '${pkg}' (unmapped — TODO: replace manually)`;
@@ -314,38 +325,12 @@ function transpileTypes(line: string): string {
 }
 
 function mapType(dartType: string): string {
-  const t = dartType.trim();
-  const mapped = TYPE_MAP[t];
-  if (mapped) return mapped;
-  
-  // List<T> in nested generics
-  if (t.startsWith('List<')) {
-    const inner = t.slice(5, -1);
-    return `${mapType(inner)}[]`;
-  }
-  if (t.startsWith('Map<')) {
-    const inner = t.slice(4, -1);
-    const comma = findComma(inner);
-    if (comma >= 0) {
-      return `Record<${mapType(inner.slice(0, comma))}, ${mapType(inner.slice(comma + 1))}>`;
-    }
-  }
-  if (t.startsWith('Future<')) {
-    return `Promise<${mapType(t.slice(7, -1))}>`;
-  }
-  
-  return t; // keep as-is (class names, etc.)
+  // PHASE 50 — mapping canonique unique. AVANT : table locale + conteneurs
+  // gérés ici, en désaccord avec code-planner et ir-generator.
+  return mapDartTypeToTS(dartType);
 }
 
-function findComma(s: string): number {
-  let depth = 0;
-  for (let i = 0; i < s.length; i++) {
-    if (s[i] === '<') depth++;
-    else if (s[i] === '>') depth--;
-    else if (s[i] === ',' && depth === 0) return i;
-  }
-  return -1;
-}
+
 
 function convertStringInterpolation(line: string): string {
   // '$variable' → `${variable}` (single quotes with interpolation)
@@ -363,9 +348,6 @@ function convertStringInterpolation(line: string): string {
   return line;
 }
 
-function toCamelCase(s: string): string {
-  return s.replace(/_(\w)/g, (_, c: string) => c.toUpperCase());
-}
 
 // ── Main transpiler ───────────────────────────────────────────────────────────
 
@@ -500,4 +482,11 @@ function wrapAsZustandStore(content: string, _sourcePath: string): string {
   const hasZustand = content.includes("from 'zustand'");
   const header = !hasZustand ? "import { create } from 'zustand';\nimport AsyncStorage from '@react-native-async-storage/async-storage';\n\n" : '';
   return header + content;
+}
+
+/** `task_tile` → `TaskTile` — forme des noms exportés par les fichiers générés. */
+function toPascal(name: string): string {
+  return name
+    .replace(/[^A-Za-z0-9]+(.)?/g, (_, c?: string) => (c ? c.toUpperCase() : ''))
+    .replace(/^(.)/, (_, c: string) => c.toUpperCase());
 }

@@ -4,3 +4,9 @@ export interface Task {
   title: string;
   isDone: boolean;
 }
+
+export interface TaskList {
+  items: Task[];
+  total: number;
+  page: number;
+}

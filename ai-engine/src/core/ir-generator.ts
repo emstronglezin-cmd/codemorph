@@ -10,6 +10,7 @@
 //   - DependencyMap: zéro appel IA si mapping statique dispo (déjà le cas)
 // ============================================================
 import { AIProvider }  from './ai-provider';
+import { mapDartTypeToTS } from './canonical-ir';
 import type {
   ConversionContext, IRDocument, IRSourceMetrics,
   IRKnowledgeGraph, IRKnowledgeNode, IRKnowledgeEdge,
@@ -278,18 +279,18 @@ export class IRGenerator {
   // contenait donc QUE `id`, alors que la source déclarait `title`, `isDone`…
   // C'est la cause directe des « modèles incompatibles entre services et
   // composants » : chaque consommateur réinventait les propriétés manquantes.
-  private static readonly DART_TO_TS: Record<string, string> = {
-    String: 'string', int: 'number', double: 'number', num: 'number',
-    bool: 'boolean', DateTime: 'string', dynamic: 'unknown', Object: 'unknown',
-  };
 
+  /**
+   * PHASE 50 — délégué au mapping canonique unique (`canonical-ir`).
+   *
+   * AVANT : une table `IRGenerator.DART_TO_TS` et une gestion de conteneurs
+   * locales, distinctes de celles de `code-planner` et `dart-transpiler`. Les
+   * trois divergeaient (nullabilité, `Set`, `Future`, `Stream`), donc un même
+   * type Dart pouvait donner trois types TypeScript différents selon le
+   * générateur qui l'écrivait.
+   */
   private mapDartType(raw: string): string {
-    const t = raw.trim().replace(/\?$/, '');
-    const listM = t.match(/^List<\s*(.+?)\s*>$/);
-    if (listM) return `${this.mapDartType(listM[1] ?? 'unknown')}[]`;
-    const mapM = t.match(/^Map<\s*(.+?)\s*,\s*(.+?)\s*>$/);
-    if (mapM) return `Record<string, ${this.mapDartType(mapM[2] ?? 'unknown')}>`;
-    return IRGenerator.DART_TO_TS[t] ?? t;
+    return mapDartTypeToTS(raw);
   }
 
   private extractDartModelFields(

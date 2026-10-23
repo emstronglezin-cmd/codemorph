@@ -841,7 +841,9 @@ export type ValidationCheckId =
   | 'empty-files'        // fichiers sources vides
   | 'tests'              // tests disponibles du projet généré
   | 'build'              // compilation / export du projet
-  | 'source-entities';   // modèles/services/écrans/composants source survivants
+  | 'source-entities'    // modèles/services/écrans/composants source survivants
+  // PHASE 50
+  | 'service-contract';  // méthodes appelées par les écrans existent sur les services
 
 /**
  * PHASE 48 — entités extraites de la source, utilisées pour vérifier qu'elles
@@ -925,7 +927,14 @@ export type IntegrityIssueCode =
   | 'wrong-entry-route'
   | 'form-not-wired'
   // PHASE 48
-  | 'missing-layout-screen';
+  | 'missing-layout-screen'
+  // PHASE 50
+  /** Un écran appelle une méthode que le service ne définit pas. */
+  | 'missing-service-method'
+  /** Méthode appelée avec un nombre d'arguments incompatible. */
+  | 'service-arity-mismatch'
+  /** Un symbole source n'a pas été converti (marqué NOT_CONVERTED). */
+  | 'unconverted-symbol';
 
 export interface IntegrityIssue {
   code:     IntegrityIssueCode;

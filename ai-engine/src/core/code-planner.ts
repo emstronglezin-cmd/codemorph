@@ -13,6 +13,7 @@ import { cleanLLMOutput, cleanGeneratedFiles }    from './output-cleaner';
 import { convertLargeFile, needsChunking }         from './file-chunker';
 import { verifyAndFixImports, detectTypeIssues, formatTypeReport } from './import-verifier';
 import { normalizePlan } from './plan-normalizer';
+import { mapDartTypeToTS, isBooleanType, normalizeIrTypes } from './canonical-ir';
 // PHASE 29: Business Layer Extractor — conversion directe depuis le code source
 import {
   extractAndConvertBusinessLayers,
@@ -39,8 +40,20 @@ export class CodePlanner {
 
   async plan(ctx: ConversionContext, ir: IRDocument): Promise<CodePlan> {
     console.log(`[CodePlanner] plan() START — target=${ctx.targetFramework} projectId=${ctx.projectId}`);
+    // ── PHASE 50 : normalisation canonique des types de l'IR ────────────────
+    // AVANT : les types produits par le modèle d'IA (bool, String, List<Task>)
+    // traversaient tels quels jusqu'aux générateurs, produisant du TypeScript
+    // invalide. Le chemin statique mappait déjà ses types, d'où des
+    // validations hors ligne vertes sur des conversions réelles cassées.
+    // Appliqué ici, en amont de TOUS les générateurs, quelle que soit la
+    // provenance de l'IR.
+    const irNorm = normalizeIrTypes(ir);
+    if (irNorm.changed > 0) {
+      console.log(`[CodePlanner] PHASE 50 — ${irNorm.changed} type(s) d'IR normalisé(s) : ${irNorm.rewritten.slice(0, 8).join(', ')}`);
+    }
+
     const planner = this.getFrameworkPlanner(ctx.targetFramework);
-    const result  = await planner(ctx, ir);
+    const result  = await planner(ctx, irNorm.ir);
 
     console.log(`[CodePlanner] plan() RAW — Generated files: ${result.files.length} | Total lines: ${result.summary.totalLines}`);
 
@@ -701,14 +714,23 @@ export const useAuthStore = create<AuthState>((set) => ({
     const fields  = model.fields ?? [];
     const idField = fields.find((f) => f.name === 'id') ?? fields[0];
     const idName  = idField?.name ?? 'id';
-    const idType  = idField?.type ?? 'string';
+    const idType  = mapDartTypeToTS(idField?.type ?? 'string');
 
     // Champs à fournir à la création : requis, non-identifiant, non booléen d'état.
-    const boolField = fields.find((f) => f.type === 'boolean' && f.name !== idName);
+    // PHASE 50 — AVANT : `f.type === 'boolean'`. L'IR peut porter le type Dart
+    // `bool` (aucune normalisation sur le chemin IA), donc la comparaison ne
+    // matchait jamais : `toggle()` et le compteur n'étaient PAS générés alors
+    // que les écrans les appelaient. `isBooleanType` accepte Dart ET TS.
+    const boolField = fields.find((f) => isBooleanType(f.type) && f.name !== idName);
     const inputFields = fields.filter((f) =>
       f.name !== idName && !(boolField && f.name === boolField.name));
 
-    const params = inputFields.map((f) => `${f.name}: ${f.type}`).join(', ');
+    // PHASE 50 — AVANT : `${f.type}` brut, donc un champ Dart `bool` produisait
+    // `title: bool` en TypeScript → échec de compilation. Tout type passe par
+    // le mapping canonique unique.
+    const params = inputFields
+      .map((f) => `${f.name}: ${mapDartTypeToTS(f.type)}`)
+      .join(', ');
     const boolName  = boolField?.name;
     const modelFile = `../types/${model.name.toLowerCase()}.types`;
     const entityVar = `${model.name.charAt(0).toLowerCase()}${model.name.slice(1)}s`;
@@ -2419,9 +2441,16 @@ export default ${name};
     return null;
   }
   private methodDecorator(m: string): string { return { GET: 'Get', POST: 'Post', PUT: 'Put', PATCH: 'Patch', DELETE: 'Delete' }[m] ?? 'Get'; }
+  /**
+   * PHASE 50 — délégué au mapping canonique unique.
+   *
+   * AVANT : une table locale de 7 entrées, sans conteneurs imbriqués
+   * (`List` → `unknown[]`, `Map` → `Record<string,unknown>` — types perdus)
+   * et sans nullabilité. C'était le TROISIÈME mapping Dart→TS du moteur, en
+   * désaccord avec ceux de `dart-transpiler` et `ir-generator`.
+   */
   private dartTypeToTS(type: string): string {
-    const map: Record<string, string> = { String: 'string', int: 'number', double: 'number', bool: 'boolean', dynamic: 'unknown', List: 'unknown[]', Map: 'Record<string,unknown>' };
-    return map[type] ?? type;
+    return mapDartTypeToTS(type);
   }
 
   // ── Package.json templates ─────────────────────────────

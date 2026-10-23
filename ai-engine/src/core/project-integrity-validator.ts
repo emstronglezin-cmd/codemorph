@@ -25,6 +25,16 @@
 //   • imports de types (`import type`) et imports side-effect.
 // ============================================================
 import * as path from 'path';
+import {
+  buildSymbolTable, resolveSourcePath, resolveRelativeTarget, resolveSymbol,
+  toPascalCase, type CanonicalSymbol,
+} from './canonical-ir';
+
+/** Nom de base d'un spécificateur, sans extension. */
+function baseNameOf(spec: string): string {
+  const last = spec.split('/').pop() ?? spec;
+  return last.replace(/\.(ts|tsx|js|jsx)$/, '');
+}
 import type { GeneratedFile } from '../models/ir.types';
 
 // ── Types publics ─────────────────────────────────────────────────────────────
@@ -702,6 +712,8 @@ export function validateProjectIntegrity(files: GeneratedFile[]): IntegrityRepor
     ...checkFormWiring(files),
     ...checkDuplicates(files),
     ...checkEmptySources(files),
+    ...checkServiceContract(files),
+    ...checkUnconvertedSymbols(files),
   ];
 
   const errorCount   = issues.filter((i) => i.severity === 'error').length;
@@ -739,4 +751,103 @@ export function formatIntegrityReport(report: IntegrityReport): string {
   }
   if (sorted.length > 25) lines.push(`  … ${sorted.length - 25} autres`);
   return lines.join('\n');
+}
+
+// ── PHASE 50 — contrat service ↔ écrans, et symboles non convertis ───────────
+
+const CALL_RE = /([A-Za-z_$][\w$]*)\.([A-Za-z_$][\w$]*)\s*\(/g;
+
+/**
+ * PHASE 50 — Vérifie que toute méthode appelée sur un service importé existe
+ * bien sur ce service.
+ *
+ * C'est le contrôle qui manquait pour le défaut réel observé : le service
+ * généré exposait `getAll()` et `add()` mais pas `toggle()`, alors que l'écran
+ * appelait `toggle()`. Rien ne le signalait avant la compilation chez le
+ * destinataire.
+ */
+export function checkServiceContract(files: GeneratedFile[]): IntegrityIssue[] {
+  const issues: IntegrityIssue[] = [];
+  const table = buildSymbolTable(files);
+
+  for (const file of files) {
+    if (!/\.(ts|tsx)$/.test(file.path)) continue;
+
+    // Quels identifiants locaux viennent d'un service généré ?
+    const localServices = new Map<string, CanonicalSymbol>();
+    const importRe = /import\s+(?:type\s+)?\{([^}]*)\}\s+from\s+['"](\.[^'"]*)['"]/g;
+    let im: RegExpExecArray | null;
+    while ((im = importRe.exec(file.content)) !== null) {
+      const spec = im[2] ?? '';
+      // Même résolution que la passe de réécriture : chemin relatif réel
+      // d'abord, puis chemin source Dart, puis nom de symbole.
+      const target =
+        resolveRelativeTarget(file.path, spec, table)
+        ?? resolveSourcePath(table, spec)
+        ?? resolveSymbol(table, toPascalCase(baseNameOf(spec)))?.outputFile
+        ?? null;
+      if (!target) continue;
+      const symbol = [...table.byName.values()].find((s) => s.outputFile === target);
+      if (!symbol || symbol.kind !== 'service') continue;
+      for (const raw of (im[1] ?? '').split(',')) {
+        const name = raw.trim().split(/\s+as\s+/).pop()?.trim();
+        if (name) localServices.set(name, symbol);
+      }
+    }
+    if (localServices.size === 0) continue;
+
+    const known = new Set<string>();
+    for (const s of localServices.values()) for (const m of s.methods) known.add(m.name);
+    if (known.size === 0) continue; // aucune méthode extraite : on ne spécule pas
+
+    let cm: RegExpExecArray | null;
+    CALL_RE.lastIndex = 0;
+    const reported = new Set<string>();
+    while ((cm = CALL_RE.exec(file.content)) !== null) {
+      const receiver = cm[1] ?? '';
+      const method = cm[2] ?? '';
+      if (!localServices.has(receiver)) continue;
+      if (known.has(method)) continue;
+      const key = `${receiver}.${method}`;
+      if (reported.has(key)) continue;
+      reported.add(key);
+      issues.push({
+        code: 'missing-service-method',
+        severity: 'error',
+        file: file.path,
+        message:
+          `${file.path} appelle ${key}() mais le service ne le définit pas ` +
+          `(méthodes disponibles : ${[...known].join(', ')})`,
+        detail: key,
+      });
+    }
+  }
+  return issues;
+}
+
+/**
+ * PHASE 50 — Signale les symboles source qui n'ont pas pu être convertis.
+ *
+ * Un import non résoluble est commenté `NOT_CONVERTED` dans la sortie par la
+ * passe canonique. Ce contrôle remonte ces marques comme erreurs : mieux vaut
+ * un échec explicite qu'un projet livré avec des trous silencieux.
+ */
+export function checkUnconvertedSymbols(files: GeneratedFile[]): IntegrityIssue[] {
+  const issues: IntegrityIssue[] = [];
+  for (const file of files) {
+    const re = /\/\/\s*NOT_CONVERTED:\s*import\s+'([^']+)'/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(file.content)) !== null) {
+      issues.push({
+        code: 'unconverted-symbol',
+        severity: 'error',
+        file: file.path,
+        message:
+          `${file.path} importe '${m[1] ?? ''}' mais aucun fichier généré ne le fournit — ` +
+          `symbole source non converti, à traiter manuellement`,
+        detail: m[1] ?? '',
+      });
+    }
+  }
+  return issues;
 }
