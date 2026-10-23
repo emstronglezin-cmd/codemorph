@@ -1,0 +1,29 @@
+{
+  "name": "tasklist",
+  "version": "1.0.0",
+  "private": true,
+  "main": "expo-router/entry",
+  "scripts": {
+    "start": "expo start",
+    "typecheck": "tsc --noEmit",
+    "test": "jest",
+    "export": "expo export --platform web"
+  },
+  "dependencies": {
+    "expo": "~52.0.0",
+    "react": "18.3.1",
+    "react-native": "0.76.9"
+  },
+  "devDependencies": {
+    "typescript": "^5.3.3",
+    "@types/react": "~18.3.12"
+  },
+  "jest": {
+    "preset": "jest-expo",
+    "transformIgnorePatterns": [
+      "node_modules/(?!((jest-)?react-native|@react-native(-community)?)|expo(nent)?|@expo(nent)?/.*|@expo-google-fonts/.*|react-navigation|@react-navigation/.*|@sentry/react-native|native-base|react-native-svg)"
+    ],
+    "testMatch": ["**/__tests__/**/*.test.ts", "**/__tests__/**/*.test.tsx"],
+    "clearMocks": true
+  }
+}
