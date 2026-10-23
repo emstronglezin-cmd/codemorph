@@ -731,8 +731,13 @@ export const useAuthStore = create<AuthState>((set) => ({
     return this.${entityVar}.filter((t) => t.${boolName}).length;
   }` : '';
 
-    const declared = (svc.methods ?? []).map((m) => m.name);
-    const wantsRemove = declared.some((n) => /^(remove|delete)/i.test(n));
+    // PHASE 49 — un service de collection local expose TOUJOURS la suppression.
+    // AVANT : `remove` n'était généré que si l'extraction de méthodes de l'IR
+    // l'avait détectée. Cette extraction est incomplète selon la signature Dart,
+    // si bien que `remove()` de la source se perdait sans qu'aucun contrôle ne
+    // le signale. La suppression fait partie du contrat d'un service de
+    // collection : elle est générée systématiquement.
+    const wantsRemove = true;
 
     return `// ${svc.name} — service local généré depuis la source Dart.
 // Aucune API REST n'est inventée : la source est une classe côté client.
