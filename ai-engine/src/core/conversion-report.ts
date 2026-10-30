@@ -24,6 +24,7 @@
 // =========================
 // ============================================================
 
+import { splitDeliverableFiles } from './canonical-ir';
 import type {
   IRFidelityScore, IRFidelityDetail, IRAutoCorrectReport, GeneratedFile,
 } from '../models/ir.types';
@@ -41,6 +42,156 @@ type NullableScore = number | null;
  * pouvait auparavant être présenté comme réussi alors qu'aucun test ni build
  * n'avait tourné.
  */
+/** PHASE 51 — ce dont la règle de production a besoin du delivery check. */
+export interface ReportDeliverySection {
+  status:   'READY' | 'NEEDS_REPAIR';
+  blockers: string[];
+}
+
+/** PHASE 51 — ce dont la règle de production a besoin des tests fonctionnels. */
+export interface ReportFunctionalSection {
+  tests: Array<{ feature: string; status: 'PASS' | 'PARTIAL' | 'FAIL' | 'NOT_TESTABLE' }>;
+}
+
+/**
+ * PHASE 51 — tests fonctionnels dont l'échec bloque la livraison.
+ *
+ * Ce sont les capacités sans lesquelles l'application générée ne peut pas
+ * fonctionner du tout. Les autres (auth, API, state, configuration, services
+ * externes) sont dégradées mais ne rendent pas le livraison dangereuse.
+ */
+export const CRITICAL_FUNCTIONAL_FEATURES: ReadonlySet<string> = new Set([
+  'App bootstrap (entry point)',
+  'Navigation (routing)',
+  'Data models (TypeScript interfaces/types)',
+  'Services (business logic layer)',
+  'Screens (UI components)',
+  'TypeScript compilation (static check)',
+  'No source-language residuals (Dart/Flutter imports)',
+]);
+
+/**
+ * PHASE 51 — Résultat de la règle de production, avec les raisons explicites.
+ *
+ * Le statut est calculé à partir des RÉSULTATS RÉELS (contrôles exécutés,
+ * blockers, tests fonctionnels, erreurs TypeScript), jamais à partir du seul
+ * score de fidélité.
+ */
+export interface ProductionReadiness {
+  ready:    boolean;
+  /** Raisons précises du blocage — vide si et seulement si `ready` est vrai. */
+  blockers: string[];
+}
+
+export function evaluateProductionReadiness(input: {
+  fidelityScore:       number;
+  compilationStatus:   'PASS' | 'FAIL' | 'SKIPPED';
+  typeScriptErrors:    string[];
+  validation?:         ReportValidationSection;
+  deliveryCheck?:      ReportDeliverySection;
+  testResults?:        ReportFunctionalSection;
+}): ProductionReadiness {
+  const blockers: string[] = [];
+
+  // 1. Une erreur TypeScript bloque la livraison.
+  if (input.typeScriptErrors.length > 0) {
+    blockers.push(
+      `${input.typeScriptErrors.length} erreur(s) TypeScript : ` +
+      input.typeScriptErrors.slice(0, 3).join(' | '),
+    );
+  }
+
+  // 2. Une compilation SKIPPED n'est JAMAIS une réussite.
+  if (input.compilationStatus === 'SKIPPED') {
+    blockers.push(
+      'Compilation non exécutée (SKIPPED) — une compilation ignorée ne peut pas ' +
+      'être comptée comme réussie',
+    );
+  } else if (input.compilationStatus === 'FAIL') {
+    blockers.push('Compilation en échec');
+  }
+
+  // 3. Un blocker actif du delivery check bloque la livraison.
+  if (input.deliveryCheck) {
+    if (input.deliveryCheck.status === 'NEEDS_REPAIR') {
+      blockers.push(`Delivery check : NEEDS_REPAIR`);
+    }
+    for (const b of input.deliveryCheck.blockers) blockers.push(`Blocker : ${b}`);
+  }
+
+  // 4. Un contrôle critique FAIL bloque ; un critique NOT_RUN bloque aussi,
+  //    car « non exécuté » n'est pas « réussi ».
+  if (input.validation) {
+    for (const id of input.validation.failedCritical) {
+      blockers.push(`Contrôle critique en échec : ${id}`);
+    }
+    for (const id of input.validation.notRunCritical) {
+      blockers.push(`Contrôle critique non exécuté : ${id}`);
+    }
+  }
+
+  // 5. Un test fonctionnel CRITIQUE en échec bloque la livraison.
+  if (input.testResults) {
+    for (const t of input.testResults.tests) {
+      if (t.status === 'FAIL' && CRITICAL_FUNCTIONAL_FEATURES.has(t.feature)) {
+        blockers.push(`Test fonctionnel critique en échec : ${t.feature}`);
+      }
+    }
+  }
+
+  // 6. Le score reste une condition nécessaire, jamais suffisante.
+  if (input.fidelityScore < 80) {
+    blockers.push(`Fidélité ${input.fidelityScore}% < 80%`);
+  }
+
+  return { ready: blockers.length === 0, blockers };
+}
+
+/**
+ * PHASE 51 — Statut explicite du round-trip.
+ *
+ * ## Le défaut corrigé
+ *
+ * `const roundTripScore = roundTripResult?.averageScore ?? 0;` rendait
+ * indistinguables « jamais exécuté » et « exécuté, score 0 % ». Le rapport
+ * affichait `Round-trip : 0 %`, ce qui se lit comme une mesure d'échec alors
+ * qu'aucune mesure n'a été prise.
+ *
+ * Constat vérifié dans le code : `runRoundTripFidelity()` existe dans
+ * `round-trip-fidelity.ts`, mais **le pipeline ne l'appelle jamais** (le module
+ * n'est référencé que par `conversion-report.ts`, pour le type). Le statut réel
+ * est donc `NOT_RUN` — la capacité est implémentée, elle n'est pas câblée.
+ */
+export type RoundTripStatus =
+  /** La conversion inverse n'existe pas dans le moteur. */
+  | 'NOT_IMPLEMENTED'
+  /** La direction de conversion ne permet pas de round-trip. */
+  | 'NOT_APPLICABLE'
+  /** Implémenté et applicable, mais non lancé sur ce job. */
+  | 'NOT_RUN'
+  /** Exécuté, score sous le seuil. */
+  | 'FAIL'
+  /** Exécuté, score au-dessus du seuil. */
+  | 'PASS';
+
+/** Seuil au-dessus duquel un round-trip exécuté est considéré comme réussi. */
+export const ROUND_TRIP_PASS_THRESHOLD = 70;
+
+/**
+ * Déduit le statut réel du round-trip. Un résultat absent n'est JAMAIS
+ * converti en score mesuré, et un score de 0 n'est jamais présenté comme une
+ * réussite.
+ */
+export function deriveRoundTripStatus(
+  result: { averageScore: number } | undefined,
+  opts?: { applicable?: boolean; implemented?: boolean },
+): RoundTripStatus {
+  if (opts?.implemented === false) return 'NOT_IMPLEMENTED';
+  if (opts?.applicable === false) return 'NOT_APPLICABLE';
+  if (!result) return 'NOT_RUN';
+  return result.averageScore >= ROUND_TRIP_PASS_THRESHOLD ? 'PASS' : 'FAIL';
+}
+
 export interface ReportValidationSection {
   fullyValidated: boolean;
   durationMs:     number;
@@ -68,13 +219,20 @@ export interface ConversionReport {
   uiFidelity:         NullableScore;
   compilation:        boolean;
   roundTrip:          number;
+  /** PHASE 51 — statut réel, distinct du score. `roundTrip: 0` avec un statut
+   *  `NOT_RUN` ne doit jamais être lu comme un round-trip échoué. */
+  roundTripStatus:    RoundTripStatus;
   filesGenerated:     number;
+  /** PHASE 51 — rapports internes, hors ZIP applicatif. */
+  reportFiles:        number;
   filesAutoRepaired:  number;
   warnings:           number;
   errorsFixed:        number;
   overallFidelity:    number;  // calculé uniquement sur axes applicables
   compilationStatus:  'PASS' | 'FAIL' | 'SKIPPED';
   readyForProduction: boolean;
+  /** PHASE 51 — raisons précises du blocage (vide ⇔ prêt pour la production). */
+  productionBlockers: string[];
 
   // N/A metadata
   applicableAxes:     string[];   // axes avec score réel
@@ -121,11 +279,15 @@ export function buildConversionReport(params: {
   aiTier?:             string;
   /** PHASE 48 — contrôles réellement exécutés. */
   validation?:         ReportValidationSection;
+  /** PHASE 51 — évaluation de livraison (blockers) et tests fonctionnels. */
+  deliveryCheck?:      ReportDeliverySection;
+  testResults?:        ReportFunctionalSection;
 }): ConversionReport {
   const {
     fidelityScore, autoCorrectionReport, files,
     compilationResult, roundTripResult,
     projectName, conversionType, duration, aiTier, validation,
+    deliveryCheck, testResults,
   } = params;
 
   // Compter les repositories et services générés
@@ -163,6 +325,12 @@ export function buildConversionReport(params: {
 
   // Round-trip
   const roundTripScore = roundTripResult?.averageScore ?? 0;
+  // PHASE 51 — la capacité existe (`runRoundTripFidelity`) mais le pipeline ne
+  // l'appelle pas : aucun résultat n'est donc produit sur ce chemin.
+  const roundTripStatus = deriveRoundTripStatus(roundTripResult, {
+    implemented: true,
+    applicable:  true,
+  });
 
   // Scores N/A-aware : utiliser directement les valeurs de fidelityScore (qui sont déjà null si N/A)
   // Pour repositories et services : utiliser les axes dédiés du nouveau scoring
@@ -185,11 +353,31 @@ export function buildConversionReport(params: {
   const rawOverall     = fidelityScore.overall + compilBonus + roundTripBonus;
   const overallFidelity = Math.max(0, Math.min(100, rawOverall));
 
-  // Ready for production
-  const readyForProduction =
-    overallFidelity >= 80 &&
-    compilStatus !== 'FAIL' &&
-    (compilationResult?.errors.filter((e) => e.severity === 'error').length ?? 0) === 0;
+  // ── PHASE 51 : Ready for production ────────────────────────────────────────
+  // AVANT :
+  //   overallFidelity >= 80 && compilStatus !== 'FAIL' && (erreurs ?? 0) === 0
+  // Trois défauts : (a) `!== 'FAIL'` laissait passer SKIPPED ; (b) la règle ne
+  // consultait NI le delivery check NI les blockers NI les tests fonctionnels ;
+  // (c) `compilationResult` provient de l'étape de build, souvent absente, donc
+  // les erreurs TypeScript trouvées par le validateur statique n'étaient pas
+  // vues. Résultat observé : « Ready For Production: YES » avec NEEDS_REPAIR,
+  // 1 blocker actif et une erreur TS1005.
+  const tsErrorsFromBuild = (compilationResult?.errors ?? [])
+    .filter((e) => e.severity === 'error')
+    .map((e) => e.message);
+  const tsErrorsFromChecks = (validation?.checks ?? [])
+    .filter((c) => c.id === 'typescript' && c.status === 'FAIL')
+    .flatMap((c) => [c.reason ?? 'erreur TypeScript détectée par le contrôle statique']);
+
+  const readiness = evaluateProductionReadiness({
+    fidelityScore:     overallFidelity,
+    compilationStatus: compilStatus,
+    typeScriptErrors:  [...tsErrorsFromBuild, ...tsErrorsFromChecks],
+    ...(validation ? { validation } : {}),
+    ...(deliveryCheck ? { deliveryCheck } : {}),
+    ...(testResults ? { testResults } : {}),
+  });
+  const readyForProduction = readiness.ready;
 
   return {
     ...(validation ? { validation } : {}),
@@ -200,15 +388,25 @@ export function buildConversionReport(params: {
     stores:            fidelityScore.stores        ?? null,
     api:               fidelityScore.api           ?? null,
     uiFidelity:        fidelityScore.uiFidelity    ?? null,
-    compilation:       compilStatus === 'PASS' || compilStatus === 'SKIPPED',
+    // PHASE 51 — AVANT : `=== 'PASS' || === 'SKIPPED'`, donc une compilation
+    // ignorée était comptabilisée comme réussie. Un contrôle non exécuté n'est
+    // pas un contrôle réussi.
+    compilation:       compilStatus === 'PASS',
     roundTrip:         roundTripScore,
-    filesGenerated:    files.length,
+    roundTripStatus,
+    // PHASE 51 — AVANT : `files.length`, qui incluait les rapports internes
+    // injectés APRÈS la création du ZIP. Le rapport annonçait donc 34 fichiers
+    // quand le ZIP en contenait 30. Le compte livré est désormais dérivé de la
+    // même fonction que celle du ZIP.
+    filesGenerated:    splitDeliverableFiles(files).deliverable.filter((f) => !!f.content).length,
+    reportFiles:       splitDeliverableFiles(files).reports.length,
     filesAutoRepaired,
     warnings:          totalWarnings,
     errorsFixed,
     overallFidelity,
     compilationStatus: compilStatus,
     readyForProduction,
+    productionBlockers: readiness.blockers,
     applicableAxes:    fidelityScore.applicableAxes ?? [],
     naAxes:            fidelityScore.naAxes ?? [],
     ...(fidelityScore.detectedFramework !== undefined ? { detectedFramework: fidelityScore.detectedFramework } : {}),

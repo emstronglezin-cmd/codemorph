@@ -12,6 +12,7 @@
 //   7. Missing routes (routes referenced but not found)
 // ============================================================
 
+import { checkGeneratedSyntax, formatSyntaxIssues } from './syntax-validator';
 import { execSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -501,6 +502,11 @@ export async function runStaticValidation(
   // On RÉUTILISE les détecteurs existants (ci-dessus) et le validateur
   // d'intégrité déjà présent — aucun validateur parallèle n'est créé. Chaque
   // contrôle produit PASS / FAIL / NOT_RUN avec sa durée réelle.
+  // PHASE 51 — contrôle syntaxique systématique, indépendant de toute
+  // installation du projet cible : il s'exécute même quand tsc est SKIPPED.
+  const syntaxResult = checkGeneratedSyntax(files);
+  console.log(formatSyntaxIssues(syntaxResult));
+
   const integrityStart = Date.now();
   const integrity      = validateProjectIntegrity(files);
   const integrityMs    = Date.now() - integrityStart;
@@ -624,6 +630,21 @@ export async function runStaticValidation(
         ? `modèles ${sourceEntities.models.length}, services ${sourceEntities.services.length}, ` +
           `écrans ${sourceEntities.screens.length}, composants ${sourceEntities.widgets.length}`
         : 'Survie des modèles, services, écrans et composants de la source',
+    },
+    {
+      // PHASE 51 — syntaxe de chaque fichier TS/TSX généré. CRITIQUE : un
+      // fichier non analysable (ex. TS1005 '} expected') rend le projet
+      // inutilisable, et la compilation complète est souvent SKIPPED donc
+      // incapable de le révéler.
+      id: 'syntax',
+      status: syntaxResult.passed ? 'PASS' : 'FAIL',
+      durationMs: syntaxResult.durationMs,
+      errors: syntaxResult.invalid
+        .map((i) => `${i.file}(${i.line},${i.column}): error TS${i.code}: ${i.message}`)
+        .slice(0, 30),
+      warnings: [],
+      files: [...new Set(syntaxResult.invalid.map((i) => i.file))],
+      detail: `${syntaxResult.checked} fichier(s) TS/TSX analysé(s) par le parseur TypeScript`,
     },
     {
       // PHASE 50 — contrat service ↔ écrans, et symboles source non convertis.

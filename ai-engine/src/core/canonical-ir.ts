@@ -640,3 +640,67 @@ export function normalizeIrTypes(ir: IRDocument): IrNormalizationResult {
 
   return { ir, changed, rewritten };
 }
+
+// ── PHASE 51 — comptage canonique des fichiers ───────────────────────────────
+
+/** Préfixe des artefacts internes, qui ne font pas partie de l'application. */
+export const INTERNAL_REPORT_PREFIX = '_codemorph-reports/';
+
+/** Vrai pour un artefact interne (rapports CodeMorph), pas pour du code livré. */
+export function isInternalReportFile(path: string): boolean {
+  return normalizePath(path).startsWith(INTERNAL_REPORT_PREFIX);
+}
+
+export interface FileSplit {
+  /** Fichiers de l'application générée — ce que contient le ZIP. */
+  deliverable: GeneratedFile[];
+  /** Rapports internes injectés après la création du ZIP. */
+  reports:     GeneratedFile[];
+}
+
+/**
+ * PHASE 51 — Sépare les fichiers livrables des rapports internes.
+ *
+ * ## Le défaut corrigé
+ *
+ * Le ZIP était construit AVANT l'injection des rapports internes, puis ces
+ * rapports étaient ajoutés à la liste retournée au client. Le ZIP annonçait
+ * donc 30 fichiers pendant que le callback en annonçait 34 — deux nombres
+ * issus de deux étapes différentes, sans qu'aucun des deux ne le dise.
+ *
+ * Tous les comptes (rapport, journaux, ZIP, callback) doivent désormais être
+ * dérivés de cette seule fonction.
+ */
+export function splitDeliverableFiles(files: GeneratedFile[]): FileSplit {
+  const deliverable: GeneratedFile[] = [];
+  const reports: GeneratedFile[] = [];
+  for (const f of files) {
+    if (isInternalReportFile(f.path)) reports.push(f);
+    else deliverable.push(f);
+  }
+  return { deliverable, reports };
+}
+
+/**
+ * Vérifie que le nombre de fichiers du ZIP correspond au nombre de fichiers
+ * livrables. Une divergence signifie que le ZIP et le rapport ne décrivent pas
+ * le même état — elle doit être signalée, jamais ignorée.
+ */
+export function reconcileFileCounts(
+  zipFileCount: number,
+  files: GeneratedFile[],
+): { consistent: boolean; zip: number; deliverable: number; reports: number; detail: string } {
+  const split = splitDeliverableFiles(files);
+  const deliverable = split.deliverable.filter((f) => !!f.content).length;
+  const consistent = zipFileCount === deliverable;
+  return {
+    consistent,
+    zip: zipFileCount,
+    deliverable,
+    reports: split.reports.length,
+    detail: consistent
+      ? `ZIP ${zipFileCount} fichier(s) == livrables ${deliverable} (+${split.reports.length} rapport(s) interne(s))`
+      : `INCOHÉRENCE : ZIP ${zipFileCount} fichier(s) != livrables ${deliverable} ` +
+        `(+${split.reports.length} rapport(s) interne(s))`,
+  };
+}

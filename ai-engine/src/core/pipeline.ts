@@ -15,6 +15,7 @@
 //   STEP 4: TypeScript Issue Detection (import-verifier.ts)
 //   STEP 5: Source↔Generated Fidelity Comparison (fidelity-comparator.ts)
 // ============================================================
+import { reconcileFileCounts } from './canonical-ir';
 import { pipelineCache, buildCacheKey } from './pipeline-cache';
 import pino from 'pino';
 import { getJobLogger } from './structured-logger';
@@ -1156,6 +1157,18 @@ export class ConversionPipeline {
 
     // ── PHASE 9 FINALE: Conversion Report ────────────────────────────────────
     jlog.info('📊 Phase Finale 9: Conversion Report', { jobId: ctx.jobId });
+    // ── Phase 8 (fonctionnelle) — test-results.json ──────────────────────────
+    // PHASE 51 — calculé AVANT le rapport : la règle de production doit
+    // consulter les résultats réels des tests fonctionnels. Ils étaient produits
+    // APRÈS le rapport, donc le statut ne pouvait pas les voir.
+    const testResults: TestResultsReport = buildFunctionalTestResults(
+      enhancedFiles,
+      finalFidelityScore,
+      finalContentValidation,
+      appSpec,
+    );
+    console.log(formatTestResultsReport(testResults));
+
     let conversionReportData: { text: string; json: string; markdown: string; html: string } | undefined;
     try {
       // PHASE 48 — le rapport utilisateur reçoit les contrôles RÉELLEMENT
@@ -1171,6 +1184,14 @@ export class ConversionPipeline {
         duration:             durationMs,
         aiTier:               tier,
         ...(validationSection ? { validation: validationSection } : {}),
+        // PHASE 51 — la règle de production consulte les résultats réels.
+        deliveryCheck: {
+          status:   deliveryCheck.status,
+          blockers: deliveryCheck.blockers,
+        },
+        testResults: {
+          tests: testResults.tests.map((t) => ({ feature: t.feature, status: t.status })),
+        },
       });
 
       const { formatConversionReportJSON, formatConversionReportMarkdown, formatConversionReportHTML, formatValidationSection } = await import('./conversion-report');
@@ -1188,15 +1209,6 @@ export class ConversionPipeline {
     } catch (rptErr) {
       console.warn(`[PIPELINE] Phase 9 Report: Generation skipped — ${(rptErr as Error).message}`);
     }
-
-    // ── Phase 8 (fonctionnelle) — Génération test-results.json ───────────────
-    const testResults: TestResultsReport = buildFunctionalTestResults(
-      enhancedFiles,
-      finalFidelityScore,
-      finalContentValidation,
-      appSpec,
-    );
-    console.log(formatTestResultsReport(testResults));
 
     // ── PHASE 29: Fidelity Engine — Source vs ZIP comparison (12 axes) ────────
     jlog.phaseStart('fidelity_check', { action: 'source_vs_zip_comparison' });
@@ -1354,6 +1366,26 @@ export class ConversionPipeline {
         language: f.path.endsWith('.json') ? 'json' : f.path.endsWith('.md') ? 'markdown' : 'html',
       })),
     ];
+
+    // ── PHASE 51 : réconciliation des comptages de fichiers ──────────────────
+    // Le ZIP est construit AVANT l'injection des rapports internes, puis ces
+    // rapports sont ajoutés à la liste retournée au client. Le ZIP annonçait
+    // donc un nombre de fichiers inférieur à celui du callback, sans qu'aucun
+    // des deux ne le dise. Les deux comptes sont maintenant dérivés de la même
+    // fonction et toute divergence est journalisée explicitement.
+    if (zipResult) {
+      const reconciliation = reconcileFileCounts(zipResult.fileCount, filesWithReports);
+      const msg = `[PIPELINE] PHASE 51 — Réconciliation fichiers : ${reconciliation.detail}`;
+      if (reconciliation.consistent) console.log(msg);
+      else console.warn(`⚠️  ${msg}`);
+      jlog.info(reconciliation.consistent ? 'file counts reconciled' : 'FILE COUNT MISMATCH', {
+        jobId: ctx.jobId,
+        zipFileCount:      reconciliation.zip,
+        deliverableCount:  reconciliation.deliverable,
+        reportFileCount:   reconciliation.reports,
+        consistent:        reconciliation.consistent,
+      });
+    }
 
     return {
       jobId:      ctx.jobId,

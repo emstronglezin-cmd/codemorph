@@ -843,7 +843,9 @@ export type ValidationCheckId =
   | 'build'              // compilation / export du projet
   | 'source-entities'    // modèles/services/écrans/composants source survivants
   // PHASE 50
-  | 'service-contract';  // méthodes appelées par les écrans existent sur les services
+  | 'service-contract'   // méthodes appelées par les écrans existent sur les services
+  // PHASE 51
+  | 'syntax';            // syntaxe TS/TSX de chaque fichier généré
 
 /**
  * PHASE 48 — entités extraites de la source, utilisées pour vérifier qu'elles

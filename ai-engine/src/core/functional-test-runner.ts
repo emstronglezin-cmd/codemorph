@@ -22,9 +22,6 @@ import type {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-function hasFile(files: GeneratedFile[], pattern: RegExp): boolean {
-  return files.some((f) => pattern.test(f.path));
-}
 
 function hasFileWithContent(files: GeneratedFile[], pathPattern: RegExp, contentPattern: RegExp): boolean {
   return files.some(
@@ -82,14 +79,18 @@ const TESTS: TestDef[] = [
   {
     feature: 'App bootstrap (entry point)',
     run(files) {
-      const hasEntry = hasFile(files, /\/(app|index|_layout)\.(tsx?|jsx?)$/)
-        || hasFile(files, /App\.(tsx?|jsx?)$/);
-      if (!hasEntry) {
-        return { feature: 'App bootstrap (entry point)', status: 'FAIL', detail: 'No entry file found (app.tsx / App.tsx / _layout.tsx / index.tsx)' };
+      // PHASE 51 — AVANT : `/(app|index|_layout)\.(tsx?|jsx?)$/` suivi de
+      // `files.find(...)`. Ce motif matche N'IMPORTE QUEL `index.ts` de
+      // n'importe quel répertoire, et `find` renvoyait le premier venu : sur le
+      // projet témoin le « point d'entrée » détecté était `src/theme/index.ts`,
+      // un barrel de thème. Le test passait donc sur une preuve fausse.
+      // On classe maintenant les candidats par spécificité.
+      const entryFile = findEntryPoint(files);
+      if (!entryFile) {
+        return { feature: 'App bootstrap (entry point)', status: 'FAIL', detail: 'No entry file found (app/_layout.tsx, app/index.tsx, App.tsx, src/main.tsx)' };
       }
-      const entryFile = files.find((f) => /\/(app|index|_layout)\.(tsx?|jsx?)$/.test(f.path) || /App\.(tsx?|jsx?)$/.test(f.path))!;
       if (isShell(entryFile)) {
-        return { feature: 'App bootstrap (entry point)', status: 'FAIL', detail: 'Entry file is a SHELL_401 — not generated', blockedBy: 'SHELL_401' };
+        return { feature: 'App bootstrap (entry point)', status: 'FAIL', detail: `Entry file ${entryFile.path} is a SHELL_401 — not generated`, blockedBy: 'SHELL_401' };
       }
       return { feature: 'App bootstrap (entry point)', status: 'PASS', detail: `Entry point found: ${entryFile.path}` };
     },
@@ -260,9 +261,12 @@ const TESTS: TestDef[] = [
   {
     feature: 'Screens (UI components)',
     run(files, fidelityScore) {
-      const screenPattern = /\/(screens?|pages?)\//i;
-      const screenExclude = /_layout|index\.(tsx?|jsx?)$/;
-      const screenFiles = files.filter((f) => screenPattern.test(f.path) && !screenExclude.test(f.path));
+      // PHASE 51 — AVANT : seuls `screens/` et `pages/` étaient reconnus, et le
+      // motif d'exclusion `_layout|index\.(tsx?|jsx?)$` écartait explicitement
+      // `index.tsx`. Or Expo Router place les écrans DIRECTEMENT dans `app/`
+      // (`app/index.tsx`, `app/add-task.tsx`) : tout projet Expo Router était
+      // donc déclaré « No screen files found » alors que ses écrans existent.
+      const screenFiles = findScreenFiles(files);
       if (screenFiles.length === 0) {
         return { feature: 'Screens (UI components)', status: 'FAIL', detail: 'No screen files found' };
       }
@@ -270,7 +274,10 @@ const TESTS: TestDef[] = [
       if (shellScreens === screenFiles.length) {
         return { feature: 'Screens (UI components)', status: 'FAIL', detail: `All ${screenFiles.length} screens are SHELL_401`, blockedBy: 'SHELL_401' };
       }
-      const hasComponents = hasFileWithContent(files, screenPattern, /return\s*\(|React\.FC|export\s+default\s+function\s+\w+/i);
+      // PHASE 51 — vérifié sur les écrans réellement identifiés (Expo Router
+      // compris), plus sur un motif de répertoire.
+      const COMPONENT_RE = /return\s*\(|React\.FC|export\s+default\s+function\s+\w+/i;
+      const hasComponents = screenFiles.some((f) => COMPONENT_RE.test(f.content));
       const uiScore = fidelityScore?.uiFidelity ?? null;
       const validScreens = screenFiles.length - shellScreens;
       if (validScreens > 0 && hasComponents) {
@@ -501,4 +508,62 @@ export function formatTestResultsReport(report: TestResultsReport): string {
   lines.push('════════════════════════════════════════════════════════════════════════');
   lines.push('');
   return lines.join('\n');
+}
+
+// ── PHASE 51 : détection du point d'entrée et des écrans ─────────────────────
+
+/**
+ * Points d'entrée réels, du plus spécifique au plus générique.
+ *
+ * Un barrel `src/theme/index.ts` ou `src/utils/index.ts` n'est PAS un point
+ * d'entrée : le motif doit ancrer le répertoire, pas seulement le nom de
+ * fichier.
+ */
+const ENTRY_POINT_PATTERNS: ReadonlyArray<RegExp> = [
+  /^app\/_layout\.(tsx?|jsx?)$/,          // Expo Router — layout racine
+  /^app\/index\.(tsx?|jsx?)$/,            // Expo Router — écran racine
+  /^(App|app)\.(tsx?|jsx?)$/,              // CRA / racine RN
+  /^index\.(tsx?|jsx?)$/,                  // racine
+  /^src\/(App|app|main|index)\.(tsx?|jsx?)$/,
+  /^src\/_layout\.(tsx?|jsx?)$/,
+  /^main\.(tsx?|jsx?)$/,
+];
+
+/**
+ * Retourne le point d'entrée de l'application, ou `null`.
+ * Classe les candidats par spécificité au lieu de prendre le premier fichier
+ * dont le nom ressemble à un point d'entrée.
+ */
+export function findEntryPoint(files: GeneratedFile[]): GeneratedFile | null {
+  for (const pattern of ENTRY_POINT_PATTERNS) {
+    const hit = files.find((f) => pattern.test(f.path.replace(/^\.\//, '')));
+    if (hit) return hit;
+  }
+  return null;
+}
+
+/**
+ * Retourne les fichiers d'écran, en reconnaissant les DEUX conventions :
+ *   • répertoires `screens/` ou `pages/` (React Navigation, Next.js) ;
+ *   • routes fichier d'Expo Router : tout `.tsx` sous `app/` qui n'est ni un
+ *     layout ni une route spéciale.
+ *
+ * `app/index.tsx` EST un écran (l'écran d'accueil) — l'ancien motif
+ * d'exclusion l'écartait.
+ */
+export function findScreenFiles(files: GeneratedFile[]): GeneratedFile[] {
+  const isRouteSpecial = (p: string): boolean =>
+    /(^|\/)_(layout|not-found|error|loading)\.(tsx?|jsx?)$/.test(p)
+    || /(^|\/)\+[^/]+\.(tsx?|jsx?)$/.test(p)
+    || /(^|\+)not-found\.(tsx?|jsx?)$/.test(p);
+
+  return files.filter((f) => {
+    if (!/\.(tsx|jsx)$/.test(f.path)) return false;
+    const p = f.path.replace(/^\.\//, '');
+    // Convention 1 : répertoire screens/ ou pages/
+    if (/\/(screens?|pages?)\//i.test(p)) return !isRouteSpecial(p);
+    // Convention 2 : Expo Router — fichiers de route sous app/
+    if (/^app\//.test(p) || /\/app\//.test(p)) return !isRouteSpecial(p);
+    return false;
+  });
 }

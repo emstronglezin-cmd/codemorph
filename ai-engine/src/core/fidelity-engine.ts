@@ -526,7 +526,7 @@ function computeAxis(
 /** Contrôles dont l'échec ou la non-exécution interdit un statut flatteur. */
 export const CRITICAL_CHECKS: ValidationCheckResult['id'][] = [
   'local-imports', 'dependencies', 'typescript', 'config-entrypoint', 'routes',
-  'source-entities', 'service-contract', 'tests', 'build',
+  'source-entities', 'service-contract', 'syntax', 'tests', 'build',
 ];
 
 /**
