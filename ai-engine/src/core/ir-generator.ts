@@ -9,6 +9,7 @@
 //   - Contexte partagé (stateInfo, navInfo, authInfo, extInfo) calculé 1 fois, réutilisé
 //   - DependencyMap: zéro appel IA si mapping statique dispo (déjà le cas)
 // ============================================================
+import { extractSourceRoutes, resolveRouteTarget } from './source-route-extractor';
 import { AIProvider }  from './ai-provider';
 import { mapDartTypeToTS } from './canonical-ir';
 import type {
@@ -261,15 +262,51 @@ export class IRGenerator {
     const targetFramework = ctx.targetFramework;
     void targetFramework; // used in prompts
 
+    // ── PHASE 52 : routes RÉELLES de la source ───────────────────────────────
+    // AVANT : `screens.slice(1).map(...)` déclarait chaque écran atteignable
+    // depuis le premier avec un déclencheur générique « navigate ». Aucune ligne
+    // de la source n'était lue : les routes étaient inventées à partir de l'ordre
+    // des écrans, donc les écrans réellement navigables et les orphelins étaient
+    // indistinguables, et la comparaison source ↔ cible portait sur du fictif.
+    const extracted = extractSourceRoutes(
+      ast.files.map((f) => ({ path: f.path, content: f.content })),
+    );
+
+    let navigationFlow: Array<{ from: string; to: string; trigger: string; guard: string }>;
+    if (extracted.detected) {
+      const flows: Array<{ from: string; to: string; trigger: string; guard: string }> = [];
+      const seen = new Set<string>();
+      for (const route of extracted.routes) {
+        if (route.kind === 'pop') continue; // un retour n'est pas une route cible
+        const fromId = resolveRouteTarget(route.from, screens) ?? screens[0]?.id ?? 'screen-home';
+        const toId   = resolveRouteTarget(route.to, screens);
+        // Une cible introuvable parmi les écrans générés n'est PAS inventée :
+        // elle est conservée sous son nom source pour que la comparaison
+        // source ↔ cible puisse la signaler comme non convertie.
+        const to = toId ?? `unresolved:${route.to}`;
+        const key = `${fromId}->${to}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        flows.push({
+          from:    fromId,
+          to,
+          trigger: route.kind === 'named' ? `navigate(${route.routeName ?? route.to})` : 'navigate',
+          guard:   '',
+        });
+      }
+      navigationFlow = flows;
+      console.log(`[IRGenerator] PHASE 52 — ${flows.length} route(s) extraite(s) de la source (mécanisme : ${extracted.mechanism})`);
+    } else {
+      // Aucune navigation dans la source : on ne fabrique plus de routes
+      // fictives. Une liste vide est une information vraie.
+      navigationFlow = [];
+      console.log('[IRGenerator] PHASE 52 — aucune route de navigation trouvée dans la source (aucune route inventée)');
+    }
+
     return {
       screens,
       components,
-      navigationFlow: screens.slice(1).map((s) => ({
-        from:    screens[0]?.id ?? 'screen-home',
-        to:      s.id,
-        trigger: 'navigate',
-        guard:   '',
-      })),
+      navigationFlow,
       stateFlow: [],
     };
   }

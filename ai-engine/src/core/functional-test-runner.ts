@@ -10,6 +10,7 @@
 //   - Un SHELL file → test FAIL automatique pour la feature
 // ============================================================
 
+import { checkGeneratedSyntax } from './syntax-validator';
 import type {
   GeneratedFile,
   IRFidelityScore,
@@ -327,10 +328,32 @@ const TESTS: TestDef[] = [
           detail: `${tsFiles.length - shellTs}/${tsFiles.length} TS files appear valid, ${shellTs} SHELL files may cause errors`,
         };
       }
+
+      // PHASE 52 — AVANT : ce test renvoyait PASS après avoir seulement vérifié
+      // l'absence d'imports Dart et de fichiers SHELL. Son propre détail disait
+      // « runtime tsc not executed » : un PASS annoncé alors que rien n'avait
+      // été compilé. C'est précisément le cas « le rapport annonce PASS alors
+      // que le projet n'est pas compilable ».
+      // On analyse maintenant réellement la syntaxe avec le parseur TypeScript.
+      // Ce n'est toujours PAS une vérification de types complète (modules et
+      // types externes non résolus) — le détail le dit explicitement.
+      const syntax = checkGeneratedSyntax(tsFiles);
+      if (!syntax.passed) {
+        const first = syntax.invalid[0];
+        return {
+          feature: 'TypeScript compilation (static check)',
+          status: 'FAIL',
+          detail: `${syntax.invalid.length} erreur(s) de syntaxe — ` +
+            `${first?.file ?? '?'}(${first?.line ?? 0},${first?.column ?? 0}): ` +
+            `TS${first?.code ?? 0} ${first?.message ?? ''}`,
+        };
+      }
       return {
         feature: 'TypeScript compilation (static check)',
         status: 'PASS',
-        detail: `${tsFiles.length} TS/JSX files — no Dart imports, no SHELL files detected (runtime tsc not executed)`,
+        detail: `${syntax.checked} fichier(s) TS/TSX analysés par le parseur TypeScript, ` +
+          `0 erreur de syntaxe (vérification de types complète non exécutée : ` +
+          `modules externes non résolus)`,
       };
     },
   },

@@ -15,7 +15,7 @@
 //   STEP 4: TypeScript Issue Detection (import-verifier.ts)
 //   STEP 5: Source↔Generated Fidelity Comparison (fidelity-comparator.ts)
 // ============================================================
-import { reconcileFileCounts } from './canonical-ir';
+import { reconcileFileCounts, INTERNAL_REPORT_PREFIX } from './canonical-ir';
 import { pipelineCache, buildCacheKey } from './pipeline-cache';
 import pino from 'pino';
 import { getJobLogger } from './structured-logger';
@@ -1169,12 +1169,17 @@ export class ConversionPipeline {
     );
     console.log(formatTestResultsReport(testResults));
 
+    // PHASE 52 — hoisté : le JSON de livraison doit reprendre le MÊME objet
+    // ConversionReport que le texte/Markdown/HTML. Construit séparément, le JSON
+    // omettait readyForProduction et productionBlockers : le ZIP annonçait un
+    // verdict sans le statut de production qui le contredisait.
+    let conversionReport: ConversionReport | undefined;
     let conversionReportData: { text: string; json: string; markdown: string; html: string } | undefined;
     try {
       // PHASE 48 — le rapport utilisateur reçoit les contrôles RÉELLEMENT
       // exécutés. La règle de qualification est celle, unique, de
       // `summarizeValidation` : aucune duplication de logique.
-      const report: ConversionReport = buildConversionReport({
+      conversionReport = buildConversionReport({
         fidelityScore:        finalFidelityScore,
         autoCorrectionReport,
         files:                enhancedFiles,
@@ -1195,16 +1200,16 @@ export class ConversionPipeline {
       });
 
       const { formatConversionReportJSON, formatConversionReportMarkdown, formatConversionReportHTML, formatValidationSection } = await import('./conversion-report');
-      const reportText = formatConversionReport(report);
+      const reportText = formatConversionReport(conversionReport);
 
       // Afficher le rapport dans la console (Phase 9)
       console.log(reportText);
 
       conversionReportData = {
         text:     reportText,
-        json:     formatConversionReportJSON(report),
-        markdown: formatConversionReportMarkdown(report) + formatValidationSection(validationSection),
-        html:     formatConversionReportHTML(report),
+        json:     formatConversionReportJSON(conversionReport),
+        markdown: formatConversionReportMarkdown(conversionReport) + formatValidationSection(validationSection),
+        html:     formatConversionReportHTML(conversionReport),
       };
     } catch (rptErr) {
       console.warn(`[PIPELINE] Phase 9 Report: Generation skipped — ${(rptErr as Error).message}`);
@@ -1307,6 +1312,28 @@ export class ConversionPipeline {
           transformed: ax.transformed.slice(0, 10),
         })),
         phaseTimings,
+        // ── PHASE 52 : le statut de production entre dans le JSON livré ──────
+        // AVANT : le JSON du ZIP était construit séparément du ConversionReport
+        // et n'emportait ni readyForProduction ni productionBlockers. Le ZIP
+        // pouvait donc annoncer un verdict sans le statut qui le contredisait.
+        // Les deux sortent désormais du même objet.
+        delivery: {
+          filesDelivered:     conversionReport?.filesGenerated ?? enhancedFiles.length,
+          // Les rapports sont injectés APRÈS le calcul du ConversionReport :
+          // on utilise donc le compte réel, pas celui du rapport.
+          reportFiles:        reportFilesToInject.length,
+          zipFileCount:       zipResult?.fileCount ?? null,
+          compilationStatus:  conversionReport?.compilationStatus ?? 'SKIPPED',
+          compilationPassed:  conversionReport?.compilation ?? false,
+          roundTrip:          conversionReport?.roundTrip ?? 0,
+          roundTripStatus:    conversionReport?.roundTripStatus ?? 'NOT_RUN',
+          readyForProduction: conversionReport?.readyForProduction ?? false,
+          productionBlockers: conversionReport?.productionBlockers ?? [
+            'rapport de conversion indisponible — le statut ne peut pas être affirmé',
+          ],
+          deliveryCheckStatus: deliveryCheck.status,
+          deliveryBlockers:    deliveryCheck.blockers,
+        },
         // ── PHASE 48 : la validation réellement exécutée entre dans le JSON ──
         // Sans ce bloc, le rapport JSON annonçait un verdict sans aucune trace
         // des contrôles : impossible de contredire un « EXCELLENT » infondé.
@@ -1366,6 +1393,33 @@ export class ConversionPipeline {
         language: f.path.endsWith('.json') ? 'json' : f.path.endsWith('.md') ? 'markdown' : 'html',
       })),
     ];
+
+    // PHASE 52 — le nombre de rapports n'est exact qu'une fois tous les rapports
+    // assemblés (conversion-report.json est sérialisé avant les trois autres).
+    // On réécrit donc son bloc delivery avec le compte final, pour que le JSON
+    // livré dise la vérité sur son propre contenu.
+    {
+      const finalReportCount = filesWithReports.filter(
+        (f) => f.path.startsWith(INTERNAL_REPORT_PREFIX)
+      ).length;
+      const crIdx = filesWithReports.findIndex(
+        (f) => f.path === `${INTERNAL_REPORT_PREFIX}conversion-report.json`
+      );
+      if (crIdx >= 0 && finalReportCount > 0) {
+        const current = filesWithReports[crIdx]!;
+        try {
+          const parsed = JSON.parse(current.content) as Record<string, unknown>;
+          const dl = parsed['delivery'] as Record<string, unknown> | undefined;
+          if (dl && dl['reportFiles'] !== finalReportCount) {
+            dl['reportFiles'] = finalReportCount;
+            filesWithReports[crIdx] = { ...current, content: JSON.stringify(parsed, null, 2) };
+            jlog.info(`PHASE 52 — reportFiles corrigé à ${finalReportCount} dans conversion-report.json`);
+          }
+        } catch {
+          jlog.warn('PHASE 52 — conversion-report.json non réanalysable, reportFiles non corrigé');
+        }
+      }
+    }
 
     // ── PHASE 51 : réconciliation des comptages de fichiers ──────────────────
     // Le ZIP est construit AVANT l'injection des rapports internes, puis ces

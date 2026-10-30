@@ -19,7 +19,7 @@ export class TaskService {
       id: this.nextId(),
       title,
       isDone: false,
-    } as Task;
+    };
     this.tasks = [...this.tasks, created];
     this.notify();
     return created;
@@ -63,7 +63,8 @@ export class TaskService {
   }
 
   private nextId(): string {
-    return `task-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}` as unknown as string;
+    // Identifiant texte : préfixe lisible + horodatage + aléa.
+    return `task-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
   }
 
   /** Réinitialisation — utilisée par les tests. */

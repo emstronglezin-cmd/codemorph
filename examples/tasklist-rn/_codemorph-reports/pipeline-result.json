@@ -1,0 +1,194 @@
+{
+  "jobId": "job-tasklist",
+  "filesDelivered": 29,
+  "reportFiles": 4,
+  "zipResult": {
+    "success": true,
+    "zipPath": "/tmp/codemorph-job-tasklist",
+    "fileCount": 29,
+    "totalBytes": 0,
+    "duration": 22
+  },
+  "deliveryCheck": {
+    "status": "READY",
+    "score": 90,
+    "compilationPassed": true,
+    "noSourceImports": true,
+    "noShellCritical": true,
+    "noMissingCritical": true,
+    "navigationFunctional": true,
+    "apiLayerPresent": true,
+    "configTransferred": true,
+    "blockers": [],
+    "warnings": [],
+    "readyChecklist": [
+      {
+        "item": "TypeScript compilation",
+        "passed": true,
+        "detail": "Passed"
+      },
+      {
+        "item": "Local imports resolve",
+        "passed": true,
+        "detail": "All relative/alias imports resolve to a generated file"
+      },
+      {
+        "item": "Dependencies declared in package.json",
+        "passed": true,
+        "detail": "Every imported package is declared in the manifest"
+      },
+      {
+        "item": "Navigation targets exist",
+        "passed": true,
+        "detail": "Every referenced route has a matching screen"
+      },
+      {
+        "item": "Canonical models (no duplicate incompatible types)",
+        "passed": true,
+        "detail": "No exported type is declared with conflicting properties"
+      },
+      {
+        "item": "Project scaffold complete",
+        "passed": true,
+        "detail": "manifest/entrypoint/config issues: 0"
+      },
+      {
+        "item": "No source-language imports in target",
+        "passed": true,
+        "detail": "Clean — no Dart/Swift/Kotlin imports in TypeScript files"
+      },
+      {
+        "item": "No critical SHELL files",
+        "passed": true,
+        "detail": "No critical SHELL_401 files"
+      },
+      {
+        "item": "Navigation functional",
+        "passed": true,
+        "detail": "Navigation root (app/_layout.tsx) found with 2 screen(s)"
+      },
+      {
+        "item": "API layer present",
+        "passed": true,
+        "detail": "3 real API service file(s) found"
+      },
+      {
+        "item": "Configuration transferred",
+        "passed": true,
+        "detail": "Configuration appears correctly transferred"
+      },
+      {
+        "item": "Conversion coverage ≥ 50% (converted+scaffold+incomplete)",
+        "passed": true,
+        "detail": "Coverage: 100% (29/29 files: 18 converted + 6 scaffold + 5 incomplete)"
+      },
+      {
+        "item": "Fidelity score ≥ 40%",
+        "passed": true,
+        "detail": "Overall fidelity: 90%"
+      }
+    ],
+    "integrityVerdict": "PASS",
+    "integrityErrors": 0,
+    "integrityWarnings": 0,
+    "compilationTested": true
+  },
+  "testResults": {
+    "totalTests": 12,
+    "passed": 6,
+    "partial": 5,
+    "failed": 0,
+    "notTestable": 1,
+    "overallStatus": "PARTIAL",
+    "tests": [
+      {
+        "feature": "App bootstrap (entry point)",
+        "status": "PASS",
+        "detail": "Entry point found: app/_layout.tsx"
+      },
+      {
+        "feature": "Navigation (routing)",
+        "status": "PARTIAL",
+        "detail": "1/1 layouts valid, nav score=78%"
+      },
+      {
+        "feature": "Authentication (login / logout / session)",
+        "status": "PARTIAL",
+        "detail": "2/3 auth mechanisms detected (login=true, logout=false, storage=true)"
+      },
+      {
+        "feature": "API / Network layer",
+        "status": "PARTIAL",
+        "detail": "Real URL not detected — may need configuration"
+      },
+      {
+        "feature": "Data models (TypeScript interfaces/types)",
+        "status": "PASS",
+        "detail": "3/3 model files valid with TS interfaces, score=100%"
+      },
+      {
+        "feature": "State management (Zustand stores)",
+        "status": "PARTIAL",
+        "detail": "1/1 stores valid, Zustand detected, score=N/A%"
+      },
+      {
+        "feature": "Services (business logic layer)",
+        "status": "PASS",
+        "detail": "1/1 service files valid, score=100%"
+      },
+      {
+        "feature": "Screens (UI components)",
+        "status": "PASS",
+        "detail": "3/3 screens valid, React components detected, uiFidelity=70%"
+      },
+      {
+        "feature": "TypeScript compilation (static check)",
+        "status": "PASS",
+        "detail": "23 fichier(s) TS/TSX analysés par le parseur TypeScript, 0 erreur de syntaxe (vérification de types complète non exécutée : modules externes non résolus)"
+      },
+      {
+        "feature": "Configuration (env vars, API keys, base URLs)",
+        "status": "PARTIAL",
+        "detail": "Config files present, 1 placeholders, URL preserved=false"
+      },
+      {
+        "feature": "External services integration",
+        "status": "NOT_TESTABLE",
+        "detail": "No external services detected in source"
+      },
+      {
+        "feature": "No source-language residuals (Dart/Flutter imports)",
+        "status": "PASS",
+        "detail": "No Dart/Flutter imports found in TypeScript files"
+      }
+    ]
+  },
+  "integrityReport": {
+    "issues": [],
+    "errorCount": 0,
+    "warningCount": 0,
+    "infoCount": 0,
+    "passed": true,
+    "verdict": "PASS",
+    "checkedFiles": 29,
+    "byCode": {}
+  },
+  "fidelityValidation": {
+    "overallFidelityScore": 84,
+    "verdict": "GOOD",
+    "verdictReason": "Source coverage 100% but critical checks NOT RUN: tests, build — cannot be reported as fully validated",
+    "fullyValidated": false,
+    "notRunCritical": [
+      "tests",
+      "build"
+    ],
+    "scoreBreakdown": {
+      "sourceCoverage": 100,
+      "structuralCoherence": 100,
+      "functionalPreservation": null,
+      "staticValidation": 100,
+      "testsExecuted": null,
+      "compilationSucceeded": 100
+    }
+  }
+}

@@ -84,7 +84,7 @@ export default function HomeScreen(): React.JSX.Element {
 
       {state === 'ready' && tasks.length > 0 ? (
         <FlatList
-          data={tasks as Task[]}
+          data={tasks}
           keyExtractor={(item) => item.id}
           renderItem={({ item }) => <TaskTile task={item} onToggle={handleToggle} />}
           testID="task-list"

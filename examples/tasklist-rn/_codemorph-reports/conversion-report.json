@@ -1,0 +1,267 @@
+{
+  "generatedAt": "2026-10-30T09:06:08.411Z",
+  "jobId": "job-tasklist",
+  "projectName": "tasklist",
+  "conversionType": "Flutter → React Native",
+  "durationMs": 81,
+  "aiTier": "static",
+  "filesGenerated": 29,
+  "fidelityScore": {
+    "pipeline": 90,
+    "engine": 84,
+    "verdict": "GOOD"
+  },
+  "axes": [
+    {
+      "axis": "screens",
+      "score": 100,
+      "status": "measured",
+      "sourceCount": 2,
+      "targetCount": 3,
+      "missing": [],
+      "identical": [
+        "HomeScreen",
+        "AddTaskScreen"
+      ],
+      "transformed": []
+    },
+    {
+      "axis": "navigation",
+      "score": null,
+      "status": "na",
+      "sourceCount": 0,
+      "targetCount": 0,
+      "missing": [],
+      "identical": [],
+      "transformed": []
+    },
+    {
+      "axis": "ui_components",
+      "score": 100,
+      "status": "measured",
+      "sourceCount": 1,
+      "targetCount": 10,
+      "missing": [],
+      "identical": [
+        "TaskTile"
+      ],
+      "transformed": []
+    },
+    {
+      "axis": "business_logic",
+      "score": 100,
+      "status": "measured",
+      "sourceCount": 1,
+      "targetCount": 2,
+      "missing": [],
+      "identical": [
+        "TaskService"
+      ],
+      "transformed": []
+    },
+    {
+      "axis": "api_calls",
+      "score": null,
+      "status": "na",
+      "sourceCount": 0,
+      "targetCount": 0,
+      "missing": [],
+      "identical": [],
+      "transformed": []
+    },
+    {
+      "axis": "state_mgmt",
+      "score": null,
+      "status": "na",
+      "sourceCount": 0,
+      "targetCount": 1,
+      "missing": [],
+      "identical": [],
+      "transformed": []
+    },
+    {
+      "axis": "services",
+      "score": 100,
+      "status": "measured",
+      "sourceCount": 1,
+      "targetCount": 1,
+      "missing": [],
+      "identical": [
+        "TaskService"
+      ],
+      "transformed": []
+    },
+    {
+      "axis": "data_models",
+      "score": 100,
+      "status": "measured",
+      "sourceCount": 1,
+      "targetCount": 10,
+      "missing": [],
+      "identical": [
+        "Task"
+      ],
+      "transformed": []
+    },
+    {
+      "axis": "assets",
+      "score": null,
+      "status": "na",
+      "sourceCount": 0,
+      "targetCount": 0,
+      "missing": [],
+      "identical": [],
+      "transformed": []
+    },
+    {
+      "axis": "config_env",
+      "score": null,
+      "status": "na",
+      "sourceCount": 0,
+      "targetCount": 2,
+      "missing": [],
+      "identical": [],
+      "transformed": []
+    },
+    {
+      "axis": "dependencies",
+      "score": null,
+      "status": "na",
+      "sourceCount": 0,
+      "targetCount": 11,
+      "missing": [],
+      "identical": [],
+      "transformed": []
+    },
+    {
+      "axis": "features",
+      "score": null,
+      "status": "na",
+      "sourceCount": 0,
+      "targetCount": 0,
+      "missing": [],
+      "identical": [],
+      "transformed": []
+    }
+  ],
+  "phaseTimings": {
+    "ast": 0,
+    "arch": 0,
+    "ir": 1,
+    "mapping": 0,
+    "planning": 37,
+    "validation": 0
+  },
+  "delivery": {
+    "filesDelivered": 29,
+    "reportFiles": 4,
+    "zipFileCount": 29,
+    "compilationStatus": "SKIPPED",
+    "compilationPassed": false,
+    "roundTrip": 0,
+    "roundTripStatus": "NOT_RUN",
+    "readyForProduction": false,
+    "productionBlockers": [
+      "Compilation non exécutée (SKIPPED) — une compilation ignorée ne peut pas être comptée comme réussie",
+      "Contrôle critique non exécuté : tests",
+      "Contrôle critique non exécuté : build"
+    ],
+    "deliveryCheckStatus": "READY",
+    "deliveryBlockers": []
+  },
+  "validation": {
+    "fullyValidated": false,
+    "durationMs": 3318,
+    "failedCritical": [],
+    "notRunCritical": [
+      "tests",
+      "build"
+    ],
+    "verdict": "GOOD",
+    "verdictReason": "Source coverage 100% but critical checks NOT RUN: tests, build — cannot be reported as fully validated",
+    "scoreBreakdown": {
+      "sourceCoverage": 100,
+      "structuralCoherence": 100,
+      "functionalPreservation": null,
+      "staticValidation": 100,
+      "testsExecuted": null,
+      "compilationSucceeded": 100
+    },
+    "checks": [
+      {
+        "id": "local-imports",
+        "status": "PASS",
+        "durationMs": 3,
+        "errors": 0
+      },
+      {
+        "id": "dependencies",
+        "status": "PASS",
+        "durationMs": 3,
+        "errors": 0
+      },
+      {
+        "id": "typescript",
+        "status": "PASS",
+        "durationMs": 3315,
+        "errors": 0
+      },
+      {
+        "id": "config-entrypoint",
+        "status": "PASS",
+        "durationMs": 3,
+        "errors": 0
+      },
+      {
+        "id": "routes",
+        "status": "PASS",
+        "durationMs": 3,
+        "errors": 0
+      },
+      {
+        "id": "source-imports",
+        "status": "PASS",
+        "durationMs": 3,
+        "errors": 0
+      },
+      {
+        "id": "empty-files",
+        "status": "FAIL",
+        "durationMs": 3,
+        "errors": 1
+      },
+      {
+        "id": "source-entities",
+        "status": "PASS",
+        "durationMs": 3,
+        "errors": 0
+      },
+      {
+        "id": "syntax",
+        "status": "PASS",
+        "durationMs": 12,
+        "errors": 0
+      },
+      {
+        "id": "service-contract",
+        "status": "PASS",
+        "durationMs": 3,
+        "errors": 0
+      },
+      {
+        "id": "tests",
+        "status": "NOT_RUN",
+        "durationMs": 0,
+        "errors": 0,
+        "reason": "aucun test n'est généré pour le projet cible ; aucun runner exécuté"
+      },
+      {
+        "id": "build",
+        "status": "NOT_RUN",
+        "durationMs": 0,
+        "errors": 0,
+        "reason": "ni build ni export Expo exécuté (dépendances du projet non installées)"
+      }
+    ]
+  }
+}

@@ -1,0 +1,37 @@
+{
+  "generatedAt": "2026-10-30T09:06:08.411Z",
+  "jobId": "job-tasklist",
+  "timestamp": "2026-10-30T09:06:05.036Z",
+  "sourceFramework": "Flutter",
+  "totalFiles": 5,
+  "dartFiles": 5,
+  "screens": [
+    "HomeScreen",
+    "AddTaskScreen"
+  ],
+  "routes": [],
+  "services": [
+    "TaskService"
+  ],
+  "repositories": [],
+  "stateClasses": [],
+  "models": [
+    "Task"
+  ],
+  "widgets": [
+    "TaskTile"
+  ],
+  "apiEndpoints": [],
+  "dependencies": [],
+  "envVars": [],
+  "assets": [],
+  "features": [],
+  "complexity": {
+    "screenCount": 2,
+    "serviceCount": 1,
+    "stateCount": 0,
+    "apiCount": 0,
+    "totalChars": 3876,
+    "level": "small"
+  }
+}
